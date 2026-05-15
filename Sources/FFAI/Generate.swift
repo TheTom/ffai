@@ -34,14 +34,14 @@ public extension Model {
     func generate(prompt: String,
                   options: GenerateOptions = GenerateOptions()) async throws -> GenerationResult {
         let promptTokens = tokenizer.encode(text: prompt)
-        let caches = llama.makeKVCache()
+        let caches = engine.makeKVCache()
         let eos = config.eosTokenId
 
         // Prefill: feed each prompt token, discard logits except the last.
         let prefillStart = Date()
         var lastLogits: Tensor?
         for (i, t) in promptTokens.enumerated() {
-            lastLogits = llama.forward(tokenId: t, position: i, caches: caches)
+            lastLogits = engine.forward(tokenId: t, position: i, caches: caches)
         }
         let prefillTime = Date().timeIntervalSince(prefillStart)
         guard let initialLogits = lastLogits else {
@@ -58,7 +58,7 @@ public extension Model {
             let next = Sampling.argmax(nextLogits)
             if options.stopOnEOS, let e = eos, next == e { break }
             generated.append(next)
-            nextLogits = llama.forward(tokenId: next, position: pos, caches: caches)
+            nextLogits = engine.forward(tokenId: next, position: pos, caches: caches)
             pos += 1
         }
         let decodeTime = Date().timeIntervalSince(decodeStart)

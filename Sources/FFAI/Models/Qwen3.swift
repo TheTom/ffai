@@ -1,39 +1,51 @@
-// Llama family — Llama 3.x architecture. Phase 2 ships the dense
-// variant only (1B / 3B / 8B / 70B; 405B with quant). The protocol +
-// per-variant struct pattern is established here even with a single
-// variant so the family scales when 4 / 4.x / future variants land.
+// Qwen3 family — Qwen3 dense (Phase 2.5). Future variants land here:
+//
+//   Qwen3.5 hybrid (GDN + attention)   — Phase 4 alongside the GDN kernels
+//   Qwen3.5 MoE                        — Phase 4
+//   Qwen3.5-VL (vision)                — Phase 6
+//   Qwen3.5-Omni (vision + audio)      — Phase 7+
+//
+// The protocol + per-variant struct convention is established now even
+// with a single dense variant, so adding 3.5 hybrid/MoE later is a
+// new struct + a new entry in `Qwen3.variant(for:)` rather than a
+// switch-statement grow-out.
 
 import Foundation
 import Metal
 
 // ─── Family entry point ──────────────────────────────────────────────
 
-public enum Llama {
-    public static let modelTypes: Set<String> = ["llama"]
-    public static let architectures: Set<String> = ["LlamaForCausalLM"]
+public enum Qwen3 {
+    public static let modelTypes: Set<String> = ["qwen3"]
+    public static let architectures: Set<String> = ["Qwen3ForCausalLM"]
 
-    /// Pick the variant struct for a config. Phase 2 only knows about
-    /// LlamaDense; future variants (e.g. LlamaMoE if Llama 4 ships one)
-    /// would dispatch here.
-    public static func variant(for config: ModelConfig) throws -> any LlamaVariant.Type {
-        // Only one variant for now.
-        return LlamaDense.self
+    public static func variant(for config: ModelConfig) throws -> any Qwen3Variant.Type {
+        return Qwen3Dense.self
     }
 }
 
-public protocol LlamaVariant {
+public protocol Qwen3Variant {
     static var availableCapabilities: Set<Capability> { get }
     static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel
+    ) throws -> Qwen3Model
 }
 
-// ─── LlamaDense — standard transformer ───────────────────────────────
+public enum Qwen3Error: Error, CustomStringConvertible {
+    case missingConfig
+    public var description: String {
+        switch self {
+        case .missingConfig: return "Qwen3: required config field missing"
+        }
+    }
+}
 
-public struct LlamaDense: LlamaVariant {
+// ─── Qwen3Dense — standard dense transformer with q_norm / k_norm ─────
+
+public struct Qwen3Dense: Qwen3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
 
     public static func loadModel(
@@ -41,7 +53,7 @@ public struct LlamaDense: LlamaVariant {
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel {
+    ) throws -> Qwen3Model {
         guard let hidden = config.hiddenSize,
               let nLayers = config.numLayers,
               let nHeads = config.numAttentionHeads,
@@ -50,26 +62,40 @@ public struct LlamaDense: LlamaVariant {
               let intermediate = config.intermediateSize,
               let eps = config.rmsNormEps
         else {
-            throw LlamaError.missingConfig
+            throw Qwen3Error.missingConfig
         }
         let nKVHeads = config.numKeyValueHeads ?? nHeads
-        let theta = Float(config.ropeTheta ?? 500_000)
-        let maxSeq = config.int("max_position_embeddings") ?? 8192
+        let theta = Float(config.ropeTheta ?? 1_000_000)
+        let maxSeq = config.int("max_position_embeddings") ?? 32_768
         let tieEmbed = config.tieWordEmbeddings
 
-        // Llama 3 RoPE scaling (rope_type: "llama3"). For other rope_types
-        // (yarn, dynamic) we'd dispatch differently — for Phase 2 we only
-        // handle the explicit llama3 case + plain rope.
+        // Optional linear RoPE scaling (Qwen3 dense uses rope_scaling
+        // {type: "linear", factor: F} which uniformly divides every
+        // inv_freq by F. We model this with the Llama-3 scaling shape
+        // by setting scaleFactor = F and pinning everything else so the
+        // wavelength branches always go down the "low_freq → divide"
+        // path, equivalent to a uniform scale.)
         var ropeScaling = Ops.RoPEScaling.none
-        if let rs = config.nested("rope_scaling"),
-           (rs["rope_type"] as? String) == "llama3"
-        {
-            ropeScaling = Ops.RoPEScaling(
-                scaleFactor: Float((rs["factor"] as? Double) ?? (rs["factor"] as? Int).map(Double.init) ?? 1),
-                lowFreqFactor: Float((rs["low_freq_factor"] as? Double) ?? 1),
-                highFreqFactor: Float((rs["high_freq_factor"] as? Double) ?? 4),
-                originalMaxPosition: Float((rs["original_max_position_embeddings"] as? Int) ?? 8192)
-            )
+        if let rs = config.nested("rope_scaling") {
+            if let typeStr = (rs["type"] as? String) ?? (rs["rope_type"] as? String),
+               typeStr == "linear",
+               let factor = rs["factor"] as? Double
+            {
+                ropeScaling = Ops.RoPEScaling(
+                    scaleFactor: Float(factor),
+                    lowFreqFactor: 1, highFreqFactor: 1,
+                    originalMaxPosition: 1  // forces low_freq_wavelen = 1, so all freqs are "low"
+                )
+            } else if (rs["rope_type"] as? String) == "llama3" {
+                // Some Qwen3 variants ship Llama-3 style scaling; reuse
+                // the same parameters.
+                ropeScaling = Ops.RoPEScaling(
+                    scaleFactor: Float((rs["factor"] as? Double) ?? 1),
+                    lowFreqFactor: Float((rs["low_freq_factor"] as? Double) ?? 1),
+                    highFreqFactor: Float((rs["high_freq_factor"] as? Double) ?? 4),
+                    originalMaxPosition: Float((rs["original_max_position_embeddings"] as? Int) ?? 8192)
+                )
+            }
         }
 
         // Embedding
@@ -77,7 +103,7 @@ public struct LlamaDense: LlamaVariant {
         let embedTokens = Embedding(weight: embedWeight)
 
         // Layers
-        var layers: [LlamaLayer] = []
+        var layers: [Qwen3Layer] = []
         layers.reserveCapacity(nLayers)
         for i in 0..<nLayers {
             let p = "model.layers.\(i)"
@@ -86,6 +112,14 @@ public struct LlamaDense: LlamaVariant {
             let kProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.k_proj.weight"))
             let vProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.v_proj.weight"))
             let oProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.o_proj.weight"))
+
+            // Per-head Q/K RMSNorm — the structural delta vs Llama.
+            let qNorm = RMSNorm(
+                weight: try weights.tensor(named: "\(p).self_attn.q_norm.weight"),
+                eps: Float(eps))
+            let kNorm = RMSNorm(
+                weight: try weights.tensor(named: "\(p).self_attn.k_norm.weight"),
+                eps: Float(eps))
 
             let gateProj = Linear(weight: try weights.tensor(named: "\(p).mlp.gate_proj.weight"))
             let upProj = Linear(weight: try weights.tensor(named: "\(p).mlp.up_proj.weight"))
@@ -98,8 +132,9 @@ public struct LlamaDense: LlamaVariant {
                 weight: try weights.tensor(named: "\(p).post_attention_layernorm.weight"),
                 eps: Float(eps))
 
-            layers.append(LlamaLayer(
+            layers.append(Qwen3Layer(
                 qProj: qProj, kProj: kProj, vProj: vProj, oProj: oProj,
+                qNorm: qNorm, kNorm: kNorm,
                 gateProj: gateProj, upProj: upProj, downProj: downProj,
                 inputNorm: inputNorm, postAttnNorm: postAttnNorm,
                 hidden: hidden, nHeads: nHeads, nKVHeads: nKVHeads,
@@ -120,11 +155,10 @@ public struct LlamaDense: LlamaVariant {
         } else if let w = try? weights.tensor(named: "lm_head.weight") {
             lmHead = Linear(weight: w)
         } else {
-            // Some checkpoints omit lm_head when tying; fall back to embed.
             lmHead = Linear(weight: embedWeight)
         }
 
-        return LlamaModel(
+        return Qwen3Model(
             embedTokens: embedTokens, layers: layers,
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
@@ -134,19 +168,11 @@ public struct LlamaDense: LlamaVariant {
     }
 }
 
-public enum LlamaError: Error, CustomStringConvertible {
-    case missingConfig
-    public var description: String {
-        switch self {
-        case .missingConfig: return "Llama: required config field missing"
-        }
-    }
-}
+// ─── Qwen3Layer ──────────────────────────────────────────────────────
 
-// ─── Layer (attention + MLP) ─────────────────────────────────────────
-
-public final class LlamaLayer: Module {
+public final class Qwen3Layer: Module {
     let qProj, kProj, vProj, oProj: Linear
+    let qNorm, kNorm: RMSNorm
     let gateProj, upProj, downProj: Linear
     let inputNorm, postAttnNorm: RMSNorm
     let hidden, nHeads, nKVHeads, headDim, intermediate: Int
@@ -155,12 +181,14 @@ public final class LlamaLayer: Module {
     let scale: Float
 
     init(qProj: Linear, kProj: Linear, vProj: Linear, oProj: Linear,
+         qNorm: RMSNorm, kNorm: RMSNorm,
          gateProj: Linear, upProj: Linear, downProj: Linear,
          inputNorm: RMSNorm, postAttnNorm: RMSNorm,
          hidden: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          intermediate: Int, ropeTheta: Float,
          ropeScaling: Ops.RoPEScaling) {
         self.qProj = qProj; self.kProj = kProj; self.vProj = vProj; self.oProj = oProj
+        self.qNorm = qNorm; self.kNorm = kNorm
         self.gateProj = gateProj; self.upProj = upProj; self.downProj = downProj
         self.inputNorm = inputNorm; self.postAttnNorm = postAttnNorm
         self.hidden = hidden; self.nHeads = nHeads; self.nKVHeads = nKVHeads
@@ -176,6 +204,8 @@ public final class LlamaLayer: Module {
         for (k, v) in kProj.parameters() { out.append(("self_attn.k_proj.\(k)", v)) }
         for (k, v) in vProj.parameters() { out.append(("self_attn.v_proj.\(k)", v)) }
         for (k, v) in oProj.parameters() { out.append(("self_attn.o_proj.\(k)", v)) }
+        for (k, v) in qNorm.parameters() { out.append(("self_attn.q_norm.\(k)", v)) }
+        for (k, v) in kNorm.parameters() { out.append(("self_attn.k_norm.\(k)", v)) }
         for (k, v) in gateProj.parameters() { out.append(("mlp.gate_proj.\(k)", v)) }
         for (k, v) in upProj.parameters() { out.append(("mlp.up_proj.\(k)", v)) }
         for (k, v) in downProj.parameters() { out.append(("mlp.down_proj.\(k)", v)) }
@@ -184,9 +214,9 @@ public final class LlamaLayer: Module {
         return out
     }
 
-    /// Single-token forward pass. `h` is the residual stream [hidden].
-    /// `position` is the absolute sequence index of this token.
-    /// Returns the updated residual stream.
+    /// Single-token forward pass. Same shape as LlamaLayer.forward but
+    /// applies q_norm / k_norm to each head's [head_dim] vector before
+    /// RoPE (rather than on the full hidden dim).
     func forward(_ h: Tensor, position: Int, cache: KVCache,
                  cmd: MTLCommandBuffer, device: Device) -> Tensor {
         // Attention
@@ -195,26 +225,31 @@ public final class LlamaLayer: Module {
         let k = kProj(xNorm, on: cmd)   // [n_kv_heads * head_dim]
         let v = vProj(xNorm, on: cmd)   // [n_kv_heads * head_dim]
 
+        // Apply per-head q_norm and k_norm. q_norm.weight is shape
+        // [head_dim] and is applied INDEPENDENTLY to each head's
+        // head_dim-vector.
+        let qNormed = applyPerHeadRMSNorm(q, weight: qNorm.weight, eps: qNorm.eps,
+                                          nHeads: nHeads, headDim: headDim,
+                                          on: cmd, device: device)
+        let kNormed = applyPerHeadRMSNorm(k, weight: kNorm.weight, eps: kNorm.eps,
+                                          nHeads: nKVHeads, headDim: headDim,
+                                          on: cmd, device: device)
+
         // RoPE on q and k
-        let qRotated = Ops.rope(q.reshaped(to: [nHeads, headDim]),
+        let qRotated = Ops.rope(qNormed.reshaped(to: [nHeads, headDim]),
                                 position: position, headDim: headDim,
                                 thetaBase: ropeTheta, scaling: ropeScaling, on: cmd)
-        let kRotated = Ops.rope(k.reshaped(to: [nKVHeads, headDim]),
+        let kRotated = Ops.rope(kNormed.reshaped(to: [nKVHeads, headDim]),
                                 position: position, headDim: headDim,
                                 thetaBase: ropeTheta, scaling: ropeScaling, on: cmd)
 
-        // Append to KV cache. Need to sync the command buffer first so
-        // rotated K/V are CPU-visible before memcpy.
+        // Sync so the rotated K/V are CPU-visible for the cache append.
         cmd.commit()
         cmd.waitUntilCompleted()
-
         cache.append(kFlat: kRotated, vFlat: v.reshaped(to: [nKVHeads, headDim]))
 
-        // New command buffer for SDPA + MLP
         let cmd2 = device.makeCommandBuffer()
 
-        // SDPA — cache is [nKVHeads, maxSeq, headDim]; kernel takes
-        // n_kv = filled length, kv_stride = maxSeq physical stride.
         let attnOut = Ops.sdpaDecode(
             q: qRotated, k: cache.kBuffer, v: cache.vBuffer,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
@@ -223,7 +258,7 @@ public final class LlamaLayer: Module {
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd2)
         let postAttn = Ops.add(h, oOut, on: cmd2)
 
-        // MLP
+        // MLP — SwiGLU
         let mlpNorm = postAttnNorm(postAttn, on: cmd2)
         let gate = gateProj(mlpNorm, on: cmd2)
         let up = upProj(mlpNorm, on: cmd2)
@@ -237,13 +272,38 @@ public final class LlamaLayer: Module {
 
         return result
     }
+
+    /// Apply RMSNorm independently to each head's [head_dim] slice of a
+    /// flat [nHeads * headDim] tensor. Phase 2.5 implementation: launch
+    /// one rmsNorm per head sequentially. Slow (nHeads kernel launches)
+    /// but trivially correct; an optimized multi-row rms_norm kernel is
+    /// a Phase 5 follow-up.
+    private func applyPerHeadRMSNorm(
+        _ x: Tensor, weight: Tensor, eps: Float,
+        nHeads: Int, headDim: Int,
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let result = Tensor.empty(shape: x.shape, dtype: x.dtype)
+        let bytesPerHead = headDim * x.dtype.byteSize
+        for h in 0..<nHeads {
+            let inSlice = Tensor(buffer: x.buffer,
+                                 offset: x.offset + h * bytesPerHead,
+                                 shape: [headDim], dtype: x.dtype)
+            let outSlice = Tensor(buffer: result.buffer,
+                                  offset: result.offset + h * bytesPerHead,
+                                  shape: [headDim], dtype: x.dtype)
+            _ = Ops.rmsNorm(inSlice, weight: weight, eps: eps,
+                            on: cmd, into: outSlice)
+        }
+        return result
+    }
 }
 
-// ─── Whole model ─────────────────────────────────────────────────────
+// ─── Qwen3Model ──────────────────────────────────────────────────────
 
-public final class LlamaModel: LanguageModel {
+public final class Qwen3Model: LanguageModel {
     public let embedTokens: Embedding
-    public let layers: [LlamaLayer]
+    public let layers: [Qwen3Layer]
     public let finalNorm: RMSNorm
     public let lmHead: Linear
 
@@ -251,7 +311,7 @@ public final class LlamaModel: LanguageModel {
     public let ropeTheta: Float
     public let dtype: DType
 
-    init(embedTokens: Embedding, layers: [LlamaLayer],
+    init(embedTokens: Embedding, layers: [Qwen3Layer],
          finalNorm: RMSNorm, lmHead: Linear,
          hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType) {
@@ -259,15 +319,9 @@ public final class LlamaModel: LanguageModel {
         self.layers = layers
         self.finalNorm = finalNorm
         self.lmHead = lmHead
-        self.hidden = hidden
-        self.nLayers = nLayers
-        self.nHeads = nHeads
-        self.nKVHeads = nKVHeads
-        self.headDim = headDim
-        self.vocab = vocab
-        self.maxSeq = maxSeq
-        self.ropeTheta = ropeTheta
-        self.dtype = dtype
+        self.hidden = hidden; self.nLayers = nLayers; self.nHeads = nHeads
+        self.nKVHeads = nKVHeads; self.headDim = headDim; self.vocab = vocab
+        self.maxSeq = maxSeq; self.ropeTheta = ropeTheta; self.dtype = dtype
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -283,7 +337,6 @@ public final class LlamaModel: LanguageModel {
         return out
     }
 
-    /// Make a fresh KV cache for one inference session.
     public func makeKVCache(maxSeq: Int?, device: Device) -> [KVCache] {
         let cap = maxSeq ?? self.maxSeq
         return (0..<nLayers).map { _ in
@@ -291,11 +344,8 @@ public final class LlamaModel: LanguageModel {
         }
     }
 
-    /// Single-token forward. `tokenId` is the input token; `position` is
-    /// its absolute sequence index. Returns logits [vocab].
     public func forward(tokenId: Int, position: Int,
                         caches: [KVCache], device: Device) -> Tensor {
-        // Embedding
         let cmd0 = device.makeCommandBuffer()
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
@@ -305,20 +355,17 @@ public final class LlamaModel: LanguageModel {
         cmd0.commit()
         cmd0.waitUntilCompleted()
 
-        // Layers
         for (i, layer) in layers.enumerated() {
             let cmdL = device.makeCommandBuffer()
             h = layer.forward(h, position: position, cache: caches[i],
                               cmd: cmdL, device: device)
         }
 
-        // Final norm + lm head
         let cmdF = device.makeCommandBuffer()
         let normed = finalNorm(h, on: cmdF)
         let logits = lmHead(normed, on: cmdF)
         cmdF.commit()
         cmdF.waitUntilCompleted()
-
         return logits
     }
 }

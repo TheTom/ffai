@@ -24,16 +24,17 @@ struct LlamaIntegrationTests {
         }
 
         // Sanity: shapes match the published config
-        #expect(m.llama.hidden == 2048)
-        #expect(m.llama.nLayers == 16)
-        #expect(m.llama.nHeads == 32)
-        #expect(m.llama.nKVHeads == 8)
-        #expect(m.llama.headDim == 64)
-        #expect(m.llama.vocab == 128256)
+        #expect(m.engine.hidden == 2048)
+        #expect(m.engine.nLayers == 16)
+        #expect(m.engine.nHeads == 32)
+        #expect(m.engine.nKVHeads == 8)
+        #expect(m.engine.headDim == 64)
+        #expect(m.engine.vocab == 128256)
+        #expect(m.llama != nil, "expected the engine to be a LlamaModel")
 
         // Forward one token (BOS) and check we get finite, non-zero logits.
-        let caches = m.llama.makeKVCache()
-        let logits = m.llama.forward(tokenId: 128000, position: 0, caches: caches)
+        let caches = m.engine.makeKVCache()
+        let logits = m.engine.forward(tokenId: 128000, position: 0, caches: caches)
         let topByOneToken = Sampling.topN(logits, n: 5)
         #expect(topByOneToken.count == 5)
         #expect(topByOneToken[0].1.isFinite)

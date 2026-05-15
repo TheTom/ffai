@@ -20,28 +20,16 @@ public enum ModelError: Error, CustomStringConvertible {
     }
 }
 
-/// Phase 2 ModelRegistry — only Llama for now. Family files register
-/// their architectures here at compile time.
+/// Routes a config to the right family file. Family files declare which
+/// architecture / model_type strings they handle. Add a new family by
+/// extending `dispatchAndLoad` here.
 public enum ModelRegistry {
-    public static func loadLlama(
-        config: ModelConfig,
-        weights: SafeTensorsBundle,
-        options: LoadOptions,
-        device: Device
-    ) throws -> LlamaModel {
-        let variant = try Llama.variant(for: config)
-        return try variant.loadModel(
-            config: config, weights: weights,
-            options: options, device: device
-        )
-    }
-
     public static func dispatchAndLoad(
         config: ModelConfig,
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> LlamaModel {
+    ) throws -> any LanguageModel {
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(config: config, weights: weights,
                                  options: options, device: device)
@@ -50,8 +38,38 @@ public enum ModelRegistry {
             return try loadLlama(config: config, weights: weights,
                                  options: options, device: device)
         }
+        if let arch = config.architecture, Qwen3.architectures.contains(arch) {
+            return try loadQwen3(config: config, weights: weights,
+                                 options: options, device: device)
+        }
+        if let mt = config.modelType, Qwen3.modelTypes.contains(mt) {
+            return try loadQwen3(config: config, weights: weights,
+                                 options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
+        )
+    }
+
+    public static func loadLlama(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> LlamaModel {
+        let variant = try Llama.variant(for: config)
+        return try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+    }
+
+    public static func loadQwen3(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Qwen3Model {
+        let variant = try Qwen3.variant(for: config)
+        return try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
         )
     }
 }
@@ -59,12 +77,20 @@ public enum ModelRegistry {
 /// High-level loaded model with tokenizer attached. The public API users
 /// touch.
 public final class Model: @unchecked Sendable {
-    public let llama: LlamaModel
+    /// The concrete model engine (LlamaModel, Qwen3Model, …).
+    public let engine: any LanguageModel
     public let tokenizer: any Tokenizer
     public let config: ModelConfig
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
     public let enabledCapabilities: Set<Capability>
+
+    /// Convenience accessor for tests + tools that want the Llama-typed
+    /// model. Returns nil if the loaded engine isn't Llama.
+    public var llama: LlamaModel? { engine as? LlamaModel }
+
+    /// Convenience accessor for the Qwen3 engine.
+    public var qwen3: Qwen3Model? { engine as? Qwen3Model }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
@@ -77,11 +103,11 @@ public final class Model: @unchecked Sendable {
     public let events: AsyncStream<ModelLifecycleEvent>
     private let eventsContinuation: AsyncStream<ModelLifecycleEvent>.Continuation
 
-    init(llama: LlamaModel, tokenizer: any Tokenizer, config: ModelConfig,
+    init(engine: any LanguageModel, tokenizer: any Tokenizer, config: ModelConfig,
          modelDirectory: URL,
          availableCapabilities: Set<Capability>,
          enabledCapabilities: Set<Capability>) {
-        self.llama = llama
+        self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
         self.modelDirectory = modelDirectory
@@ -116,15 +142,15 @@ public final class Model: @unchecked Sendable {
         let dir = try await locator.resolve(idOrPath: idOrPath, revision: options.revision)
         let config = try ModelConfig.load(from: dir)
         let bundle = try SafeTensorsBundle(directory: dir, device: device)
-        let llama = try ModelRegistry.dispatchAndLoad(
+        let engine = try ModelRegistry.dispatchAndLoad(
             config: config, weights: bundle, options: options, device: device
         )
         let tokenizer = try await TokenizerLoader().load(from: dir)
 
         let model = Model(
-            llama: llama, tokenizer: tokenizer, config: config,
+            engine: engine, tokenizer: tokenizer, config: config,
             modelDirectory: dir,
-            availableCapabilities: LlamaDense.availableCapabilities,
+            availableCapabilities: Capability.textOnly,
             enabledCapabilities: options.capabilities
         )
 
@@ -141,8 +167,7 @@ public final class Model: @unchecked Sendable {
     /// Compile PSOs for the kernels we'll need during decode by running
     /// one no-op forward step. Costs ~100ms-1s on first load.
     public func prewarm() async {
-        let cache = llama.makeKVCache()
-        // Run one decode step on token 0 to warm every PSO.
-        _ = llama.forward(tokenId: 0, position: 0, caches: cache)
+        let cache = engine.makeKVCache()
+        _ = engine.forward(tokenId: 0, position: 0, caches: cache)
     }
 }
