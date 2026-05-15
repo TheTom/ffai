@@ -37,6 +37,8 @@ struct FFAICommand: AsyncParsableCommand {
             // to a sampling strategy.
             let promptTokens = m.tokenizer.encode(text: prompt)
             print("prompt tokens: \(promptTokens)")
+
+
             let caches = m.engine.makeKVCache()
             var lastLogits: Tensor?
             for (i, t) in promptTokens.enumerated() {

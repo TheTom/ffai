@@ -88,6 +88,21 @@ public struct ModelConfig: @unchecked Sendable {
     }
     /// `bos_token_id`
     public var bosTokenId: Int? { int("bos_token_id") }
+
+    /// MLX quantization block: `{ "group_size": Int, "bits": Int }`.
+    /// Returns nil for unquantized checkpoints.
+    public struct QuantizationConfig: Sendable {
+        public let bits: Int
+        public let groupSize: Int
+    }
+
+    public var quantization: QuantizationConfig? {
+        guard let q = nested("quantization"),
+              let bits = q["bits"] as? Int,
+              let group = q["group_size"] as? Int
+        else { return nil }
+        return QuantizationConfig(bits: bits, groupSize: group)
+    }
 }
 
 public enum ModelConfigError: Error, CustomStringConvertible {

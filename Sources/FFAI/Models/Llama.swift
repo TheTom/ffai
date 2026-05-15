@@ -72,9 +72,14 @@ public struct LlamaDense: LlamaVariant {
             )
         }
 
-        // Embedding
-        let embedWeight = try weights.tensor(named: "model.embed_tokens.weight")
-        let embedTokens = Embedding(weight: embedWeight)
+        let quant = config.quantization
+
+        // Embedding — quantized if the bundle has matching scales/biases
+        // (mlx-community 4-bit checkpoints typically quantize this).
+        let embedTokens = try loadEmbedding(
+            base: "model.embed_tokens", in: weights,
+            hidden: hidden, quantization: quant
+        )
 
         // Layers
         var layers: [LlamaLayer] = []
@@ -82,14 +87,14 @@ public struct LlamaDense: LlamaVariant {
         for i in 0..<nLayers {
             let p = "model.layers.\(i)"
 
-            let qProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.q_proj.weight"))
-            let kProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.k_proj.weight"))
-            let vProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.v_proj.weight"))
-            let oProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.o_proj.weight"))
+            let qProj = try loadLinear(base: "\(p).self_attn.q_proj", in: weights, quantization: quant)
+            let kProj = try loadLinear(base: "\(p).self_attn.k_proj", in: weights, quantization: quant)
+            let vProj = try loadLinear(base: "\(p).self_attn.v_proj", in: weights, quantization: quant)
+            let oProj = try loadLinear(base: "\(p).self_attn.o_proj", in: weights, quantization: quant)
 
-            let gateProj = Linear(weight: try weights.tensor(named: "\(p).mlp.gate_proj.weight"))
-            let upProj = Linear(weight: try weights.tensor(named: "\(p).mlp.up_proj.weight"))
-            let downProj = Linear(weight: try weights.tensor(named: "\(p).mlp.down_proj.weight"))
+            let gateProj = try loadLinear(base: "\(p).mlp.gate_proj", in: weights, quantization: quant)
+            let upProj = try loadLinear(base: "\(p).mlp.up_proj", in: weights, quantization: quant)
+            let downProj = try loadLinear(base: "\(p).mlp.down_proj", in: weights, quantization: quant)
 
             let inputNorm = RMSNorm(
                 weight: try weights.tensor(named: "\(p).input_layernorm.weight"),
@@ -113,15 +118,34 @@ public struct LlamaDense: LlamaVariant {
             weight: try weights.tensor(named: "model.norm.weight"),
             eps: Float(eps))
 
-        // LM head
-        let lmHead: Linear
-        if tieEmbed {
-            lmHead = Linear(weight: embedWeight)
-        } else if let w = try? weights.tensor(named: "lm_head.weight") {
-            lmHead = Linear(weight: w)
+        // LM head. Three cases:
+        //   1. !tieEmbed and the checkpoint has lm_head: load it (quant
+        //      if applicable).
+        //   2. tieEmbed AND embedding is quantized: reuse the embedding's
+        //      QuantizedLinear-shaped triplet for the lm_head gemv.
+        //   3. tieEmbed AND embedding is full precision: tie weights.
+        let lmHead: AnyLinear
+        if !tieEmbed, weights.has("lm_head.weight") {
+            lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
+        } else if let q = quant, q.bits == 4, weights.isQuantized("model.embed_tokens") {
+            let t = try weights.quantizedTriplet("model.embed_tokens")
+            lmHead = AnyLinear(QuantizedLinear(
+                weight: t.weight, scales: t.scales, biases: t.biases,
+                groupSize: q.groupSize
+            ))
         } else {
-            // Some checkpoints omit lm_head when tying; fall back to embed.
-            lmHead = Linear(weight: embedWeight)
+            lmHead = AnyLinear(Linear(weight: embedTokens.weight))
+        }
+
+        // Activation/inference dtype: prefer the scales dtype for
+        // quantized models (the f16/bf16 the model actually computes
+        // in), fall back to the embedding weight dtype otherwise.
+        let activationDtype: DType
+        if weights.isQuantized("model.embed_tokens"),
+           let scales = try? weights.tensor(named: "model.embed_tokens.scales") {
+            activationDtype = scales.dtype
+        } else {
+            activationDtype = embedTokens.weight.dtype
         }
 
         return LlamaModel(
@@ -129,7 +153,7 @@ public struct LlamaDense: LlamaVariant {
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
             nKVHeads: nKVHeads, headDim: headDim, vocab: vocab,
-            maxSeq: maxSeq, ropeTheta: theta, dtype: embedWeight.dtype
+            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype
         )
     }
 }
@@ -146,16 +170,16 @@ public enum LlamaError: Error, CustomStringConvertible {
 // ─── Layer (attention + MLP) ─────────────────────────────────────────
 
 public final class LlamaLayer: Module {
-    let qProj, kProj, vProj, oProj: Linear
-    let gateProj, upProj, downProj: Linear
+    let qProj, kProj, vProj, oProj: AnyLinear
+    let gateProj, upProj, downProj: AnyLinear
     let inputNorm, postAttnNorm: RMSNorm
     let hidden, nHeads, nKVHeads, headDim, intermediate: Int
     let ropeTheta: Float
     let ropeScaling: Ops.RoPEScaling
     let scale: Float
 
-    init(qProj: Linear, kProj: Linear, vProj: Linear, oProj: Linear,
-         gateProj: Linear, upProj: Linear, downProj: Linear,
+    init(qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear, oProj: AnyLinear,
+         gateProj: AnyLinear, upProj: AnyLinear, downProj: AnyLinear,
          inputNorm: RMSNorm, postAttnNorm: RMSNorm,
          hidden: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          intermediate: Int, ropeTheta: Float,
@@ -242,17 +266,17 @@ public final class LlamaLayer: Module {
 // ─── Whole model ─────────────────────────────────────────────────────
 
 public final class LlamaModel: LanguageModel {
-    public let embedTokens: Embedding
+    public let embedTokens: AnyEmbedding
     public let layers: [LlamaLayer]
     public let finalNorm: RMSNorm
-    public let lmHead: Linear
+    public let lmHead: AnyLinear
 
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let ropeTheta: Float
     public let dtype: DType
 
-    init(embedTokens: Embedding, layers: [LlamaLayer],
-         finalNorm: RMSNorm, lmHead: Linear,
+    init(embedTokens: AnyEmbedding, layers: [LlamaLayer],
+         finalNorm: RMSNorm, lmHead: AnyLinear,
          hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType) {
         self.embedTokens = embedTokens

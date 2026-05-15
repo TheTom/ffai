@@ -47,19 +47,24 @@ public enum SafeTensorsError: Error, CustomStringConvertible {
     }
 }
 
-/// One safetensors file mmap'd into one MTLBuffer (zero-copy on
-/// Apple Silicon; Metal sees the same pages as the page cache).
+/// One safetensors file mmap'd zero-copy. Each tensor entry gets its
+/// own MTLBuffer wrapping the slice of the mmap'd region it occupies.
+/// (Apple's Metal driver has aliasing/correctness issues when binding
+/// the same MTLBuffer at multiple offsets per dispatch, so we use
+/// per-tensor MTLBuffers — still zero-copy because they all wrap the
+/// same mmap.)
 public final class SafeTensorsFile: @unchecked Sendable {
-    public struct Entry: Sendable {
+    public struct Entry: @unchecked Sendable {
         public let name: String
         public let dtype: DType
         public let shape: [Int]
-        /// Byte offset within `buffer` (already accounts for the header).
-        public let bufferOffset: Int
+        /// MTLBuffer for this tensor (offset is always 0).
+        public let buffer: MTLBuffer
     }
 
     public let url: URL
-    public let buffer: MTLBuffer
+    public let mappedBase: UnsafeMutableRawPointer
+    public let mappedLength: Int
     public let entries: [String: Entry]
 
     public init(url: URL, device: Device = .shared) throws {
@@ -111,22 +116,13 @@ public final class SafeTensorsFile: @unchecked Sendable {
             throw SafeTensorsError.mmapFailed(resolvedURL)
         }
 
-        // Wrap mmap'd region as a no-copy MTLBuffer. Deallocator unmaps.
-        guard let buf = device.mtlDevice.makeBuffer(
-            bytesNoCopy: mapped,
-            length: totalBytes,
-            options: [],
-            deallocator: { ptr, len in
-                munmap(ptr, len)
-            }
-        ) else {
-            munmap(mapped, totalBytes)
-            throw SafeTensorsError.mtlBufferFailed
-        }
-
         // Header + 8 bytes header-length prefix, all skipped from data section
         let dataStart = 8 + Int(headerLen)
 
+        // Per-tensor MTLBuffers wrapping mmap slices. We retain ownership
+        // of the mmap via the `mappedBase` / `mappedLength` fields and
+        // unmap in `deinit`. None of the MTLBuffer deallocators get to
+        // call munmap directly (we'd unmap mid-execution).
         var parsed: [String: Entry] = [:]
         for (name, value) in json {
             if name == "__metadata__" { continue }
@@ -135,7 +131,8 @@ public final class SafeTensorsFile: @unchecked Sendable {
                   let shapeAny = dict["shape"] as? [Any],
                   let offsets = dict["data_offsets"] as? [Any],
                   offsets.count == 2,
-                  let startNum = offsets[0] as? NSNumber
+                  let startNum = offsets[0] as? NSNumber,
+                  let endNum = offsets[1] as? NSNumber
             else {
                 throw SafeTensorsError.headerEntryMalformed(name)
             }
@@ -146,23 +143,41 @@ public final class SafeTensorsFile: @unchecked Sendable {
             guard shape.count == shapeAny.count else {
                 throw SafeTensorsError.headerEntryMalformed(name)
             }
-            parsed[name] = Entry(
-                name: name,
-                dtype: dtype,
-                shape: shape,
-                bufferOffset: dataStart + startNum.intValue
-            )
+            let absStart = dataStart + startNum.intValue
+            let length = endNum.intValue - startNum.intValue
+            let ptr = mapped.advanced(by: absStart)
+            // Per-tensor MTLBuffer, offset 0. We copy from the mmap into
+            // a freshly-allocated page-aligned shared buffer because
+            // makeBuffer(bytesNoCopy:) requires page-aligned pointers
+            // (Apple Silicon page size = 16 KiB), and arbitrary offsets
+            // into a mmap'd safetensors file are not page-aligned.
+            // Cost: one extra memcpy of the full file at load time.
+            guard let perTensorBuf = device.mtlDevice.makeBuffer(
+                bytes: ptr, length: length,
+                options: [.storageModeShared]
+            ) else {
+                munmap(mapped, totalBytes)
+                throw SafeTensorsError.mtlBufferFailed
+            }
+            parsed[name] = Entry(name: name, dtype: dtype,
+                                 shape: shape, buffer: perTensorBuf)
         }
 
         self.url = url
-        self.buffer = buf
+        self.mappedBase = mapped
+        self.mappedLength = totalBytes
         self.entries = parsed
     }
 
-    /// Get a Tensor view over a named entry (no copy).
+    deinit {
+        munmap(mappedBase, mappedLength)
+    }
+
+    /// Get a Tensor view over a named entry (no copy). Each tensor has
+    /// its own MTLBuffer at offset 0.
     public func tensor(named: String) throws -> Tensor {
         guard let e = entries[named] else { throw SafeTensorsError.missingTensor(named) }
-        return Tensor(buffer: buffer, offset: e.bufferOffset, shape: e.shape, dtype: e.dtype)
+        return Tensor(buffer: e.buffer, offset: 0, shape: e.shape, dtype: e.dtype)
     }
 }
 
@@ -229,4 +244,28 @@ public final class SafeTensorsBundle: @unchecked Sendable {
 
     public var allKeys: [String] { Array(index.keys).sorted() }
     public var has: (String) -> Bool { { [self] name in index[name] != nil } }
+
+    // ─── Quantized weight helpers (mlx int4 layout) ──────────────────
+
+    /// True if `<base>.scales` and `<base>.biases` exist alongside `<base>.weight`,
+    /// indicating an MLX-format quantized linear.
+    public func isQuantized(_ base: String) -> Bool {
+        index["\(base).scales"] != nil && index["\(base).biases"] != nil
+    }
+
+    public struct QuantizedTriplet: Sendable {
+        public let weight: Tensor
+        public let scales: Tensor
+        public let biases: Tensor
+    }
+
+    /// Load `(weight, scales, biases)` for a quantized linear at `base`.
+    /// The weight at `base.weight` is the packed uint32 tensor.
+    public func quantizedTriplet(_ base: String) throws -> QuantizedTriplet {
+        return QuantizedTriplet(
+            weight: try tensor(named: "\(base).weight"),
+            scales: try tensor(named: "\(base).scales"),
+            biases: try tensor(named: "\(base).biases")
+        )
+    }
 }

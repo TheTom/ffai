@@ -331,6 +331,116 @@ public enum Ops {
         return result
     }
 
+    /// MLX-format int4 dequantizing gather (embedding lookup with packed
+    /// uint32 weights). Output dtype matches scales/biases.
+    public static func dequantGatherInt4(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        tokenIds: Tensor, hidden: Int, groupSize: Int,
+        on cmd: MTLCommandBuffer, into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(weight.dtype == .u32, "dequantGatherInt4: weight must be u32 packed")
+        precondition(tokenIds.dtype == .u32, "dequantGatherInt4: tokenIds must be u32")
+        precondition(scales.dtype == biases.dtype, "dequantGatherInt4: scales/biases dtype mismatch")
+        let n = tokenIds.elementCount
+        let result = out ?? Tensor.empty(shape: [n, hidden], dtype: scales.dtype)
+        let totalThreads = n * hidden
+        let (grid, tg) = elementwiseGrid(totalThreads)
+        switch scales.dtype {
+        case .f32:
+            MetalTileKernels.dequant_gather_int4_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: UInt32(hidden), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.dequant_gather_int4_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: UInt32(hidden), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.dequant_gather_int4_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: UInt32(hidden), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.dequantGatherInt4: unsupported dtype \(scales.dtype)")
+        }
+        return result
+    }
+
+    /// MLX-format int4 dequantizing GEMV. Weight is packed uint32 (each
+    /// uint32 packs 8 int4 values, low nibble first). For each
+    /// `groupSize`-wide stripe of the in_dim axis, a per-row (scale, bias)
+    /// pair dequantizes via `w_real = q * scale + bias`. Fused with the
+    /// gemv accumulator — the full weight matrix is never materialized.
+    ///
+    /// weight  [out_dim, in_dim/8]              uint32
+    /// scales  [out_dim, in_dim/groupSize]      same dtype as input/output
+    /// biases  [out_dim, in_dim/groupSize]      same dtype as input/output
+    /// input   [in_dim]                         scaling/output dtype
+    /// output  [out_dim]                        scaling/output dtype
+    public static func dequantGemvInt4(
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        input: Tensor, groupSize: Int = 64,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(weight.shape.count == 2, "dequantGemvInt4: weight must be 2D")
+        precondition(weight.dtype == .u32, "dequantGemvInt4: weight must be u32 (packed)")
+        precondition(scales.dtype == input.dtype && biases.dtype == input.dtype,
+                     "dequantGemvInt4: scales/biases dtype must match input")
+        let outDim = weight.shape[0]
+        let packedPerRow = weight.shape[1]
+        let inDim = packedPerRow * 8
+        precondition(input.elementCount == inDim,
+                     "dequantGemvInt4: input \(input.elementCount) ≠ in_dim \(inDim)")
+        let result = out ?? Tensor.empty(shape: [outDim], dtype: input.dtype)
+        let (grid, tg) = elementwiseGrid(outDim)
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.dequant_gemv_int4_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.dequant_gemv_int4_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.dequant_gemv_int4_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.dequantGemvInt4: unsupported dtype \(input.dtype)")
+        }
+        return result
+    }
+
     /// SDPA decode. q: [n_q_heads, head_dim]. k/v cache layout:
     /// [n_kv_heads, kv_stride, head_dim] where kv_stride is the physical
     /// capacity (maxSeq) and nKV is how many positions to attend to.

@@ -98,9 +98,13 @@ public struct Qwen3Dense: Qwen3Variant {
             }
         }
 
-        // Embedding
-        let embedWeight = try weights.tensor(named: "model.embed_tokens.weight")
-        let embedTokens = Embedding(weight: embedWeight)
+        let quant = config.quantization
+
+        // Embedding — quantized if the bundle has matching scales/biases.
+        let embedTokens = try loadEmbedding(
+            base: "model.embed_tokens", in: weights,
+            hidden: hidden, quantization: quant
+        )
 
         // Layers
         var layers: [Qwen3Layer] = []
@@ -108,10 +112,10 @@ public struct Qwen3Dense: Qwen3Variant {
         for i in 0..<nLayers {
             let p = "model.layers.\(i)"
 
-            let qProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.q_proj.weight"))
-            let kProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.k_proj.weight"))
-            let vProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.v_proj.weight"))
-            let oProj = Linear(weight: try weights.tensor(named: "\(p).self_attn.o_proj.weight"))
+            let qProj = try loadLinear(base: "\(p).self_attn.q_proj", in: weights, quantization: quant)
+            let kProj = try loadLinear(base: "\(p).self_attn.k_proj", in: weights, quantization: quant)
+            let vProj = try loadLinear(base: "\(p).self_attn.v_proj", in: weights, quantization: quant)
+            let oProj = try loadLinear(base: "\(p).self_attn.o_proj", in: weights, quantization: quant)
 
             // Per-head Q/K RMSNorm — the structural delta vs Llama.
             let qNorm = RMSNorm(
@@ -121,9 +125,9 @@ public struct Qwen3Dense: Qwen3Variant {
                 weight: try weights.tensor(named: "\(p).self_attn.k_norm.weight"),
                 eps: Float(eps))
 
-            let gateProj = Linear(weight: try weights.tensor(named: "\(p).mlp.gate_proj.weight"))
-            let upProj = Linear(weight: try weights.tensor(named: "\(p).mlp.up_proj.weight"))
-            let downProj = Linear(weight: try weights.tensor(named: "\(p).mlp.down_proj.weight"))
+            let gateProj = try loadLinear(base: "\(p).mlp.gate_proj", in: weights, quantization: quant)
+            let upProj = try loadLinear(base: "\(p).mlp.up_proj", in: weights, quantization: quant)
+            let downProj = try loadLinear(base: "\(p).mlp.down_proj", in: weights, quantization: quant)
 
             let inputNorm = RMSNorm(
                 weight: try weights.tensor(named: "\(p).input_layernorm.weight"),
@@ -148,14 +152,27 @@ public struct Qwen3Dense: Qwen3Variant {
             weight: try weights.tensor(named: "model.norm.weight"),
             eps: Float(eps))
 
-        // LM head
-        let lmHead: Linear
-        if tieEmbed {
-            lmHead = Linear(weight: embedWeight)
-        } else if let w = try? weights.tensor(named: "lm_head.weight") {
-            lmHead = Linear(weight: w)
+        // LM head. Tied / quantized variants — same as Llama.
+        let lmHead: AnyLinear
+        if !tieEmbed, weights.has("lm_head.weight") {
+            lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
+        } else if let q = quant, q.bits == 4, weights.isQuantized("model.embed_tokens") {
+            let t = try weights.quantizedTriplet("model.embed_tokens")
+            lmHead = AnyLinear(QuantizedLinear(
+                weight: t.weight, scales: t.scales, biases: t.biases,
+                groupSize: q.groupSize
+            ))
         } else {
-            lmHead = Linear(weight: embedWeight)
+            lmHead = AnyLinear(Linear(weight: embedTokens.weight))
+        }
+
+        // Activation/inference dtype: prefer scales for quantized models.
+        let activationDtype: DType
+        if weights.isQuantized("model.embed_tokens"),
+           let scales = try? weights.tensor(named: "model.embed_tokens.scales") {
+            activationDtype = scales.dtype
+        } else {
+            activationDtype = embedTokens.weight.dtype
         }
 
         return Qwen3Model(
@@ -163,7 +180,7 @@ public struct Qwen3Dense: Qwen3Variant {
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
             nKVHeads: nKVHeads, headDim: headDim, vocab: vocab,
-            maxSeq: maxSeq, ropeTheta: theta, dtype: embedWeight.dtype
+            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype
         )
     }
 }
@@ -171,18 +188,18 @@ public struct Qwen3Dense: Qwen3Variant {
 // ─── Qwen3Layer ──────────────────────────────────────────────────────
 
 public final class Qwen3Layer: Module {
-    let qProj, kProj, vProj, oProj: Linear
+    let qProj, kProj, vProj, oProj: AnyLinear
     let qNorm, kNorm: RMSNorm
-    let gateProj, upProj, downProj: Linear
+    let gateProj, upProj, downProj: AnyLinear
     let inputNorm, postAttnNorm: RMSNorm
     let hidden, nHeads, nKVHeads, headDim, intermediate: Int
     let ropeTheta: Float
     let ropeScaling: Ops.RoPEScaling
     let scale: Float
 
-    init(qProj: Linear, kProj: Linear, vProj: Linear, oProj: Linear,
+    init(qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear, oProj: AnyLinear,
          qNorm: RMSNorm, kNorm: RMSNorm,
-         gateProj: Linear, upProj: Linear, downProj: Linear,
+         gateProj: AnyLinear, upProj: AnyLinear, downProj: AnyLinear,
          inputNorm: RMSNorm, postAttnNorm: RMSNorm,
          hidden: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          intermediate: Int, ropeTheta: Float,
@@ -302,17 +319,17 @@ public final class Qwen3Layer: Module {
 // ─── Qwen3Model ──────────────────────────────────────────────────────
 
 public final class Qwen3Model: LanguageModel {
-    public let embedTokens: Embedding
+    public let embedTokens: AnyEmbedding
     public let layers: [Qwen3Layer]
     public let finalNorm: RMSNorm
-    public let lmHead: Linear
+    public let lmHead: AnyLinear
 
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let ropeTheta: Float
     public let dtype: DType
 
-    init(embedTokens: Embedding, layers: [Qwen3Layer],
-         finalNorm: RMSNorm, lmHead: Linear,
+    init(embedTokens: AnyEmbedding, layers: [Qwen3Layer],
+         finalNorm: RMSNorm, lmHead: AnyLinear,
          hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
          vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType) {
         self.embedTokens = embedTokens
