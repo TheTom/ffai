@@ -11,7 +11,7 @@ import Metal
 import Testing
 @testable import MetalTileSwift
 
-@Suite("vector_add round-trip")
+@Suite("add_f32 round-trip")
 struct VectorAddTests {
     @Test("a + b produces expected output")
     func vectorAdd() throws {
@@ -37,7 +37,7 @@ struct VectorAddTests {
         }
 
         let cache = PSOCache(library: lib)
-        let pso = try cache.pipelineStateThrowing(for: "vector_add")
+        let pso = try cache.pipelineStateThrowing(for: "add_f32")
 
         // Dispatch one thread per element. vector_add is Elementwise mode:
         // `program_id::<0>()` returns thread_position_in_grid.
