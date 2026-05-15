@@ -4,7 +4,7 @@
 
 A minimal, dependency-light LLM inference library for Apple Silicon, built on
 pre-compiled Metal kernels generated from the [metaltile](https://github.com/metaltile/metaltile)
-DSL. No MLX. No JIT. No four-repo dependency chain.
+DSL. No Python. MLX. No C compilation. No JIT. No four-repo dependency chain. Just fucking fast AI.
 
 ## Status
 
@@ -15,6 +15,18 @@ Early bootstrap.
 - [`planning/architecture.md`](planning/architecture.md) — visual
   reference for kernel generation, model loading, and the inference
   dispatch loop
+
+## Models Supported
+
+TODO: Fill in
+
+## Features
+
+TODO: Fill in with kv cache schemes, multi-modal, hot loading features, speculative decoding, etc.
+
+## Quick Start
+
+TODO: Fill in with code usage example
 
 ## Architecture (target)
 
@@ -44,6 +56,10 @@ Early bootstrap.
 │       MetalTileKernels.swift  (typed wrappers)          │
 └─────────────────────────────────────────────────────────┘
 ```
+
+## Developing
+
+TODO: Fill in with quick set up - git clone, run setup-dev.sh, etc. Link to development docs for best practices and testing.
 
 ## License
 

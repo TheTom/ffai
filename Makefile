@@ -37,10 +37,11 @@ regenerate-kernels: ## run metaltile-emit to regenerate metallib + Swift wrapper
 	  echo "Clone the sibling metaltile repo at ../metaltile."; \
 	  exit 1; \
 	fi
-	@# TODO Phase 0: uncomment once metaltile-emit bin lands.
-	@# cargo run --release --manifest-path $(METALTILE_DIR)/Cargo.toml \
-	@#   -p metaltile-emit -- --out $(KERNEL_OUT)
-	@echo "metaltile-emit not yet implemented (Phase 0 deliverable)"
+	@# Run cargo from the metaltile dir so its rust-toolchain.toml (nightly,
+	@# 2024 edition) is honored. Running cargo from FFAI/ would use the
+	@# system default toolchain, which lacks edition=2024 support.
+	cd $(METALTILE_DIR) && cargo run --release \
+	  -p metaltile-emit -- --out $(KERNEL_OUT)
 
 # ─── Test ─────────────────────────────────────────────────────────────
 .PHONY: test

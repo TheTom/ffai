@@ -78,13 +78,12 @@ jobs:
         # Phase 0: this step compiles metaltile and produces
         # kernels.metallib + manifest.json + Generated/MetalTileKernels.swift
         # into FFAI/Sources/MetalTileSwift/. Once the SPM build plugin lands
-        # this becomes implicit.
+        # (post-Phase 0) this becomes implicit. Run from metaltile/ so its
+        # rust-toolchain.toml (nightly, 2024 edition) is picked up.
+        working-directory: metaltile
         run: |
-          # TODO: implement metaltile-emit bin and uncomment:
-          # cargo run --release --manifest-path ../metaltile/Cargo.toml \
-          #   -p metaltile-emit -- \
-          #   --out Sources/MetalTileSwift
-          echo "metaltile-emit not yet implemented (Phase 0 deliverable)"
+          cargo run --release -p metaltile-emit -- \
+            --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
 
       - name: Build
         run: swift build
