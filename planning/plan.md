@@ -571,7 +571,7 @@ based on what's most demanded; we don't need to commit now).
 
 ---
 
-## Phase 5 — Autotuner
+## Phase 6 — Autotuner
 
 Implement `metaltile-runtime`'s autotuner for real (currently stubbed):
 

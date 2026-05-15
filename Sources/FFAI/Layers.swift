@@ -27,26 +27,31 @@ public final class Linear: Module {
 
 // ─── QuantizedLinear (mlx int4 format) ────────────────────────────────
 
-/// Linear layer backed by mlx-format int4-quantized weights.
-/// Storage is the (weight, scales, biases) triplet plus group_size:
+/// Linear layer backed by mlx-format quantized weights (int4 or int8).
+/// Storage is the (weight, scales, biases) triplet plus (bits, group_size).
 ///
-///   weight   [out_features, in_features / 8]   uint32 (packed)
+///   weight   [out_features, in_features / pack_factor]  uint32
+///            pack_factor = 32 / bits (8 for int4, 4 for int8)
 ///   scales   [out_features, in_features / group_size]
 ///   biases   [out_features, in_features / group_size]
 ///
-/// callAsFunction dispatches Ops.dequantGemvInt4 — fused dequant + gemv.
+/// callAsFunction dispatches Ops.dequantGemv — fused dequant + gemv.
 public final class QuantizedLinear: Module {
     public let weight: Tensor
     public let scales: Tensor
     public let biases: Tensor
+    public let bits: Int
     public let groupSize: Int
 
-    public init(weight: Tensor, scales: Tensor, biases: Tensor, groupSize: Int) {
+    public init(weight: Tensor, scales: Tensor, biases: Tensor,
+                bits: Int, groupSize: Int) {
         precondition(weight.dtype == .u32, "QuantizedLinear: weight must be u32 packed")
         precondition(weight.shape.count == 2, "QuantizedLinear: weight must be 2D")
+        precondition(bits == 4 || bits == 8, "QuantizedLinear: bits must be 4 or 8")
         self.weight = weight
         self.scales = scales
         self.biases = biases
+        self.bits = bits
         self.groupSize = groupSize
     }
 
@@ -55,9 +60,9 @@ public final class QuantizedLinear: Module {
     }
 
     public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
-        Ops.dequantGemvInt4(
+        Ops.dequantGemv(
             weight: weight, scales: scales, biases: biases,
-            input: x, groupSize: groupSize, on: cmd
+            input: x, bits: bits, groupSize: groupSize, on: cmd
         )
     }
 }
@@ -86,17 +91,18 @@ public final class AnyLinear: Module {
 }
 
 /// Build the right Linear variant for a weight at `<base>.weight` —
-/// QuantizedLinear if the bundle has matching `.scales`/`.biases`,
-/// regular Linear otherwise.
+/// QuantizedLinear if the bundle has matching `.scales`/`.biases` and
+/// the config quantization block specifies a supported bit-width
+/// (4 or 8), regular Linear otherwise.
 public func loadLinear(
     base: String, in bundle: SafeTensorsBundle,
     quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyLinear {
-    if let q = quantization, q.bits == 4, bundle.isQuantized(base) {
+    if let q = quantization, (q.bits == 4 || q.bits == 8), bundle.isQuantized(base) {
         let t = try bundle.quantizedTriplet(base)
         return AnyLinear(QuantizedLinear(
             weight: t.weight, scales: t.scales, biases: t.biases,
-            groupSize: q.groupSize
+            bits: q.bits, groupSize: q.groupSize
         ))
     }
     return AnyLinear(Linear(weight: try bundle.tensor(named: "\(base).weight")))
@@ -127,18 +133,21 @@ public final class Embedding: Module {
 // ─── QuantizedEmbedding (mlx int4 format) ─────────────────────────────
 
 public final class QuantizedEmbedding: Module {
-    public let weight: Tensor   // [vocab, hidden/8] uint32
+    public let weight: Tensor   // [vocab, hidden/pack_factor] uint32
     public let scales: Tensor
     public let biases: Tensor
     public let hidden: Int
+    public let bits: Int
     public let groupSize: Int
 
     public init(weight: Tensor, scales: Tensor, biases: Tensor,
-                hidden: Int, groupSize: Int) {
+                hidden: Int, bits: Int, groupSize: Int) {
+        precondition(bits == 4 || bits == 8, "QuantizedEmbedding: bits must be 4 or 8")
         self.weight = weight
         self.scales = scales
         self.biases = biases
         self.hidden = hidden
+        self.bits = bits
         self.groupSize = groupSize
     }
 
@@ -147,9 +156,9 @@ public final class QuantizedEmbedding: Module {
     }
 
     public func callAsFunction(_ tokenIds: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
-        Ops.dequantGatherInt4(
+        Ops.dequantGather(
             weight: weight, scales: scales, biases: biases,
-            tokenIds: tokenIds, hidden: hidden, groupSize: groupSize,
+            tokenIds: tokenIds, hidden: hidden, bits: bits, groupSize: groupSize,
             on: cmd
         )
     }
@@ -186,11 +195,11 @@ public func loadEmbedding(
     base: String, in bundle: SafeTensorsBundle,
     hidden: Int, quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyEmbedding {
-    if let q = quantization, q.bits == 4, bundle.isQuantized(base) {
+    if let q = quantization, (q.bits == 4 || q.bits == 8), bundle.isQuantized(base) {
         let t = try bundle.quantizedTriplet(base)
         return AnyEmbedding(QuantizedEmbedding(
             weight: t.weight, scales: t.scales, biases: t.biases,
-            hidden: hidden, groupSize: q.groupSize
+            hidden: hidden, bits: q.bits, groupSize: q.groupSize
         ))
     }
     return AnyEmbedding(Embedding(weight: try bundle.tensor(named: "\(base).weight")))

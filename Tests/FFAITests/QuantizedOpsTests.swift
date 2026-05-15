@@ -21,6 +21,14 @@ struct QuantizedOpsTests {
         return w
     }
 
+    /// Pack 4 8-bit values (low byte first) into one uint32.
+    static func pack4Bytes(_ q: [UInt32]) -> UInt32 {
+        precondition(q.count == 4)
+        var w: UInt32 = 0
+        for i in 0..<4 { w |= (q[i] & 0xFF) << (8 * UInt32(i)) }
+        return w
+    }
+
     @Test("int4 dequant gather + matrix multiply matches CPU at group_size=64")
     func realShapeRoundTrip() {
         // Realistic shape: 4 rows × 128 in_dim, group_size=64 → 2 groups per row.
@@ -84,6 +92,78 @@ struct QuantizedOpsTests {
         for i in 0..<outDim {
             #expect(abs(got[i] - expected[i]) < 1e-2,
                     "row \(i): got \(got[i]) expected \(expected[i])")
+        }
+    }
+
+    @Test("int8 dequant gemv (group_size=64, bf16 scales/biases) matches CPU")
+    func roundTripInt8Bf16() {
+        let outDim = 2
+        let inDim = 128
+        let gs = 64
+        let nGroups = inDim / gs
+
+        // 8-bit values (0..255)
+        var q = [[UInt32]](repeating: [], count: outDim)
+        for r in 0..<outDim {
+            q[r] = (0..<inDim).map { UInt32(($0 + r * 13) & 0xFF) }
+        }
+        let scales: [Float] = (0..<(outDim * nGroups)).map { Float($0 + 1) * 0.001 }
+        let biases: [Float] = (0..<(outDim * nGroups)).map { Float($0) * -0.0005 }
+        let input: [Float] = (0..<inDim).map { Float($0) * 0.1 - 6.4 }
+
+        // Pack 4 8-bit values per uint32
+        var packed: [UInt32] = []
+        for r in 0..<outDim {
+            for i in stride(from: 0, to: inDim, by: 4) {
+                let bytes = Array(q[r][i..<i+4])
+                packed.append(Self.pack4Bytes(bytes))
+            }
+        }
+
+        // Reference uses bf16-rounded scale/bias values
+        func bf16Round(_ f: Float) -> Float {
+            Float(bitPattern: UInt32(UInt16(truncatingIfNeeded: f.bitPattern >> 16)) << 16)
+        }
+        var expected: [Float] = []
+        for r in 0..<outDim {
+            var acc: Float = 0
+            for g in 0..<nGroups {
+                let s = bf16Round(scales[r * nGroups + g])
+                let b = bf16Round(biases[r * nGroups + g])
+                for j in 0..<gs {
+                    let qv = Float(q[r][g * gs + j])
+                    acc += (qv * s + b) * bf16Round(input[g * gs + j])
+                }
+            }
+            expected.append(acc)
+        }
+
+        let scalesBits = scales.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let biasesBits = biases.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let inputBits  = input.map  { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+
+        let weight = Tensor.empty(shape: [outDim, inDim / 4], dtype: .u32)
+        weight.copyIn(from: packed)
+        let scalesT = Tensor.empty(shape: [outDim, nGroups], dtype: .bf16)
+        scalesT.copyIn(from: scalesBits)
+        let biasesT = Tensor.empty(shape: [outDim, nGroups], dtype: .bf16)
+        biasesT.copyIn(from: biasesBits)
+        let inputT = Tensor.empty(shape: [inDim], dtype: .bf16)
+        inputT.copyIn(from: inputBits)
+
+        let cb = Device.shared.makeCommandBuffer()
+        let out = Ops.dequantGemv(
+            weight: weight, scales: scalesT, biases: biasesT,
+            input: inputT, bits: 8, groupSize: gs, on: cb
+        )
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let got = out.toArray(as: UInt16.self).map { Float(bitPattern: UInt32($0) << 16) }
+        for i in 0..<outDim {
+            let tol = max(abs(expected[i]) * 0.05, 1.0)
+            #expect(abs(got[i] - expected[i]) < tol,
+                    "row \(i): got \(got[i]) expected \(expected[i]) (tol \(tol))")
         }
     }
 
