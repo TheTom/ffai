@@ -488,7 +488,67 @@ decode.
 
 ---
 
-## Phase 4 — Advanced kernels (TurboQuant, GDN, SSM)
+## Phase 4 — Performance optimizations
+
+**Goal:** Close the gap between Phase 0-3 correctness-first kernels
+and the M-series GPU's actual ceiling. The Phase 0-3 implementation
+hit ~5 tok/s on Llama 3.2 1B / 4-bit Qwen3 4B; M1 Max hardware
+should support 80-200 tok/s on these workloads.
+
+**Profile-driven targets, in priority order:**
+
+1. **Eliminate per-layer CPU↔GPU sync.** The Phase 2 KV cache append
+   is a CPU memcpy from rotated K/V into the cache buffer, requiring
+   `cmd.commit(); cmd.waitUntilCompleted()` mid-layer. Replace with a
+   `kv_cache_update` Metal kernel; never sync inside a layer.
+2. **Single MTLCommandBuffer per token.** All layers + sampling on
+   one command buffer; one commit + wait per token (down from
+   ~30-70 currently).
+3. **GPU sampling.** Argmax / top-k / top-p / temperature kernels.
+   Eliminates the per-token logits→CPU readback (~50-300 KB
+   transfer + sync). Only the chosen token id (4 bytes) crosses
+   CPU↔GPU.
+4. **Activate the BufferPool.** Per-token activations come from
+   `BufferPool.shared` instead of fresh `Tensor.empty(...)` per op.
+   Drop pool at end of each token. ~100-150 fewer `makeBuffer` calls
+   per token.
+5. **Cooperative-thread gemv.** Replace `gemv_naive` (one thread per
+   output row, serial inner loop) with the strided-reduce-dot pattern
+   from `metaltile-bench/src/ops/gemv.rs` (one threadgroup per row,
+   simd_sum reduction across the in_dim axis).
+6. **Multi-row RMSNorm.** Qwen3's per-head q_norm/k_norm currently
+   dispatches one `rmsNorm` per head (32 + 8 launches per layer ×
+   36 layers = 1440 launches per token). Replace with a single
+   multi-row dispatch.
+7. **Better SDPA decode.** Port the bench's online-softmax SDPA
+   (`metaltile-bench/src/ops/scaled_dot_product_attention.rs`) — one
+   simdgroup per Q head with cooperative reduction, instead of the
+   naive per-thread recompute-everything approach.
+
+**Targets:**
+
+- Llama 3.2 1B bf16: ≥ 60 tok/s (12× current)
+- Qwen3 4B bf16: ≥ 30 tok/s (18× current)
+- Qwen3 4B 4-bit: ≥ 100 tok/s (20× current)
+
+**Tests:**
+
+- Synthetic correctness for `kv_cache_update`, GPU sampling kernels,
+  cooperative gemv (all against existing CPU/CPU-shadowed reference)
+- All existing integration tests must continue to pass with the new
+  dispatch path
+- New `Tests/PerfTests/` measures tok/s at fixed seed; CI publishes
+  the numbers per commit (regression-tracker)
+
+**Out of scope (deferred to Phase 7 autotuner):**
+
+- Per-shape kernel parameter selection
+- Argument buffer / ICB dispatch modes
+- Multi-token batched prefill
+
+---
+
+## Phase 5 — Advanced kernels (TurboQuant, GDN, SSM)
 
 **Goal:** Port the high-value custom kernels currently in mlx-swift-lm.
 These were the original motivator for this project — the 4-repo dance to
@@ -530,7 +590,7 @@ end-to-end with measured tokens/sec ≥ current mlx-swift-lm baseline.
 
 ---
 
-## Phase 5 — First multi-modal model (vision)
+## Phase 6 — First multi-modal model (vision)
 
 **Goal:** Stress-test the Capability + lifecycle infrastructure with a
 real multi-modal model. Validate that disabled-by-default modalities
@@ -571,7 +631,7 @@ based on what's most demanded; we don't need to commit now).
 
 ---
 
-## Phase 6 — Autotuner
+## Phase 7 — Autotuner
 
 Implement `metaltile-runtime`'s autotuner for real (currently stubbed):
 
@@ -585,7 +645,7 @@ for representative shapes per kernel.
 
 ---
 
-## Phase 7+ — Audio, more model families, polish
+## Phase 8+ — Audio, more model families, polish
 
 - Audio capability (`.audioIn` for STT like Whisper, `.audioOut` for
   TTS) — first audio target TBD
