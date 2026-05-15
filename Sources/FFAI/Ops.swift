@@ -340,7 +340,8 @@ public enum Ops {
         precondition(weight.dtype == .u32, "dequantGather: weight must be u32 packed")
         precondition(tokenIds.dtype == .u32, "dequantGather: tokenIds must be u32")
         precondition(scales.dtype == biases.dtype, "dequantGather: scales/biases dtype mismatch")
-        precondition(bits == 4 || bits == 8, "dequantGather: bits must be 4 or 8")
+        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+                     "dequantGather: bits must be one of 3, 4, 5, 6, or 8")
         let n = tokenIds.elementCount
         let result = out ?? Tensor.empty(shape: [n, hidden], dtype: scales.dtype)
         let totalThreads = n * hidden
@@ -402,6 +403,87 @@ public enum Ops {
                 out: result.buffer, outOffset: result.offset,
                 hidden: hiddenU, group_size: groupSizeU,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .f32):
+            MetalTileKernels.dequant_gather_int6_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .f16):
+            MetalTileKernels.dequant_gather_int6_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .bf16):
+            MetalTileKernels.dequant_gather_int6_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .f32):
+            MetalTileKernels.dequant_gather_int3_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .f16):
+            MetalTileKernels.dequant_gather_int3_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .bf16):
+            MetalTileKernels.dequant_gather_int3_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .f32):
+            MetalTileKernels.dequant_gather_int5_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .f16):
+            MetalTileKernels.dequant_gather_int5_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .bf16):
+            MetalTileKernels.dequant_gather_int5_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: tokenIds.buffer, indicesOffset: tokenIds.offset,
+                out: result.buffer, outOffset: result.offset,
+                hidden: hiddenU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.dequantGather: unsupported (bits=\(bits), dtype=\(scales.dtype))")
         }
@@ -435,11 +517,14 @@ public enum Ops {
         precondition(weight.dtype == .u32, "dequantGemv: weight must be u32 (packed)")
         precondition(scales.dtype == input.dtype && biases.dtype == input.dtype,
                      "dequantGemv: scales/biases dtype must match input")
-        precondition(bits == 4 || bits == 8, "dequantGemv: bits must be 4 or 8")
-        let packFactor = 32 / bits
+        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+                     "dequantGemv: bits must be one of 3, 4, 5, 6, or 8")
         let outDim = weight.shape[0]
         let packedPerRow = weight.shape[1]
-        let inDim = packedPerRow * packFactor
+        // Storage layout: bytes per row = in_dim * bits / 8.
+        // packedPerRow uint32 = (in_dim * bits / 8) / 4 bytes, so:
+        //   in_dim = packedPerRow * 32 / bits
+        let inDim = packedPerRow * 32 / bits
         precondition(input.elementCount == inDim,
                      "dequantGemv: input \(input.elementCount) ≠ in_dim \(inDim)")
         let result = out ?? Tensor.empty(shape: [outDim], dtype: input.dtype)
@@ -495,6 +580,87 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (8, .bf16):
             MetalTileKernels.dequant_gemv_int8_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .f32):
+            MetalTileKernels.dequant_gemv_int6_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .f16):
+            MetalTileKernels.dequant_gemv_int6_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (6, .bf16):
+            MetalTileKernels.dequant_gemv_int6_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .f32):
+            MetalTileKernels.dequant_gemv_int3_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .f16):
+            MetalTileKernels.dequant_gemv_int3_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (3, .bf16):
+            MetalTileKernels.dequant_gemv_int3_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .f32):
+            MetalTileKernels.dequant_gemv_int5_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .f16):
+            MetalTileKernels.dequant_gemv_int5_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                input: input.buffer, inputOffset: input.offset,
+                output: result.buffer, outputOffset: result.offset,
+                in_dim: inDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (5, .bf16):
+            MetalTileKernels.dequant_gemv_int5_bf16(
                 weight: weight.buffer, weightOffset: weight.offset,
                 scales: scales.buffer, scalesOffset: scales.offset,
                 biases: biases.buffer, biasesOffset: biases.offset,

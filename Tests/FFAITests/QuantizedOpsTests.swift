@@ -29,6 +29,67 @@ struct QuantizedOpsTests {
         return w
     }
 
+    /// Pack 16 6-bit values into 3 uint32 (12 bytes).
+    static func pack16Sixbit(_ q: [UInt32]) -> [UInt32] {
+        precondition(q.count == 16, "expected 16 6-bit values")
+        var bytes = [UInt8](repeating: 0, count: 12)
+        for p in 0..<4 {
+            let v0 = q[p * 4 + 0] & 0x3F
+            let v1 = q[p * 4 + 1] & 0x3F
+            let v2 = q[p * 4 + 2] & 0x3F
+            let v3 = q[p * 4 + 3] & 0x3F
+            bytes[p * 3 + 0] = UInt8(truncatingIfNeeded: v0 | ((v1 & 0x03) << 6))
+            bytes[p * 3 + 1] = UInt8(truncatingIfNeeded: ((v1 >> 2) & 0x0F) | ((v2 & 0x0F) << 4))
+            bytes[p * 3 + 2] = UInt8(truncatingIfNeeded: ((v2 >> 4) & 0x03) | ((v3 & 0x3F) << 2))
+        }
+        return Self.bytesToUint32s(bytes)
+    }
+
+    /// Pack 32 3-bit values into 3 uint32 (12 bytes = 32*3 bits).
+    /// 8 values per 3 bytes; 4 chunks span 3 uint32.
+    static func pack32Threebit(_ q: [UInt32]) -> [UInt32] {
+        precondition(q.count == 32, "expected 32 3-bit values")
+        var bytes = [UInt8](repeating: 0, count: 12)
+        for c in 0..<4 {
+            let v = (0..<8).map { q[c * 8 + $0] & 0x07 }
+            bytes[c * 3 + 0] = UInt8(truncatingIfNeeded: v[0] | (v[1] << 3) | ((v[2] & 0x03) << 6))
+            bytes[c * 3 + 1] = UInt8(truncatingIfNeeded: ((v[2] >> 2) & 0x01) | (v[3] << 1) | (v[4] << 4) | ((v[5] & 0x01) << 7))
+            bytes[c * 3 + 2] = UInt8(truncatingIfNeeded: ((v[5] >> 1) & 0x03) | (v[6] << 2) | (v[7] << 5))
+        }
+        return Self.bytesToUint32s(bytes)
+    }
+
+    /// Pack 32 5-bit values into 5 uint32 (20 bytes = 32*5 bits).
+    /// 8 values per 5 bytes; 4 chunks span 5 uint32.
+    static func pack32Fivebit(_ q: [UInt32]) -> [UInt32] {
+        precondition(q.count == 32, "expected 32 5-bit values")
+        var bytes = [UInt8](repeating: 0, count: 20)
+        for c in 0..<4 {
+            let v = (0..<8).map { q[c * 8 + $0] & 0x1F }
+            bytes[c * 5 + 0] = UInt8(truncatingIfNeeded: v[0] | ((v[1] & 0x07) << 5))
+            bytes[c * 5 + 1] = UInt8(truncatingIfNeeded: ((v[1] >> 3) & 0x03) | ((v[2] & 0x1F) << 2) | ((v[3] & 0x01) << 7))
+            bytes[c * 5 + 2] = UInt8(truncatingIfNeeded: ((v[3] >> 1) & 0x0F) | ((v[4] & 0x0F) << 4))
+            bytes[c * 5 + 3] = UInt8(truncatingIfNeeded: ((v[4] >> 4) & 0x01) | ((v[5] & 0x1F) << 1) | ((v[6] & 0x03) << 6))
+            bytes[c * 5 + 4] = UInt8(truncatingIfNeeded: ((v[6] >> 2) & 0x07) | ((v[7] & 0x1F) << 3))
+        }
+        return Self.bytesToUint32s(bytes)
+    }
+
+    /// Convert a byte array (length must be a multiple of 4) to little-endian uint32s.
+    static func bytesToUint32s(_ bytes: [UInt8]) -> [UInt32] {
+        precondition(bytes.count % 4 == 0, "byte length must be a multiple of 4")
+        var out: [UInt32] = []
+        out.reserveCapacity(bytes.count / 4)
+        for u in 0..<(bytes.count / 4) {
+            var w: UInt32 = 0
+            for b in 0..<4 {
+                w |= UInt32(bytes[u * 4 + b]) << (8 * UInt32(b))
+            }
+            out.append(w)
+        }
+        return out
+    }
+
     @Test("int4 dequant gather + matrix multiply matches CPU at group_size=64")
     func realShapeRoundTrip() {
         // Realistic shape: 4 rows × 128 in_dim, group_size=64 → 2 groups per row.
@@ -93,6 +154,154 @@ struct QuantizedOpsTests {
             #expect(abs(got[i] - expected[i]) < 1e-2,
                     "row \(i): got \(got[i]) expected \(expected[i])")
         }
+    }
+
+    @Test("int6 dequant gemv (group_size=64, bf16 scales/biases) matches CPU")
+    func roundTripInt6Bf16() {
+        let outDim = 2
+        let inDim = 64    // 1 group; minimal valid (group_size = 64)
+        let gs = 64
+
+        // 6-bit values 0..63
+        var q = [[UInt32]](repeating: [], count: outDim)
+        for r in 0..<outDim {
+            q[r] = (0..<inDim).map { UInt32(($0 + r * 11) & 0x3F) }
+        }
+        let scales: [Float] = (0..<outDim).map { Float($0 + 1) * 0.05 }
+        let biases: [Float] = (0..<outDim).map { Float($0) * -0.1 }
+        let input: [Float] = (0..<inDim).map { Float($0) * 0.1 - 3.2 }
+
+        // Pack: 64 values per row → 4 chunks of 16, each chunk is 3 uint32 = 12 uint32 per row.
+        var packed: [UInt32] = []
+        for r in 0..<outDim {
+            for chunk in 0..<(inDim / 16) {
+                let chunk16 = Array(q[r][chunk * 16 ..< (chunk + 1) * 16])
+                packed.append(contentsOf: Self.pack16Sixbit(chunk16))
+            }
+        }
+
+        // CPU reference (using bf16-rounded scale/bias to compare apples-to-apples)
+        func bf(_ f: Float) -> Float {
+            Float(bitPattern: UInt32(UInt16(truncatingIfNeeded: f.bitPattern >> 16)) << 16)
+        }
+        var expected: [Float] = []
+        for r in 0..<outDim {
+            var acc: Float = 0
+            for j in 0..<inDim {
+                let qv = Float(q[r][j])
+                acc += (qv * bf(scales[r]) + bf(biases[r])) * bf(input[j])
+            }
+            expected.append(acc)
+        }
+
+        let scalesBits = scales.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let biasesBits = biases.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let inputBits  = input.map  { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+
+        let weight = Tensor.empty(shape: [outDim, inDim * 3 / 16], dtype: .u32)
+        weight.copyIn(from: packed)
+        let scalesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        scalesT.copyIn(from: scalesBits)
+        let biasesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        biasesT.copyIn(from: biasesBits)
+        let inputT = Tensor.empty(shape: [inDim], dtype: .bf16)
+        inputT.copyIn(from: inputBits)
+
+        let cb = Device.shared.makeCommandBuffer()
+        let out = Ops.dequantGemv(
+            weight: weight, scales: scalesT, biases: biasesT,
+            input: inputT, bits: 6, groupSize: gs, on: cb
+        )
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let got = out.toArray(as: UInt16.self).map { Float(bitPattern: UInt32($0) << 16) }
+        for i in 0..<outDim {
+            let tol = max(abs(expected[i]) * 0.05, 1.0)
+            #expect(abs(got[i] - expected[i]) < tol,
+                    "row \(i): got \(got[i]) expected \(expected[i]) (tol \(tol))")
+        }
+    }
+
+    /// Helper: run an int<bits> dequant gemv with synthetic data and
+    /// verify against a CPU reference using bf16-rounded values.
+    func runDequantGemvCheck(bits: Int, mask: UInt32,
+                             packPerChunk: Int, uint32sPerChunk: Int,
+                             pack: ([UInt32]) -> [UInt32]) {
+        let outDim = 2
+        let inDim = 64                        // 1 group, group_size=64
+        let gs = 64
+        let chunkValues = packPerChunk         // values per chunk
+
+        var q = [[UInt32]](repeating: [], count: outDim)
+        for r in 0..<outDim {
+            q[r] = (0..<inDim).map { UInt32(($0 + r * 7) & Int(mask)) }
+        }
+        let scales: [Float] = (0..<outDim).map { Float($0 + 1) * 0.04 }
+        let biases: [Float] = (0..<outDim).map { Float($0) * -0.07 }
+        let input: [Float]  = (0..<inDim).map { Float($0) * 0.1 - 3.2 }
+
+        var packed: [UInt32] = []
+        for r in 0..<outDim {
+            for chunk in 0..<(inDim / chunkValues) {
+                let chunkVals = Array(q[r][chunk * chunkValues ..< (chunk + 1) * chunkValues])
+                packed.append(contentsOf: pack(chunkVals))
+            }
+        }
+
+        func bf(_ f: Float) -> Float {
+            Float(bitPattern: UInt32(UInt16(truncatingIfNeeded: f.bitPattern >> 16)) << 16)
+        }
+        var expected: [Float] = []
+        for r in 0..<outDim {
+            var acc: Float = 0
+            for j in 0..<inDim {
+                let qv = Float(q[r][j])
+                acc += (qv * bf(scales[r]) + bf(biases[r])) * bf(input[j])
+            }
+            expected.append(acc)
+        }
+
+        let scalesBits = scales.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let biasesBits = biases.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let inputBits  = input.map  { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        let u32PerRow = inDim * bits / 32
+        let weight = Tensor.empty(shape: [outDim, u32PerRow], dtype: .u32)
+        weight.copyIn(from: packed)
+        let scalesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        scalesT.copyIn(from: scalesBits)
+        let biasesT = Tensor.empty(shape: [outDim, 1], dtype: .bf16)
+        biasesT.copyIn(from: biasesBits)
+        let inputT = Tensor.empty(shape: [inDim], dtype: .bf16)
+        inputT.copyIn(from: inputBits)
+
+        let cb = Device.shared.makeCommandBuffer()
+        let out = Ops.dequantGemv(
+            weight: weight, scales: scalesT, biases: biasesT,
+            input: inputT, bits: bits, groupSize: gs, on: cb
+        )
+        cb.commit()
+        cb.waitUntilCompleted()
+
+        let got = out.toArray(as: UInt16.self).map { Float(bitPattern: UInt32($0) << 16) }
+        for i in 0..<outDim {
+            let tol = max(abs(expected[i]) * 0.05, 1.0)
+            #expect(abs(got[i] - expected[i]) < tol,
+                    "bits=\(bits) row \(i): got \(got[i]) expected \(expected[i]) (tol \(tol))")
+        }
+        _ = uint32sPerChunk   // silence unused
+    }
+
+    @Test("int3 dequant gemv (group_size=64, bf16) matches CPU")
+    func roundTripInt3Bf16() {
+        runDequantGemvCheck(bits: 3, mask: 0x07, packPerChunk: 32, uint32sPerChunk: 3,
+                            pack: Self.pack32Threebit)
+    }
+
+    @Test("int5 dequant gemv (group_size=64, bf16) matches CPU")
+    func roundTripInt5Bf16() {
+        runDequantGemvCheck(bits: 5, mask: 0x1F, packPerChunk: 32, uint32sPerChunk: 5,
+                            pack: Self.pack32Fivebit)
     }
 
     @Test("int8 dequant gemv (group_size=64, bf16 scales/biases) matches CPU")

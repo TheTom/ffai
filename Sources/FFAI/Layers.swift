@@ -47,7 +47,8 @@ public final class QuantizedLinear: Module {
                 bits: Int, groupSize: Int) {
         precondition(weight.dtype == .u32, "QuantizedLinear: weight must be u32 packed")
         precondition(weight.shape.count == 2, "QuantizedLinear: weight must be 2D")
-        precondition(bits == 4 || bits == 8, "QuantizedLinear: bits must be 4 or 8")
+        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+                     "QuantizedLinear: bits must be one of 3, 4, 5, 6, or 8")
         self.weight = weight
         self.scales = scales
         self.biases = biases
@@ -98,7 +99,9 @@ public func loadLinear(
     base: String, in bundle: SafeTensorsBundle,
     quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyLinear {
-    if let q = quantization, (q.bits == 4 || q.bits == 8), bundle.isQuantized(base) {
+    if let q = quantization, [3, 4, 5, 6, 8].contains(q.bits),
+       bundle.isQuantized(base)
+    {
         let t = try bundle.quantizedTriplet(base)
         return AnyLinear(QuantizedLinear(
             weight: t.weight, scales: t.scales, biases: t.biases,
@@ -142,7 +145,8 @@ public final class QuantizedEmbedding: Module {
 
     public init(weight: Tensor, scales: Tensor, biases: Tensor,
                 hidden: Int, bits: Int, groupSize: Int) {
-        precondition(bits == 4 || bits == 8, "QuantizedEmbedding: bits must be 4 or 8")
+        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
+                     "QuantizedEmbedding: bits must be one of 3, 4, 5, 6, or 8")
         self.weight = weight
         self.scales = scales
         self.biases = biases
@@ -195,7 +199,9 @@ public func loadEmbedding(
     base: String, in bundle: SafeTensorsBundle,
     hidden: Int, quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyEmbedding {
-    if let q = quantization, (q.bits == 4 || q.bits == 8), bundle.isQuantized(base) {
+    if let q = quantization, [3, 4, 5, 6, 8].contains(q.bits),
+       bundle.isQuantized(base)
+    {
         let t = try bundle.quantizedTriplet(base)
         return AnyEmbedding(QuantizedEmbedding(
             weight: t.weight, scales: t.scales, biases: t.biases,
