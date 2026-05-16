@@ -32,7 +32,13 @@ fully phased build-out (deliverables, kernels, tests per phase) see
   `enable(_:)` / `disable(_:)` for capabilities ships in Phase 6.
 - **Single-stream KV cache** (raw fp16 / bf16). Append + slice on the
   GPU via the `kv_cache_update` kernel — no per-layer CPU sync.
-  Quantized + TurboQuant + SSM/GDN caches land in Phase 5+.
+  TurboQuant + SSM/GDN caches land in Phase 5d/e.
+- **Affine-quantized KV cache (int8)** (Phase 5c). `LoadOptions.kvCache
+  = .affineQuantized(bits: 8, groupSize: 64)` or CLI
+  `--kv-cache int8` switches to a packed int8 cache with shared
+  working buffer. ~45% smaller KV cache on Qwen3 1.7B at maxSeq=40960
+  (4.38 GB → 2.32 GB), 7% decode-tok/s tax. int4 + int6 + a fused
+  dequant-into-SDPA kernel are 5c follow-ups.
 - **Full sampling pipeline** (Phase 5a + 5b). `temperature`, `top-K`,
   `top-P`, `min-P`, `repetition penalty`, seeded reproducible
   sampling — all wired through `GenerationParameters` + CLI flags
@@ -51,7 +57,8 @@ fully phased build-out (deliverables, kernels, tests per phase) see
 | Per-family `forwardSampleCategorical` fusion | 5b+ | Today's default impl uses 2 cmdbufs (forward + sample); fusing into 1 unlocks the real `gpu-categorical` perf win. Llama / Qwen 3 each get the per-family override. |
 | GPU filter kernels (top-K / top-P / min-P sort) | 5b+ | Today's filter-bearing paths fall back to `cpu-sample`. GPU filters need a sort or radix-select kernel. |
 | Parallel prefix-scan CDF walk | 5b+ | Replaces the single-thread CDF walk in `softmax_categorical_sample` (~150µs at vocab=152K today). |
-| Quantized KV cache (affine 4 / 6 / 8-bit) | 5c | ~3.5× memory at 4-bit; modest decode-tok/s tax. Needs quantize-on-append + bulk-dequant kernels + cache-abstraction refactor (protocol over the concrete `KVCache` class). |
+| Affine KV cache int4 + int6 | 5c+ | int8 shipped (45% memory savings, 7% tok/s tax). int4 + int6 follow up with byte-packed kernels (target ~3.5× at int4). |
+| Fused `bulk_dequant + sdpa_decode` | 5c+ | Today each attention step queues a separate dequant kernel into the shared working buffer before SDPA. Fusing removes the working-buffer materialisation entirely. |
 | TurboQuant compressed-domain attention | 5d | ~6-8× memory. Block-wise MSE codec with asymmetric K/V bits. Substantial research-grade codec port — multiple sessions. |
 | SSM / GatedDeltaNet hybrid models (Qwen 3.5, NemotronH, Mamba) | 5e | New `SSMStateCache` + `gated_delta_step` / `ssm_kernel` kernels. Requires Mamba selective-scan port. |
 | Vision encoders + multi-modal capability matrix | 6 | First targets Qwen 2.5-VL / Qwen 3.5-VL. Depends on Phase 5e for the text backbone if going hybrid. |

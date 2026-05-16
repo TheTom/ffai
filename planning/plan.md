@@ -605,18 +605,39 @@ correctness sweeps at vocab=4, 32, and 152K (model-shaped).
   (currently ~150µs at vocab=152K).
 - GPU top-K / top-P / min-P / rep-penalty kernels.
 
-### Phase 5c — Affine-quantized KV cache (4 / 6 / 8-bit)
+### Phase 5c — Affine-quantized KV cache (int8) ✅ SHIPPED
 
-Reduces KV memory ~3.5× at 4-bit. Needs:
+int8 affine group-quantization with a shared working buffer pair
+across all layers. Real memory savings on
+`mlx-community/Qwen3-1.7B-4bit` at maxSeq=40960: KV cache 4.38 GB
+→ 2.32 GB (−47%), peak GPU 5.28 GB → 3.38 GB (−36%), with a 7%
+decode tok/s tax (46.7 → 43.6 tok/s on M1 Max).
 
-- `quantize_group_affine_<bits>` kernel — fp16 K/V row → packed
-  uint32 + per-group fp16 scales/biases
-- `bulk_dequant_affine_<bits>` kernel — packed K/V up to `length` →
-  fp16 working buffer for SDPA
-- Cache-abstraction refactor (`KVCacheProtocol` over the concrete
-  `KVCache`); new `AffineQuantizedKVCache` conformance
-- Wire `LoadOptions.kvCache = .affineQuantized` through family
-  `makeKVCache(...)`
+Shipped:
+
+- metaltile `ek/sampling-kernels` (commit 87ecbd3): two new
+  kernels — `quantize_kv_int8` (one thread per group; find min/max,
+  derive scale+bias, pack 4 int8 per uint32) and `bulk_dequant_kv_int8`
+  (one thread per output element; reads packed weights + scales +
+  biases, writes fp16/bf16 directly into the SDPA-ready layout)
+- FFAI `main` (commit 5109b9b): `KVCacheProtocol` extracted from
+  the existing `KVCache`; new `AffineQuantizedKVCache` conformance;
+  `LoadOptions.kvCache = .affineQuantized(bits:groupSize:)`;
+  `--kv-cache int8` CLI flag; `LlamaModel` + `Qwen3Model` carry
+  `kvCacheKind` and switch on it in `makeKVCache(...)`. All layers
+  built in one `makeKVCache` call share a single pair of working
+  buffers (Metal hazard tracking serialises the buffer reuse across
+  layers within a cmdbuf — that's the architectural unlock that
+  makes the memory savings real vs per-layer working buffers).
+
+Follow-ups not yet done:
+
+- **int4 + int6 variants** — kernels with byte-packed sub-byte
+  storage (mirror the existing `dequant_gather_int{3,5,6}` pattern).
+  int4 should land ~3.5× memory savings vs raw.
+- **Fused `bulk_dequant + sdpa_decode`** — today each attention
+  step pays one extra dequant kernel dispatch. Fusing removes
+  the working-buffer materialisation.
 
 ### Phase 5d — TurboQuant compressed-domain attention
 
