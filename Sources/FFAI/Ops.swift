@@ -752,6 +752,56 @@ public enum Ops {
     /// GPU argmax over a 1D logits tensor. Caller supplies a 1-element
     /// u32 output buffer. Uses the cooperative 256-thread Reduction
     /// kernel — one threadgroup, ~80-300 KB / vocab logits in registers.
+    /// Mamba 2 / Mamba 1D depthwise causal-conv step — streaming
+    /// decode form. One thread per channel. `state` is the rolling
+    /// window of the last `kernelSize - 1` inputs (shape
+    /// `[kernelSize - 1, nChannels]`); shifted in-place after compute.
+    /// Activation (Mamba 2 follows the conv with SiLU) is the caller's
+    /// concern — kept separate for composability.
+    public static func conv1dCausalStep(
+        x: Tensor, w: Tensor, b: Tensor,
+        state: Tensor, into y: Tensor,
+        nChannels: Int, kernelSize: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(w.dtype == x.dtype && b.dtype == x.dtype
+                     && state.dtype == x.dtype && y.dtype == x.dtype,
+                     "Ops.conv1dCausalStep: every tensor must share dtype")
+        let grid = MTLSize(width: nChannels, height: 1, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.conv1d_causal_step_f32(
+                x: x.buffer, xOffset: x.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state: state.buffer, stateOffset: state.offset,
+                y: y.buffer, yOffset: y.offset,
+                n_channels: UInt32(nChannels), kernel_size: UInt32(kernelSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.conv1d_causal_step_f16(
+                x: x.buffer, xOffset: x.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state: state.buffer, stateOffset: state.offset,
+                y: y.buffer, yOffset: y.offset,
+                n_channels: UInt32(nChannels), kernel_size: UInt32(kernelSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.conv1d_causal_step_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state: state.buffer, stateOffset: state.offset,
+                y: y.buffer, yOffset: y.offset,
+                n_channels: UInt32(nChannels), kernel_size: UInt32(kernelSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.conv1dCausalStep: unsupported dtype \(x.dtype)")
+        }
+    }
+
     /// Mamba 2 selective-scan single-token decode step. Updates the
     /// per-layer recurrent state `h` in place and writes the output
     /// channel vector `y`. `h` lives in fp32 (state accumulates over
