@@ -15,30 +15,33 @@ public protocol LanguageModel: Module {
     var maxSeq: Int { get }
     var dtype: DType { get }
 
-    /// One per-layer KV cache, sized for the model's defaults. The
-    /// concrete type returned (raw `KVCache` vs `AffineQuantizedKVCache`)
-    /// depends on the engine's stored `LoadOptions.kvCache`.
-    func makeKVCache(maxSeq: Int?, device: Device) -> [any KVCacheProtocol]
+    /// One per-layer state cache, sized for the model's defaults. The
+    /// concrete type returned depends on the family (raw `KVCache` /
+    /// `AffineQuantizedKVCache` for attention models, `Mamba2LayerCache`
+    /// for Mamba 2). The engine knows its own cache type and casts back
+    /// internally; callers pass the array through as
+    /// `[any LayerCacheProtocol]`.
+    func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol]
 
     /// Single-token forward pass. Returns logits [vocab].
-    func forward(tokenId: Int, position: Int, caches: [any KVCacheProtocol], device: Device) -> Tensor
+    func forward(tokenId: Int, position: Int, caches: [any LayerCacheProtocol], device: Device) -> Tensor
 
     /// Forward + GPU argmax in one command buffer. Returns just the
     /// chosen token id (4-byte readback) — no full logits transfer.
     func forwardSample(tokenId: Int, position: Int,
-                       caches: [any KVCacheProtocol], device: Device) -> Int
+                       caches: [any LayerCacheProtocol], device: Device) -> Int
 }
 
 public extension LanguageModel {
-    func makeKVCache(maxSeq: Int? = nil, device: Device = .shared) -> [any KVCacheProtocol] {
-        makeKVCache(maxSeq: maxSeq, device: device)
+    func makeLayerCaches(maxSeq: Int? = nil, device: Device = .shared) -> [any LayerCacheProtocol] {
+        makeLayerCaches(maxSeq: maxSeq, device: device)
     }
 
-    func forward(tokenId: Int, position: Int, caches: [any KVCacheProtocol]) -> Tensor {
+    func forward(tokenId: Int, position: Int, caches: [any LayerCacheProtocol]) -> Tensor {
         forward(tokenId: tokenId, position: position, caches: caches, device: .shared)
     }
 
-    func forwardSample(tokenId: Int, position: Int, caches: [any KVCacheProtocol]) -> Int {
+    func forwardSample(tokenId: Int, position: Int, caches: [any LayerCacheProtocol]) -> Int {
         forwardSample(tokenId: tokenId, position: position, caches: caches, device: .shared)
     }
 
@@ -52,7 +55,7 @@ public extension LanguageModel {
     /// Family files can override to fuse into a single cmdbuf (TODO
     /// follow-up for Llama / Qwen 3).
     func forwardSampleCategorical(
-        tokenId: Int, position: Int, caches: [any KVCacheProtocol],
+        tokenId: Int, position: Int, caches: [any LayerCacheProtocol],
         temperature: Float, uniformDraw: Float,
         device: Device = .shared
     ) -> Int {

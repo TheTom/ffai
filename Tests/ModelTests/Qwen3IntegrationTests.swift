@@ -36,7 +36,7 @@ struct Qwen3IntegrationTests {
         #expect(m.engine.vocab == 151_936)
 
         // Forward one BOS-style token; check finite non-zero logits.
-        let caches = m.engine.makeKVCache()
+        let caches = m.engine.makeLayerCaches()
         let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

@@ -33,7 +33,7 @@ struct LlamaIntegrationTests {
         #expect(m.llama != nil, "expected the engine to be a LlamaModel")
 
         // Forward one token (BOS) and check we get finite, non-zero logits.
-        let caches = m.engine.makeKVCache()
+        let caches = m.engine.makeLayerCaches()
         let logits = m.engine.forward(tokenId: 128000, position: 0, caches: caches)
         let topByOneToken = Sampling.topN(logits, n: 5)
         #expect(topByOneToken.count == 5)

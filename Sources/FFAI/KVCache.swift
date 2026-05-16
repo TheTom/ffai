@@ -16,19 +16,38 @@
 import Foundation
 import Metal
 
-// MARK: - KVCacheProtocol
+// MARK: - LayerCacheProtocol (parent, used by Mamba 2 too)
 
-public protocol KVCacheProtocol: AnyObject, Sendable {
-    var nKVHeads: Int { get }
-    var headDim: Int { get }
-    var maxSeq: Int { get }
-    var dtype: DType { get }
+/// Universal per-layer state cache contract. All recurrent / attention
+/// caches conform to this so the engine + Generate can drive memory
+/// accounting and reset without caring about the layer's flavor.
+/// Attention layers add the K/V-specific surface in `KVCacheProtocol`
+/// below; SSM layers conform to this protocol directly (see
+/// `Mamba2LayerCache`).
+public protocol LayerCacheProtocol: AnyObject, Sendable {
+    /// Number of timesteps this cache has consumed. Grows monotonically
+    /// for attention caches, fixed at 0 for stateless variants. SSM
+    /// caches count steps for accounting purposes but the state size
+    /// itself is constant.
     var length: Int { get }
+    /// Maximum number of timesteps the cache was sized for. SSM caches
+    /// report `.max` since their state is not length-bound.
+    var maxSeq: Int { get }
+    /// Bytes physically allocated for this cache's persistent storage.
     var bytesAllocated: Int { get }
+    /// Bytes used by the live slice (`length` rows).
     var bytesInUse: Int { get }
 
-    /// Reset to length 0. Doesn't reclaim memory.
+    /// Reset internal state to zero. Doesn't reclaim memory.
     func reset()
+}
+
+// MARK: - KVCacheProtocol (attention-specific)
+
+public protocol KVCacheProtocol: LayerCacheProtocol {
+    var nKVHeads: Int { get }
+    var headDim: Int { get }
+    var dtype: DType { get }
 
     /// Append one timestep's K and V (each [nKVHeads, headDim]) on the
     /// GPU. Queued on `cmd`; no commit/wait. Bumps `length`.
@@ -277,6 +296,13 @@ public final class AffineQuantizedKVCache: KVCacheProtocol, @unchecked Sendable 
 }
 
 // MARK: - Array helpers
+
+public extension Array where Element == any LayerCacheProtocol {
+    /// Sum of `bytesAllocated` across all per-layer caches.
+    var totalBytesAllocated: Int { reduce(0) { $0 + $1.bytesAllocated } }
+    /// Sum of `bytesInUse` across all per-layer caches.
+    var totalBytesInUse: Int { reduce(0) { $0 + $1.bytesInUse } }
+}
 
 public extension Array where Element == any KVCacheProtocol {
     /// Sum of `bytesAllocated` across all per-layer caches.

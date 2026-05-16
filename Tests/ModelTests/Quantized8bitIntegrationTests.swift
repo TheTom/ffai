@@ -34,7 +34,7 @@ struct Quantized8bitIntegrationTests {
         #expect(m.engine.headDim == 128)
 
         // First-token logits finite + non-degenerate
-        let caches = m.engine.makeKVCache()
+        let caches = m.engine.makeLayerCaches()
         let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)

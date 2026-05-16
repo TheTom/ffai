@@ -103,7 +103,7 @@ struct GenerateCommand: AsyncParsableCommand {
             let promptTokens = m.tokenizer.encode(text: prompt)
             print("prompt tokens: \(promptTokens)")
 
-            let caches = m.engine.makeKVCache()
+            let caches = m.engine.makeLayerCaches()
             var lastLogits: Tensor?
             for (i, t) in promptTokens.enumerated() {
                 lastLogits = m.engine.forward(tokenId: t, position: i, caches: caches)

@@ -358,7 +358,7 @@ public final class Qwen3Model: LanguageModel {
         return out
     }
 
-    public func makeKVCache(maxSeq: Int?, device: Device) -> [any KVCacheProtocol] {
+    public func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol] {
         let cap = maxSeq ?? self.maxSeq
         switch kvCacheKind {
         case .raw:
@@ -383,7 +383,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     public func forward(tokenId: Int, position: Int,
-                        caches: [any KVCacheProtocol], device: Device) -> Tensor {
+                        caches: [any LayerCacheProtocol], device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)
@@ -393,7 +393,8 @@ public final class Qwen3Model: LanguageModel {
         var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 
@@ -406,7 +407,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     public func forwardSample(tokenId: Int, position: Int,
-                              caches: [any KVCacheProtocol], device: Device) -> Int {
+                              caches: [any LayerCacheProtocol], device: Device) -> Int {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)
@@ -416,7 +417,8 @@ public final class Qwen3Model: LanguageModel {
         var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 
@@ -441,7 +443,7 @@ public final class Qwen3Model: LanguageModel {
     /// cmdbufs — fusing them is the perf win for the `gpu-categorical`
     /// path Generate selects when T > 0 with no filters.
     public func forwardSampleCategorical(
-        tokenId: Int, position: Int, caches: [any KVCacheProtocol],
+        tokenId: Int, position: Int, caches: [any LayerCacheProtocol],
         temperature: Float, uniformDraw: Float,
         device: Device
     ) -> Int {
@@ -454,7 +456,8 @@ public final class Qwen3Model: LanguageModel {
         var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 

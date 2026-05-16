@@ -54,6 +54,14 @@ public enum ModelRegistry {
             return try loadQwen3(config: config, weights: weights,
                                  options: options, device: device)
         }
+        if let arch = config.architecture, Mamba2.architectures.contains(arch) {
+            return try loadMamba2(config: config, weights: weights,
+                                  options: options, device: device)
+        }
+        if let mt = config.modelType, Mamba2.modelTypes.contains(mt) {
+            return try loadMamba2(config: config, weights: weights,
+                                  options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -84,6 +92,19 @@ public enum ModelRegistry {
         return Loaded(engine: engine,
                       defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+    public static func loadMamba2(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Mamba2.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
 }
 
 /// High-level loaded model with tokenizer attached. The public API users
@@ -107,6 +128,9 @@ public final class Model: @unchecked Sendable {
 
     /// Convenience accessor for the Qwen3 engine.
     public var qwen3: Qwen3Model? { engine as? Qwen3Model }
+
+    /// Convenience accessor for the Mamba 2 engine.
+    public var mamba2: Mamba2Model? { engine as? Mamba2Model }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
@@ -198,7 +222,7 @@ public final class Model: @unchecked Sendable {
     /// Compile PSOs for the kernels we'll need during decode by running
     /// one no-op forward step. Costs ~100ms-1s on first load.
     public func prewarm() async {
-        let cache = engine.makeKVCache()
+        let cache = engine.makeLayerCaches()
         _ = engine.forward(tokenId: 0, position: 0, caches: cache)
     }
 }

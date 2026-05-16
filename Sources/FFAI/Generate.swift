@@ -157,7 +157,7 @@ public extension Model {
         parameters params: GenerationParameters,
         continuation: AsyncThrowingStream<GenerationChunk, Error>.Continuation
     ) async throws {
-        let caches = engine.makeKVCache()
+        let caches = engine.makeLayerCaches()
         let eos = config.eosTokenId
         let stopSet: Set<Int> = {
             var s = params.extraStopTokens
@@ -292,7 +292,7 @@ public extension Model {
         promptTokens: [Int], generatedCount: Int, contextSize: Int,
         prefillTime: Double, decodeTime: Double, ttftMs: Double,
         perTokenWallclock: [Double],
-        memTracker: PhaseMemoryTracker, caches: [any KVCacheProtocol],
+        memTracker: PhaseMemoryTracker, caches: [any LayerCacheProtocol],
         weightsBytes: Int, splitTokens: ThinkingSplit.Split?
     ) -> GenerationStats {
         let steady: Double? = {

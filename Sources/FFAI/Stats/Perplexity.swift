@@ -60,7 +60,7 @@ public enum Perplexity {
     ) -> Result {
         precondition(tokens.count >= 2,
                      "Perplexity.compute requires at least 2 tokens (one context + one target)")
-        let caches = model.engine.makeKVCache(maxSeq: nil, device: device)
+        let caches = model.engine.makeLayerCaches(maxSeq: nil, device: device)
         var nll = 0.0
         var scored = 0
         for t in 0..<(tokens.count - 1) {
@@ -95,8 +95,8 @@ public enum Perplexity {
     ) -> KLDResult {
         precondition(tokens.count >= 2,
                      "klDivergence requires at least 2 tokens")
-        let refCaches = reference.engine.makeKVCache(maxSeq: nil, device: device)
-        let candCaches = candidate.engine.makeKVCache(maxSeq: nil, device: device)
+        let refCaches = reference.engine.makeLayerCaches(maxSeq: nil, device: device)
+        let candCaches = candidate.engine.makeLayerCaches(maxSeq: nil, device: device)
 
         var totalKL = 0.0
         var scored = 0

@@ -291,7 +291,7 @@ public final class LlamaModel: LanguageModel {
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let ropeTheta: Float
     public let dtype: DType
-    /// Cache scheme to use when `makeKVCache(...)` is called. Set at
+    /// Cache scheme to use when `makeLayerCaches(...)` is called. Set at
     /// construction time from `LoadOptions.kvCache`.
     public let kvCacheKind: KVCacheKind
 
@@ -333,7 +333,7 @@ public final class LlamaModel: LanguageModel {
     /// type depends on `kvCacheKind` (set from LoadOptions at load
     /// time): raw `KVCache` for `.raw`, `AffineQuantizedKVCache` (with
     /// a shared working buffer pair) for `.affineQuantized`.
-    public func makeKVCache(maxSeq: Int?, device: Device) -> [any KVCacheProtocol] {
+    public func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol] {
         let cap = maxSeq ?? self.maxSeq
         switch kvCacheKind {
         case .raw:
@@ -366,7 +366,7 @@ public final class LlamaModel: LanguageModel {
     /// All N layers + embedding + final norm + lm head are queued on
     /// ONE MTLCommandBuffer with a single commit + wait at the end.
     public func forward(tokenId: Int, position: Int,
-                        caches: [any KVCacheProtocol], device: Device) -> Tensor {
+                        caches: [any LayerCacheProtocol], device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
 
         // Embedding
@@ -378,7 +378,8 @@ public final class LlamaModel: LanguageModel {
 
         // Layers — all queued on the same command buffer, no syncs.
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 
@@ -397,7 +398,7 @@ public final class LlamaModel: LanguageModel {
     /// (the chosen token id) cross CPU↔GPU per token instead of vocab_size
     /// floats.
     public func forwardSample(tokenId: Int, position: Int,
-                              caches: [any KVCacheProtocol], device: Device) -> Int {
+                              caches: [any LayerCacheProtocol], device: Device) -> Int {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)
@@ -407,7 +408,8 @@ public final class LlamaModel: LanguageModel {
         var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 
@@ -439,7 +441,7 @@ public final class LlamaModel: LanguageModel {
     /// removes that overhead and is the perf win for the
     /// `gpu-categorical` path Generate selects.
     public func forwardSampleCategorical(
-        tokenId: Int, position: Int, caches: [any KVCacheProtocol],
+        tokenId: Int, position: Int, caches: [any LayerCacheProtocol],
         temperature: Float, uniformDraw: Float,
         device: Device
     ) -> Int {
@@ -452,7 +454,8 @@ public final class LlamaModel: LanguageModel {
         var h = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
-            h = layer.forward(h, position: position, cache: caches[i],
+            h = layer.forward(h, position: position,
+                              cache: caches[i] as! any KVCacheProtocol,
                               cmd: cmd, device: device)
         }
 
