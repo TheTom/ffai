@@ -39,6 +39,17 @@ fully phased build-out (deliverables, kernels, tests per phase) see
   at maxSeq=40960: int8 saves 47% KV (4.38 → 2.32 GB) at −7% tok/s;
   int4 (group_size=32) saves 69% KV (4.38 → 1.37 GB) at −3% tok/s.
   int6 + fused-dequant-into-SDPA are 5c follow-ups.
+- **Mamba 2 dense (Phase 5e — initial drop).** End-to-end decode of
+  `mlx-community/mamba2-130m` (130M / 370M / 780M / 1.3B / 2.7B all
+  share `Mamba2Dense`). Per-token forward = one MTLCommandBuffer:
+  RMSNorm → in_proj → conv1d-causal-step + SiLU → softplus(dt) →
+  `ssm_step` → `D·x` skip → SiLU(z) gate → mixer norm → out_proj.
+  Constant-memory recurrent state via `Mamba2LayerCache`
+  (`SSMStateCache` + `ConvStateCache`). `LayerCacheProtocol` introduced
+  so SSM caches don't have to bolt on no-op attention methods.
+  Limitations today: `n_groups = 1` only; no chunked-prefill scan
+  (decode-only — prefill walks tokens one at a time); Mamba 2 hybrids
+  (NemotronH / GraniteMoeHybrid / FalconH1) are 5e+ follow-ups.
 - **Full sampling pipeline** (Phase 5a + 5b). `temperature`, `top-K`,
   `top-P`, `min-P`, `repetition penalty`, seeded reproducible
   sampling — all wired through `GenerationParameters` + CLI flags
@@ -60,7 +71,7 @@ fully phased build-out (deliverables, kernels, tests per phase) see
 | Affine KV cache int6 | 5c+ | int4 + int8 shipped (47%/69% memory savings). int6 is a byte-packed follow-up between them. |
 | Fused `bulk_dequant + sdpa_decode` | 5c+ | Today each attention step queues a separate dequant kernel into the shared working buffer before SDPA. Fusing removes the working-buffer materialisation entirely. |
 | TurboQuant compressed-domain attention | 5d | ~6-8× memory. Block-wise MSE codec with asymmetric K/V bits. Substantial research-grade codec port — multiple sessions. |
-| Mamba 2 hybrid models (NemotronH, GraniteMoeHybrid, FalconH1) | 5e | **Building blocks shipped**: `ssm_step` + `conv1d_causal_step` kernels, `SSMStateCache` + `ConvStateCache` classes, both with multi-step CPU-reference tests. Still needed: Mamba 2 family file (mixer block + weight loader), chunked-prefill parallel-scan kernel for prefill perf. |
+| Mamba 2 hybrid models (NemotronH, GraniteMoeHybrid, FalconH1) | 5e+ | **Dense Mamba 2 shipped** (see above). Still needed: chunked-prefill parallel-scan for prefill perf, `n_groups > 1` grouped B/C, and the hybrid family files that interleave Mamba 2 mixers with attention layers. |
 | GatedDeltaNet hybrid (Qwen 3.5) | 5e+ | Needs `gated_delta_step` + `gated_delta_step_record` + `state_replay` kernels for speculative-decoding rollback. Builds on the 5e SSM foundation. |
 | Vision encoders + multi-modal capability matrix | 6 | First targets Qwen 2.5-VL / Qwen 3.5-VL. Depends on Phase 5e for the text backbone if going hybrid. |
 | Audio (`.audioIn` for STT, `.audioOut` for TTS) | 8+ | First audio target TBD (Whisper, Qwen-Omni, …). |

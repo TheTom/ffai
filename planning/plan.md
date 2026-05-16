@@ -703,26 +703,48 @@ ad04737):
 - 7 correctness tests including 8-step sequential verification.
 
 Both Mamba 2 building blocks (`ssm_step` + `conv1d_causal_step`) +
-both caches (`SSMStateCache` + `ConvStateCache`) are now in place.
+both caches (`SSMStateCache` + `ConvStateCache`) are now in place,
+and `Models/Mamba2.swift` ships the end-to-end dense path.
 
-**Still needed for end-to-end Mamba 2 inference:**
+**Shipped on top of those building blocks (Phase 5e initial drop):**
 
-- Mamba 2 family file (`Models/Mamba2.swift`): mixer block
-  composing input projection → conv1d_causal_step → split into
-  (xBC, dt) → ssm_step → output projection. Plus RMSNorm,
-  embeddings, LM head.
-- Weight loader for one of: Mamba 2 130M / 1.3B, NemotronH,
-  GraniteMoeHybrid, FalconH1. Smallest checkpoint first for fast
-  iteration.
-- Chunked-prefill parallel-scan variant of `ssm_step` (prefill
-  perf; today's kernel is decode-only — usable but slow for long
-  prompts).
-- Hybrid layer integration in `Models/Qwen3.swift` (for Qwen 3.5
-  GDN + attention) — separate from pure Mamba 2 and needs the
+- `Models/Mamba2.swift` — `Mamba2` family, `Mamba2Dense` variant,
+  `Mamba2Layer` mixer block (RMSNorm → in_proj → conv1d_causal_step
+  + SiLU → softplus(dt) → ssm_step → D·x skip → SiLU(z) gate →
+  mixer norm → out_proj), `Mamba2Model` with single-cmdbuf decode.
+- `Mamba2LayerCache` bundling `SSMStateCache` + `ConvStateCache`,
+  conforming to the new `LayerCacheProtocol`.
+- `LayerCacheProtocol` parent extracted so SSM caches don't need
+  no-op attention methods; `KVCacheProtocol` is now a sub-protocol
+  with the attention surface.
+- `LanguageModel.makeKVCache` → `makeLayerCaches`, returning
+  `[any LayerCacheProtocol]`. Llama / Qwen3 / Mamba 2 cast back to
+  their concrete cache type internally.
+- `Ops.softplus` + numerically-stable `softplus_elem` kernel for
+  Mamba 2's dt computation.
+- `ssm_step` updated to per-head `dt[n_heads]` (Mamba 2 spec; was
+  scalar in the initial kernel drop). `SSMStateCacheTests` updated
+  accordingly.
+- `ModelConfig.load` switched to `.json5Allowed` so the published
+  Mamba 2 configs with `Infinity` literals parse.
+- `TokenizerLoader` calls `AutoTokenizer.from(modelFolder:, strict:
+  false)` so swift-transformers falls back to plain BPE for
+  tokenizers it doesn't have a class for (Mamba 2 ships
+  `GPTNeoXTokenizer`).
+- Integration test: `Tests/ModelTests/Mamba2IntegrationTests.swift`
+  loads `mlx-community/mamba2-130m`, verifies shapes match config,
+  runs greedy decode to completion (~130 tok/s on M-series).
+
+**Still planned for Mamba 2 / hybrid follow-ups (5e+):**
+
+- Chunked-prefill parallel-scan variant of `ssm_step` (today's
+  kernel is decode-only — usable but slow for long prompts).
+- `n_groups > 1` support (grouped B / C tensors; today only
+  `n_groups == 1` is wired through the kernel).
+- Hybrid family files (NemotronH, GraniteMoeHybrid, FalconH1)
+  that interleave Mamba 2 mixers with attention layers.
+- Qwen 3.5 hybrid (GDN + attention) — needs
   `gated_delta_step` + `state_replay` kernels.
-
-The kernels + caches in place are what every follow-up uses;
-integrating into a working model is the next session's work.
 
 **Phase 5 done when:** Qwen 3.5 (hybrid GDN+attention with
 TurboQuant KV) runs end-to-end with measured tokens/sec ≥ current
