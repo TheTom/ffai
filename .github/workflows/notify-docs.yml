@@ -1,0 +1,40 @@
+name: Trigger docs rebuild
+
+# When markdown the docs site renders changes on main, ping the
+# ffai-website repo so it rebuilds against the new commit. Avoids
+# polling and keeps the published site in lockstep with main.
+#
+# Requires a `WEBSITE_DISPATCH_TOKEN` repo secret with a fine-scoped
+# PAT (or GitHub App token) that has `contents: write` on
+# houseofwaffles/ffai-website. See README#Contributing for setup.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - 'documentation/**'
+      - 'planning/architecture.md'
+      - 'planning/roadmap.md'
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fire repository_dispatch at houseofwaffles/ffai-website
+        env:
+          GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "WEBSITE_DISPATCH_TOKEN not configured — skipping dispatch."
+            echo "Add a fine-scoped PAT under Settings → Secrets → Actions to enable."
+            exit 0
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/houseofwaffles/ffai-website/dispatches \
+            -d '{"event_type":"ffai-docs-changed","client_payload":{"sha":"${{ github.sha }}","ref":"${{ github.ref }}"}}'
+          echo "dispatched ffai-docs-changed for ${GITHUB_SHA::7}"
