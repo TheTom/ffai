@@ -24,12 +24,20 @@ public enum ModelError: Error, CustomStringConvertible {
 /// architecture / model_type strings they handle. Add a new family by
 /// extending `dispatchAndLoad` here.
 public enum ModelRegistry {
+    /// Engine + the variant-declared generation defaults. The defaults
+    /// flow into the `Model` so callers can read them off without
+    /// knowing the concrete family.
+    public struct Loaded {
+        public let engine: any LanguageModel
+        public let defaultGenerationParameters: GenerationParameters
+    }
+
     public static func dispatchAndLoad(
         config: ModelConfig,
         weights: SafeTensorsBundle,
         options: LoadOptions,
         device: Device
-    ) throws -> any LanguageModel {
+    ) throws -> Loaded {
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(config: config, weights: weights,
                                  options: options, device: device)
@@ -54,23 +62,27 @@ public enum ModelRegistry {
     public static func loadLlama(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
-    ) throws -> LlamaModel {
+    ) throws -> Loaded {
         let variant = try Llama.variant(for: config)
-        return try variant.loadModel(
+        let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
         )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
     }
 
     public static func loadQwen3(
         config: ModelConfig, weights: SafeTensorsBundle,
         options: LoadOptions, device: Device
-    ) throws -> Qwen3Model {
+    ) throws -> Loaded {
         let variant = try Qwen3.variant(for: config)
-        return try variant.loadModel(
+        let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
         )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
     }
 }
 
@@ -84,6 +96,10 @@ public final class Model: @unchecked Sendable {
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
     public let enabledCapabilities: Set<Capability>
+    /// Default generation parameters declared by the model's family
+    /// variant. Use as-is, or call `.with { $0.maxTokens = ... }` to
+    /// tweak a field without losing the family-tuned baseline.
+    public let defaultGenerationParameters: GenerationParameters
 
     /// Convenience accessor for tests + tools that want the Llama-typed
     /// model. Returns nil if the loaded engine isn't Llama.
@@ -106,13 +122,15 @@ public final class Model: @unchecked Sendable {
     init(engine: any LanguageModel, tokenizer: any Tokenizer, config: ModelConfig,
          modelDirectory: URL,
          availableCapabilities: Set<Capability>,
-         enabledCapabilities: Set<Capability>) {
+         enabledCapabilities: Set<Capability>,
+         defaultGenerationParameters: GenerationParameters) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
         self.modelDirectory = modelDirectory
         self.availableCapabilities = availableCapabilities
         self.enabledCapabilities = enabledCapabilities
+        self.defaultGenerationParameters = defaultGenerationParameters
         var cont: AsyncStream<ModelLifecycleEvent>.Continuation!
         self.events = AsyncStream { c in cont = c }
         self.eventsContinuation = cont
@@ -138,26 +156,39 @@ public final class Model: @unchecked Sendable {
         options: LoadOptions = LoadOptions(),
         device: Device = .shared
     ) async throws -> Model {
-        let locator = ModelLocator()
-        let dir = try await locator.resolve(idOrPath: idOrPath, revision: options.revision)
-        let config = try ModelConfig.load(from: dir)
-        let bundle = try SafeTensorsBundle(directory: dir, device: device)
-        let engine = try ModelRegistry.dispatchAndLoad(
-            config: config, weights: bundle, options: options, device: device
-        )
-        let tokenizer = try await TokenizerLoader().load(from: dir)
+        Debug.log(.load, "Model.load id-or-path=\(idOrPath)")
+        let model = try await Profile.timeAsync("model_load") {
+            try await Profile.signpostAsync("model_load") {
+                let locator = ModelLocator(downloader: ModelDownloader(cacheDirectory: options.cacheDirectory))
+                let dir = try await locator.resolve(idOrPath: idOrPath, revision: options.revision)
+                Debug.log(.loader, "resolved snapshot dir: \(dir.path)")
+                let config = try ModelConfig.load(from: dir)
+                Debug.log(.load, "config: arch=\(config.architecture ?? "?") model_type=\(config.modelType ?? "?") hidden=\(config.hiddenSize ?? 0) layers=\(config.numLayers ?? 0)")
+                let bundle = try SafeTensorsBundle(directory: dir, device: device)
+                let loaded = try ModelRegistry.dispatchAndLoad(
+                    config: config, weights: bundle, options: options, device: device
+                )
+                let tokenizer = try await TokenizerLoader().load(from: dir)
+                return Model(
+                    engine: loaded.engine, tokenizer: tokenizer, config: config,
+                    modelDirectory: dir,
+                    availableCapabilities: Capability.textOnly,
+                    enabledCapabilities: options.capabilities,
+                    defaultGenerationParameters: loaded.defaultGenerationParameters
+                )
+            }
+        }
 
-        let model = Model(
-            engine: engine, tokenizer: tokenizer, config: config,
-            modelDirectory: dir,
-            availableCapabilities: Capability.textOnly,
-            enabledCapabilities: options.capabilities
-        )
-
-        // Phase 2: prewarm just touches the embedding lookup once so the
-        // PSO is compiled before the first user-visible decode.
+        // Prewarm just touches the embedding lookup once so the PSO is
+        // compiled before the first user-visible decode. Captured as a
+        // separate phase so `--profiling 1` shows it broken out from
+        // model_load.
         if options.prewarm {
-            await model.prewarm()
+            await Profile.timeAsync("prewarm") {
+                await Profile.signpostAsync("prewarm") {
+                    await model.prewarm()
+                }
+            }
         }
 
         model.emit(ModelLifecycleEvent(state: .ready))

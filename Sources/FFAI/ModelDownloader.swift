@@ -29,6 +29,19 @@ public struct ModelDownloader: Sendable {
         self.client = client
     }
 
+    /// Convenience init that builds a `HubClient` with the standard
+    /// auto-detected endpoint + token but overrides the cache root.
+    /// `nil` keeps the standard discovery order (HF_HOME →
+    /// `~/.cache/huggingface/hub`); a non-nil URL points the cache at
+    /// a specific directory (e.g. an external SSD).
+    public init(cacheDirectory: URL?) {
+        if let dir = cacheDirectory {
+            self.client = HubClient(cache: HubCache(cacheDirectory: dir))
+        } else {
+            self.client = .default
+        }
+    }
+
     /// Download (or hit cache) a model snapshot. Returns the local snapshot
     /// directory containing config.json, tokenizer.json, *.safetensors, etc.
     ///

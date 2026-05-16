@@ -26,6 +26,11 @@ public enum Qwen3 {
 
 public protocol Qwen3Variant {
     static var availableCapabilities: Set<Capability> { get }
+    /// Generation defaults for this variant. The user can override any
+    /// field; absent overrides fall back to the values declared here.
+    /// See planning/roadmap.md for which fields are honored today vs
+    /// staged for Phase 5+ (sampling kernels).
+    static var defaultGenerationParameters: GenerationParameters { get }
     static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
@@ -47,6 +52,21 @@ public enum Qwen3Error: Error, CustomStringConvertible {
 
 public struct Qwen3Dense: Qwen3Variant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
+
+    /// Qwen 3 dense defaults. Tracks mlx-swift-lm's Qwen 3 family
+    /// values (temp 0.6, top-p 0.95, top-k 20, min-p 0.0,
+    /// rep-penalty 1.0) and a 1024-token prefill chunk for dense
+    /// attention. Qwen 3.5 hybrid / MoE will declare their own when
+    /// those variants land in Phase 5.
+    public static let defaultGenerationParameters = GenerationParameters(
+        maxTokens: 256,
+        prefillStepSize: 1024,
+        temperature: 0.6,
+        topP: 0.95,
+        topK: 20,
+        minP: 0.0,
+        repetitionPenalty: 1.0
+    )
 
     public static func loadModel(
         config: ModelConfig,

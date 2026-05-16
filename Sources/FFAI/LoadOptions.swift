@@ -25,6 +25,12 @@ public struct LoadOptions: Sendable {
     public var lazyCapabilities: Bool
     /// Override revision for HF download. Defaults to "main".
     public var revision: String
+    /// Override the HuggingFace cache root for this load. `nil` (the
+    /// default) honors the standard discovery order:
+    /// `HF_HOME` env var → `~/.cache/huggingface/hub/`. Set to a fixed
+    /// `URL` to point at a different location (e.g. an external SSD).
+    /// Has no effect when `idOrPath` resolves to a local directory.
+    public var cacheDirectory: URL?
 
     public init(
         capabilities: Set<Capability> = Capability.textOnly,
@@ -32,7 +38,8 @@ public struct LoadOptions: Sendable {
         dispatchMode: DispatchMode = .eager,
         prewarm: Bool = true,
         lazyCapabilities: Bool = true,
-        revision: String = "main"
+        revision: String = "main",
+        cacheDirectory: URL? = nil
     ) {
         self.capabilities = capabilities.union(Capability.textOnly)
         self.kvCache = kvCache
@@ -40,5 +47,6 @@ public struct LoadOptions: Sendable {
         self.prewarm = prewarm
         self.lazyCapabilities = lazyCapabilities
         self.revision = revision
+        self.cacheDirectory = cacheDirectory
     }
 }

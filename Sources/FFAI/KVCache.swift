@@ -95,4 +95,27 @@ public final class KVCache: @unchecked Sendable {
     }
 
     public func reset() { length = 0 }
+
+    // ─── Memory accounting (used by --stats / bench harness) ─────────
+
+    /// Bytes the K + V buffers physically occupy in device memory. Set
+    /// at construction time to `2 * nKVHeads * maxSeq * headDim *
+    /// dtype.byteSize` and immutable thereafter — the buffer is
+    /// preallocated.
+    public var bytesAllocated: Int {
+        2 * nKVHeads * maxSeq * headDim * dtype.byteSize
+    }
+
+    /// Bytes occupied by the in-use K + V slice (`length` rows out of
+    /// `maxSeq`). What you'd report as the "live KV" delta in stats.
+    public var bytesInUse: Int {
+        2 * nKVHeads * length * headDim * dtype.byteSize
+    }
+}
+
+public extension Array where Element == KVCache {
+    /// Sum of `bytesAllocated` across all per-layer caches.
+    var totalBytesAllocated: Int { reduce(0) { $0 + $1.bytesAllocated } }
+    /// Sum of `bytesInUse` across all per-layer caches.
+    var totalBytesInUse: Int { reduce(0) { $0 + $1.bytesInUse } }
 }

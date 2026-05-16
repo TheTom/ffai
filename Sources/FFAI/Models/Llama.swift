@@ -23,6 +23,11 @@ public enum Llama {
 
 public protocol LlamaVariant {
     static var availableCapabilities: Set<Capability> { get }
+    /// Generation defaults for this variant. The user can override any
+    /// field; absent overrides fall back to the values declared here.
+    /// See planning/roadmap.md for which fields are honored today vs
+    /// staged for Phase 5+ (sampling kernels).
+    static var defaultGenerationParameters: GenerationParameters { get }
     static func loadModel(
         config: ModelConfig,
         weights: SafeTensorsBundle,
@@ -35,6 +40,19 @@ public protocol LlamaVariant {
 
 public struct LlamaDense: LlamaVariant {
     public static let availableCapabilities: Set<Capability> = [.textIn, .textOut]
+
+    /// Llama 3.x dense defaults. Tracks mlx-swift-lm's
+    /// `GenerationParameters` baseline (temp 0.6, top-p 1.0) and
+    /// mlx-swift-lm's per-family `defaultPrefillStepSize` (1024 for
+    /// dense attention models).
+    public static let defaultGenerationParameters = GenerationParameters(
+        maxTokens: 256,
+        prefillStepSize: 1024,
+        temperature: 0.6,
+        topP: 1.0,
+        topK: 0,
+        repetitionPenalty: 1.0
+    )
 
     public static func loadModel(
         config: ModelConfig,
