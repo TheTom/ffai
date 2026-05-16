@@ -56,13 +56,14 @@ struct SSMStateCacheTests {
     ///                       + dt * B[n] * x[head, d]
     ///   y[head, d]         = Σ_n  C[n] * h[head, n, d]_new
     private func cpuRefStep(
-        x: [Float], a: [Float], b: [Float], c: [Float], dt: Float,
+        x: [Float], a: [Float], b: [Float], c: [Float], dt: [Float],
         h: inout [Float],
         nHeads: Int, stateDim: Int, headDim: Int
     ) -> [Float] {
         var y = [Float](repeating: 0, count: nHeads * headDim)
         for head in 0..<nHeads {
-            let decay = Foundation.exp(a[head] * dt)
+            let dtH = dt[head]
+            let decay = Foundation.exp(a[head] * dtH)
             for d in 0..<headDim {
                 let xVal = x[head * headDim + d]
                 var yVal: Float = 0
@@ -70,7 +71,7 @@ struct SSMStateCacheTests {
                     let hIdx = head * stateDim * headDim + n * headDim + d
                     let bVal = b[n]
                     let cVal = c[n]
-                    let newH = decay * h[hIdx] + dt * bVal * xVal
+                    let newH = decay * h[hIdx] + dtH * bVal * xVal
                     h[hIdx] = newH
                     yVal += cVal * newH
                 }
@@ -82,7 +83,7 @@ struct SSMStateCacheTests {
 
     /// Run one GPU step. Returns (newState, y).
     private func gpuStep(
-        x: [Float], a: [Float], b: [Float], c: [Float], dt: Float,
+        x: [Float], a: [Float], b: [Float], c: [Float], dt: [Float],
         initialState: [Float],
         nHeads: Int, stateDim: Int, headDim: Int
     ) -> (state: [Float], y: [Float]) {
@@ -94,8 +95,8 @@ struct SSMStateCacheTests {
         bT.copyIn(from: b)
         let cT = Tensor.empty(shape: [stateDim], dtype: .f32)
         cT.copyIn(from: c)
-        let dtT = Tensor.empty(shape: [1], dtype: .f32)
-        dtT.copyIn(from: [dt])
+        let dtT = Tensor.empty(shape: [nHeads], dtype: .f32)
+        dtT.copyIn(from: dt)
 
         let cache = SSMStateCache(nHeads: nHeads, stateDim: stateDim, headDim: headDim)
         cache.h.copyIn(from: initialState)
@@ -128,7 +129,8 @@ struct SSMStateCacheTests {
         for i in 0..<stateDim { b[i] = Float(i) * 0.5 + 0.3 }
         var c = [Float](repeating: 0, count: stateDim)
         for i in 0..<stateDim { c[i] = Float(i + 1) * 0.2 }
-        let dt: Float = 0.05
+        // Per-head dt (Mamba 2 spec) — vary across heads to exercise the lookup.
+        let dt: [Float] = [0.05, 0.08]
 
         var cpuH = initialH
         let cpuY = cpuRefStep(x: x, a: a, b: b, c: c, dt: dt,
@@ -161,7 +163,8 @@ struct SSMStateCacheTests {
         let a = (0..<nHeads).map { Float(-$0 - 1) * 0.3 }   // per-head, all negative
         let b = (0..<stateDim).map { Float($0) * 0.1 + 0.05 }
         let c = (0..<stateDim).map { Float($0 + 1) * 0.07 }
-        let dt: Float = 0.02
+        // Per-head dt — same for all heads here, just exercises the array path.
+        let dt: [Float] = Array(repeating: 0.02, count: nHeads)
 
         for step in 0..<12 {
             // Different x per step.
@@ -178,7 +181,7 @@ struct SSMStateCacheTests {
             let aT = Tensor.empty(shape: [nHeads], dtype: .f32); aT.copyIn(from: a)
             let bT = Tensor.empty(shape: [stateDim], dtype: .f32); bT.copyIn(from: b)
             let cT = Tensor.empty(shape: [stateDim], dtype: .f32); cT.copyIn(from: c)
-            let dtT = Tensor.empty(shape: [1], dtype: .f32); dtT.copyIn(from: [dt])
+            let dtT = Tensor.empty(shape: [nHeads], dtype: .f32); dtT.copyIn(from: dt)
             let yT = Tensor.empty(shape: [nHeads, headDim], dtype: .f32); yT.zero()
             runAndWait { cb in
                 Ops.ssmStep(x: xT, a: aT, b: bT, c: cT, dt: dtT,
@@ -212,7 +215,7 @@ struct SSMStateCacheTests {
         let a: [Float] = [-1.0, -0.5]
         let b = (0..<stateDim).map { Float($0) * 0.2 + 0.1 }
         let c = (0..<stateDim).map { Float($0 + 1) * 0.15 }
-        let dt: Float = 0.03
+        let dt: [Float] = Array(repeating: 0.03, count: nHeads)
 
         _ = cpuRefStep(x: x, a: a, b: b, c: c, dt: dt,
                        h: &cpuH,
@@ -235,8 +238,8 @@ struct SSMStateCacheTests {
         cT.copyIn(from: c.map { f -> UInt16 in
             UInt16(truncatingIfNeeded: f.bitPattern >> 16)
         })
-        let dtT = Tensor.empty(shape: [1], dtype: .bf16)
-        dtT.copyIn(from: [dt].map { f -> UInt16 in
+        let dtT = Tensor.empty(shape: [nHeads], dtype: .bf16)
+        dtT.copyIn(from: dt.map { f -> UInt16 in
             UInt16(truncatingIfNeeded: f.bitPattern >> 16)
         })
         let yT = Tensor.empty(shape: [nHeads, headDim], dtype: .bf16); yT.zero()

@@ -118,6 +118,36 @@ public enum Ops {
         return result
     }
 
+    /// Softplus: out[i] = log(1 + exp(x[i])). Numerically stable across
+    /// the full input range. Used by Mamba 2's `dt = softplus(dt_raw +
+    /// dt_bias)` per-head time-step computation.
+    public static func softplus(_ x: Tensor, on cmd: MTLCommandBuffer,
+                                into out: Tensor? = nil) -> Tensor {
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+        let n = x.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.softplus_f32(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.softplus_f16(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.softplus_bf16(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.softplus: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     /// Embedding lookup. `table` is [vocab, dim], `tokenIds` is [n_tokens]
     /// (u32), output is [n_tokens, dim].
     public static func gather(table: Tensor, tokenIds: Tensor,
