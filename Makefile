@@ -31,7 +31,7 @@ build-release: regenerate-kernels ## swift build (release)
 	swift build -c release
 
 .PHONY: regenerate-kernels
-regenerate-kernels: ## run metaltile-emit to regenerate metallib + Swift wrappers
+regenerate-kernels: ## run `tile build --emit all` to regenerate metallib + Swift wrappers
 	@if [ ! -d "$(METALTILE_DIR)" ]; then \
 	  echo "Error: metaltile not found at $(METALTILE_DIR)"; \
 	  echo "Clone the sibling metaltile repo at ../metaltile."; \
@@ -68,8 +68,8 @@ format-check: ## check formatting without modifying files
 	swift-format lint --configuration .swift-format --recursive . && echo "format OK"
 
 # ─── Docs ─────────────────────────────────────────────────────────────
-# User-facing documentation lives at https://houseofwaffles.github.io/ffai-website/
-# (source: github.com/houseofwaffles/ffai-website).
+# User-facing documentation lives at https://thewafflehaus.github.io/ffai-website/
+# (source: github.com/thewafflehaus/ffai-website).
 #
 # The website fetches markdown from this repo at build time, so committing
 # changes to documentation/, README.md, planning/architecture.md, or
@@ -83,14 +83,14 @@ docs: ## verify markdown + preview the docs site locally (if ../ffai-website is 
 	@if [ -d "$(WEBSITE_DIR)" ]; then \
 	  echo ""; \
 	  echo "Preview the docs site (Ctrl+C to stop):"; \
-	  echo "  cd $(WEBSITE_DIR) && npm run dev"; \
+	  echo "  cd $(WEBSITE_DIR) && pnpm dev"; \
 	  echo ""; \
 	  echo "Or to build a one-shot static preview:"; \
-	  echo "  cd $(WEBSITE_DIR) && npm run build && npx serve dist"; \
+	  echo "  cd $(WEBSITE_DIR) && pnpm build && pnpm dlx serve dist"; \
 	else \
 	  echo ""; \
 	  echo "Tip: clone the docs site to preview locally:"; \
-	  echo "  git clone https://github.com/houseofwaffles/ffai-website $(WEBSITE_DIR)"; \
+	  echo "  git clone https://github.com/thewafflehaus/ffai-website $(WEBSITE_DIR)"; \
 	fi
 
 .PHONY: docs-verify

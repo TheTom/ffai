@@ -6,8 +6,8 @@ Repo layout, the `make` workflow, and how to regenerate kernels.
 
 ```bash
 cd ~/Development
-git clone https://github.com/houseofwaffles/FFAI
-git clone https://github.com/houseofwaffles/metaltile     # sibling repo, required
+git clone https://github.com/thewafflehaus/FFAI
+git clone https://github.com/thewafflehaus/metaltile     # sibling repo, required
 cd FFAI
 ./scripts/setup-dev.sh
 ```

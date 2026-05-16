@@ -3,7 +3,7 @@
 **Fucking Fast Apple Inference.**
 
 A minimal, dependency-light LLM inference library for Apple Silicon, built on
-pre-compiled Metal kernels generated from the [metaltile](https://github.com/houseofwaffles/metaltile)
+pre-compiled Metal kernels generated from the [metaltile](https://github.com/thewafflehaus/metaltile)
 DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
 
 **Just really fucking fast AI!** 🚀
@@ -51,7 +51,7 @@ deep-dives (KV cache, quantization, performance, capabilities) see
 Install via SwiftPM:
 
 ```swift
-.package(url: "https://github.com/houseofwaffles/FFAI", from: "0.1.0")
+.package(url: "https://github.com/thewafflehaus/FFAI", from: "0.1.0")
 ```
 
 Then generate text in five lines:
@@ -146,8 +146,8 @@ inference dispatch loop) see
 ## Contributing
 
 ```bash
-git clone https://github.com/houseofwaffles/FFAI && cd FFAI
-git clone https://github.com/houseofwaffles/metaltile ../metaltile   # sibling
+git clone https://github.com/thewafflehaus/FFAI && cd FFAI
+git clone https://github.com/thewafflehaus/metaltile ../metaltile   # sibling
 ./scripts/setup-dev.sh                                        # toolchains + first build
 make test                                                     # 122 tests, ~30s
 ```
@@ -171,11 +171,11 @@ Common Make targets:
 | `make clean` | Remove `.build/` + generated artifacts |
 
 User-facing documentation lives at
-[**ffai.dev**](https://houseofwaffles.github.io/ffai-website/) (built
+[**ffai.dev**](https://thewafflehaus.github.io/ffai-website/) (built
 from the markdown in this repo's [`documentation/`](documentation/),
 the top-level `README.md`, and `planning/architecture.md` +
 `planning/roadmap.md`). The site source is at
-[houseofwaffles/ffai-website](https://github.com/houseofwaffles/ffai-website);
+[thewafflehaus/ffai-website](https://github.com/thewafflehaus/ffai-website);
 pushing markdown changes here triggers a rebuild automatically via
 a GitHub Action.
 
