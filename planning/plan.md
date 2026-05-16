@@ -239,14 +239,17 @@ Swift dispatch, with the SPM build plugin auto-invoking the emit step.
     Python/PyTorch invocations.
   - `Tools/capture-fixtures.py` — Python script (only used to
     *generate* fixtures, never run during `swift test`). Uses
-    `mlx-lm` for capture (closer architectural match than PyTorch
-    for the model variants we target). Writes activations + token
-    sequences to `Tests/Fixtures/<model>/`.
+    `mlx-lm` for text-only families and `mlx-vlm` for vision-language
+    families (closer architectural match than PyTorch for the model
+    variants we target). `mlx-vlm` lists `mlx-lm` as a runtime
+    dependency, so a single `pip install mlx-vlm` covers both
+    backends; the script picks the right one per model. Writes
+    activations + token sequences to `Tests/Fixtures/<model>/`.
   - Tests load the fixtures and compare with tolerance.
   - When a fixture needs regeneration: developer runs the capture
     script locally on a verified setup, commits the new files. The
-    fixture file's `metadata.json` records mlx-lm version + capture
-    date.
+    fixture file's `metadata.json` records the `mlx-lm` / `mlx-vlm`
+    version + capture date.
   - **Result:** zero Python dependency for `swift test`, fully
     reproducible CI on a stock Apple Silicon runner.
 
