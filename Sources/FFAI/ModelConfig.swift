@@ -15,10 +15,22 @@ public struct ModelConfig: @unchecked Sendable {
     public let raw: [String: Any]
 
     /// Decode `config.json` from a model directory.
+    ///
+    /// Some HF configs (notably Mamba 2's `time_step_limit: [0.0,
+    /// Infinity]`) ship non-standard JSON literals that Foundation's
+    /// `JSONSerialization` rejects unless `.json5Allowed` is set. We
+    /// enable JSON5 across the board — it's a superset of JSON, so
+    /// strict configs still parse.
     public static func load(from directory: URL) throws -> ModelConfig {
         let url = directory.appendingPathComponent("config.json")
         let data = try Data(contentsOf: url)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let parsed: Any
+        if #available(macOS 12.0, iOS 15.0, *) {
+            parsed = try JSONSerialization.jsonObject(with: data, options: [.json5Allowed])
+        } else {
+            parsed = try JSONSerialization.jsonObject(with: data)
+        }
+        guard let obj = parsed as? [String: Any] else {
             throw ModelConfigError.malformed(url)
         }
         let architecture = (obj["architectures"] as? [String])?.first
