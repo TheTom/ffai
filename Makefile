@@ -40,8 +40,14 @@ regenerate-kernels: ## run metaltile-emit to regenerate metallib + Swift wrapper
 	@# Run cargo from the metaltile dir so its rust-toolchain.toml (nightly,
 	@# 2024 edition) is honored. Running cargo from FFAI/ would use the
 	@# system default toolchain, which lacks edition=2024 support.
+	@#
+	@# `tile build --emit all` writes:
+	@#   $(KERNEL_OUT)/Resources/kernels/<name>.metal     per-kernel MSL
+	@#   $(KERNEL_OUT)/Resources/kernels.metallib         compiled metallib
+	@#   $(KERNEL_OUT)/Resources/manifest.json            IR descriptor
+	@#   $(KERNEL_OUT)/Generated/MetalTileKernels.swift   dispatch wrappers
 	cd $(METALTILE_DIR) && cargo run --release \
-	  -p metaltile-emit -- --out $(KERNEL_OUT)
+	  --bin tile -- build --emit all --out $(KERNEL_OUT)
 
 # ─── Test ─────────────────────────────────────────────────────────────
 .PHONY: test
