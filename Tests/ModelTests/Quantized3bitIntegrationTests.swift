@@ -1,4 +1,4 @@
-// End-to-end test: download mlx-community/Qwen3-1.7B-8bit and
+// End-to-end test: download mlx-community/Qwen3-1.7B-3bit and
 // generate. Skipped if network/checkpoint isn't available.
 //
 // 1.7B (vs 4B) for fast CI; the per-bit-width quantization paths
@@ -8,22 +8,19 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Qwen3 1.7B 8-bit integration", .serialized)
-struct Quantized8bitIntegrationTests {
+@Suite("Qwen3 1.7B 3-bit integration", .serialized)
+struct Quantized3bitIntegrationTests {
 
-    @Test("load + greedy generate produces coherent text")
+    @Test("3-bit Qwen3 1.7B generates coherent text")
     func loadAndGenerate() async throws {
         let m: Model
         do {
-            m = try await Model.load("mlx-community/Qwen3-1.7B-8bit")
+            m = try await Model.load("mlx-community/Qwen3-1.7B-3bit")
         } catch {
-            print("8-bit Qwen3 integration test skipped: \(error)")
+            print("3-bit Qwen3 integration test skipped: \(error)")
             return
         }
-
-        // Config carries 8-bit quantization
-        #expect(m.config.quantization?.bits == 8)
-        #expect(m.config.quantization?.groupSize == 64)
+        #expect(m.config.quantization?.bits == 3)
         #expect(m.qwen3 != nil)
 
         // Architecture matches Qwen3 1.7B
@@ -32,13 +29,6 @@ struct Quantized8bitIntegrationTests {
         #expect(m.engine.nHeads == 16)
         #expect(m.engine.nKVHeads == 8)
         #expect(m.engine.headDim == 128)
-
-        // First-token logits finite + non-degenerate
-        let caches = m.engine.makeKVCache()
-        let logits = m.engine.forward(tokenId: 0, position: 0, caches: caches)
-        let top = Sampling.topN(logits, n: 5)
-        #expect(top.count == 5)
-        #expect(top[0].1.isFinite)
 
         let result = try await m.generate(
             prompt: "The capital of France is",

@@ -45,7 +45,7 @@ struct LlamaIntegrationTests {
         // generated text to be non-empty and decode without crashing.
         let result = try await m.generate(
             prompt: "The capital of France is",
-            options: GenerateOptions(maxNewTokens: 4)
+            parameters: GenerationParameters(maxTokens: 4)
         )
         #expect(result.generatedTokens.count >= 1)
         #expect(!result.text.isEmpty)

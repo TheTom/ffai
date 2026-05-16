@@ -1,19 +1,21 @@
-// Slow integration test: downloads (or hits cache) the mlx-community
-// 4-bit Qwen3 4B and runs end-to-end greedy generation. Skipped if
-// network/checkpoint isn't available.
+// End-to-end test: download mlx-community/Qwen3-1.7B-4bit and
+// generate. Skipped if network/checkpoint isn't available.
+//
+// 1.7B (vs 4B) for fast CI; the per-bit-width quantization paths
+// don't depend on model size.
 
 import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Qwen3 4B 4-bit integration", .serialized)
+@Suite("Qwen3 1.7B 4-bit integration", .serialized)
 struct Quantized4bitIntegrationTests {
 
     @Test("load + greedy generate produces coherent text")
     func loadAndGenerate() async throws {
         let m: Model
         do {
-            m = try await Model.load("mlx-community/Qwen3-4B-4bit")
+            m = try await Model.load("mlx-community/Qwen3-1.7B-4bit")
         } catch {
             print("4-bit Qwen3 integration test skipped: \(error)")
             return
@@ -24,10 +26,10 @@ struct Quantized4bitIntegrationTests {
         #expect(m.config.quantization?.groupSize == 64)
         #expect(m.qwen3 != nil)
 
-        // Architecture matches Qwen3 4B
-        #expect(m.engine.hidden == 2560)
-        #expect(m.engine.nLayers == 36)
-        #expect(m.engine.nHeads == 32)
+        // Architecture matches Qwen3 1.7B
+        #expect(m.engine.hidden == 2048)
+        #expect(m.engine.nLayers == 28)
+        #expect(m.engine.nHeads == 16)
         #expect(m.engine.nKVHeads == 8)
         #expect(m.engine.headDim == 128)
 
@@ -43,7 +45,7 @@ struct Quantized4bitIntegrationTests {
         // non-garbage results.
         let result = try await m.generate(
             prompt: "The capital of France is",
-            options: GenerateOptions(maxNewTokens: 4)
+            parameters: GenerationParameters(maxTokens: 4)
         )
         #expect(result.generatedTokens.count >= 1)
         #expect(!result.text.isEmpty)
