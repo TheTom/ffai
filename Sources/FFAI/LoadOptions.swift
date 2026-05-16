@@ -8,12 +8,13 @@ public enum KVCacheKind: Sendable, Equatable {
     /// preprocessing.
     case raw
 
-    /// Affine group-quantized K/V at `bits` per element (8 today;
-    /// 4 + 6 are follow-ups). All layers share a single working
-    /// buffer pair (≈ one layer's worth of fp16 K/V) into which the
+    /// Affine group-quantized K/V at `bits` per element (4 + 8 today;
+    /// 6 is a follow-up). All layers share a single working buffer
+    /// pair (≈ one layer's worth of fp16 K/V) into which the
     /// `bulk_dequant_kv` kernel writes before each SDPA step.
-    /// Net memory vs `.raw` at int8: ~40% less for typical models;
-    /// ~65% less at int4 once that lands.
+    /// Net memory vs `.raw`: ~45% less at 8-bit, ~70% less at 4-bit
+    /// (group_size=32) for typical models. CLI: `--kv-cache affine8`
+    /// or `--kv-cache affine4`.
     case affineQuantized(bits: Int = 8, groupSize: Int = 64)
 
     // .turbo  — Phase 5d (TurboQuant compressed-domain attention)

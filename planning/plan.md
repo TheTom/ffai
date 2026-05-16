@@ -623,20 +623,20 @@ Shipped:
 - FFAI `main` (commit 5109b9b): `KVCacheProtocol` extracted from
   the existing `KVCache`; new `AffineQuantizedKVCache` conformance;
   `LoadOptions.kvCache = .affineQuantized(bits:groupSize:)`;
-  `--kv-cache int8` CLI flag; `LlamaModel` + `Qwen3Model` carry
-  `kvCacheKind` and switch on it in `makeKVCache(...)`. All layers
-  built in one `makeKVCache` call share a single pair of working
-  buffers (Metal hazard tracking serialises the buffer reuse across
-  layers within a cmdbuf — that's the architectural unlock that
-  makes the memory savings real vs per-layer working buffers).
+  `--kv-cache affine8` CLI flag; `LlamaModel` + `Qwen3Model` carry
+  `kvCacheKind` and switch on it in `makeLayerCaches(...)`. All
+  layers built in one `makeLayerCaches` call share a single pair of
+  working buffers (Metal hazard tracking serialises the buffer reuse
+  across layers within a cmdbuf — that's the architectural unlock
+  that makes the memory savings real vs per-layer working buffers).
 
-int4 shipped: metaltile commit `67ab7a3` (quantize_kv_int4 +
+4-bit shipped: metaltile commit `67ab7a3` (quantize_kv_int4 +
 bulk_dequant_kv_int4 kernels) + FFAI commit `31589b4`. Activate
 via `LoadOptions.kvCache = .affineQuantized(bits: 4, groupSize: 32)`
-or CLI `--kv-cache int4`. Measured ~70% KV memory savings vs raw
+or CLI `--kv-cache affine4`. Measured ~70% KV memory savings vs raw
 on Qwen3 1.7B at maxSeq=40960 (4.38 GB → 1.37 GB) with no further
-tok/s tax beyond int8. Uses group_size=32 default — group_size=64
-at int4 loses too much discriminative power and decode degenerates.
+tok/s tax beyond `affine8`. Uses group_size=32 default — group_size=64
+at 4-bit loses too much discriminative power and decode degenerates.
 
 Follow-ups not yet done:
 

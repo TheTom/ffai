@@ -33,12 +33,14 @@ fully phased build-out (deliverables, kernels, tests per phase) see
 - **Single-stream KV cache** (raw fp16 / bf16). Append + slice on the
   GPU via the `kv_cache_update` kernel — no per-layer CPU sync.
   TurboQuant + SSM/GDN caches land in Phase 5d/e.
-- **Affine-quantized KV cache (int8 + int4)** (Phase 5c). Activate via
+- **Affine-quantized KV cache (`affine8` + `affine4`)** (Phase 5c).
+  Activate via
   `LoadOptions.kvCache = .affineQuantized(bits: N, groupSize: ...)`
-  or CLI `--kv-cache int8` / `--kv-cache int4`. Measured on Qwen3 1.7B
-  at maxSeq=40960: int8 saves 47% KV (4.38 → 2.32 GB) at −7% tok/s;
-  int4 (group_size=32) saves 69% KV (4.38 → 1.37 GB) at −3% tok/s.
-  int6 + fused-dequant-into-SDPA are 5c follow-ups.
+  or CLI `--kv-cache affine8` / `--kv-cache affine4`. Measured on
+  Qwen3 1.7B at maxSeq=40960: `affine8` saves 47% KV (4.38 → 2.32 GB)
+  at −7% tok/s; `affine4` (group_size=32) saves 69% KV
+  (4.38 → 1.37 GB) at −3% tok/s. `affine6` + fused-dequant-into-SDPA
+  are 5c follow-ups.
 - **Mamba 2 dense (Phase 5e — initial drop).** End-to-end decode of
   `mlx-community/mamba2-130m` (130M / 370M / 780M / 1.3B / 2.7B all
   share `Mamba2Dense`). Per-token forward = one MTLCommandBuffer:
@@ -68,7 +70,7 @@ fully phased build-out (deliverables, kernels, tests per phase) see
 | Parallel-prefix CDF walk in `softmax_categorical_sample` | 5b+ | Per-family fusion shipped (Llama + Qwen 3 override `forwardSampleCategorical` to use one cmdbuf), but perf is bottlenecked by the single-thread CDF walk inside the kernel (~150µs at vocab=152K). Parallel-prefix replacement is the remaining lever. |
 | GPU filter kernels (top-K / top-P / min-P sort) | 5b+ | Today's filter-bearing paths fall back to `cpu-sample`. GPU filters need a sort or radix-select kernel. |
 | Parallel prefix-scan CDF walk | 5b+ | Replaces the single-thread CDF walk in `softmax_categorical_sample` (~150µs at vocab=152K today). |
-| Affine KV cache int6 | 5c+ | int4 + int8 shipped (47%/69% memory savings). int6 is a byte-packed follow-up between them. |
+| Affine KV cache `affine6` | 5c+ | `affine4` + `affine8` shipped (47%/69% memory savings). `affine6` is a byte-packed follow-up between them. |
 | Fused `bulk_dequant + sdpa_decode` | 5c+ | Today each attention step queues a separate dequant kernel into the shared working buffer before SDPA. Fusing removes the working-buffer materialisation entirely. |
 | TurboQuant compressed-domain attention | 5d | ~6-8× memory. Block-wise MSE codec with asymmetric K/V bits. Substantial research-grade codec port — multiple sessions. |
 | Mamba 2 hybrid models (NemotronH, GraniteMoeHybrid, FalconH1) | 5e+ | **Dense Mamba 2 shipped** (see above). Still needed: chunked-prefill parallel-scan for prefill perf, `n_groups > 1` grouped B/C, and the hybrid family files that interleave Mamba 2 mixers with attention layers. |
