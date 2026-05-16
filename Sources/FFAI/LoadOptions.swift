@@ -2,10 +2,21 @@
 
 import Foundation
 
-public enum KVCacheKind: Sendable {
-    case raw            // unquantized fp16 / bf16
-    // .affineQuantized — Phase 3
-    // .turbo            — Phase 4
+public enum KVCacheKind: Sendable, Equatable {
+    /// Unquantized fp16 / bf16. The default. Per-layer `KVCache` holds
+    /// raw K/V tensors directly; SDPA reads them with no per-step
+    /// preprocessing.
+    case raw
+
+    /// Affine group-quantized K/V at `bits` per element (8 today;
+    /// 4 + 6 are follow-ups). All layers share a single working
+    /// buffer pair (≈ one layer's worth of fp16 K/V) into which the
+    /// `bulk_dequant_kv` kernel writes before each SDPA step.
+    /// Net memory vs `.raw` at int8: ~40% less for typical models;
+    /// ~65% less at int4 once that lands.
+    case affineQuantized(bits: Int = 8, groupSize: Int = 64)
+
+    // .turbo  — Phase 5d (TurboQuant compressed-domain attention)
 }
 
 public enum DispatchMode: Sendable {

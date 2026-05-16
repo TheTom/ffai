@@ -292,7 +292,7 @@ public extension Model {
         promptTokens: [Int], generatedCount: Int, contextSize: Int,
         prefillTime: Double, decodeTime: Double, ttftMs: Double,
         perTokenWallclock: [Double],
-        memTracker: PhaseMemoryTracker, caches: [KVCache],
+        memTracker: PhaseMemoryTracker, caches: [any KVCacheProtocol],
         weightsBytes: Int, splitTokens: ThinkingSplit.Split?
     ) -> GenerationStats {
         let steady: Double? = {

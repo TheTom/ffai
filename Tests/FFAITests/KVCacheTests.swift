@@ -1,3 +1,5 @@
+import Foundation
+import Metal
 import Testing
 @testable import FFAI
 
@@ -65,5 +67,153 @@ struct KVCacheTests {
         #expect(c.length == 1)
         c.reset()
         #expect(c.length == 0)
+    }
+
+    // MARK: - AffineQuantizedKVCache (Phase 5c)
+
+    private func runAndWait(_ block: (MTLCommandBuffer) -> Void) {
+        let cb = Device.shared.makeCommandBuffer()
+        block(cb)
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+
+    private func makeSharedWorking(nKVHeads: Int, maxSeq: Int, headDim: Int,
+                                   dtype: DType) -> (k: Tensor, v: Tensor) {
+        let k = Tensor.empty(shape: [nKVHeads, maxSeq, headDim], dtype: dtype)
+        let v = Tensor.empty(shape: [nKVHeads, maxSeq, headDim], dtype: dtype)
+        k.zero(); v.zero()
+        return (k, v)
+    }
+
+    @Test("AffineQuantizedKVCache: round-trip a slowly-varying row preserves values within int8 precision")
+    func affineRoundTrip() {
+        let nKVHeads = 2
+        let headDim = 64
+        let maxSeq = 8
+        let groupSize = 32
+        let (sk, sv) = makeSharedWorking(nKVHeads: nKVHeads, maxSeq: maxSeq,
+                                         headDim: headDim, dtype: .f32)
+        let cache = AffineQuantizedKVCache(
+            nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+            dtype: .f32, bits: 8, groupSize: groupSize,
+            sharedWorkingK: sk, sharedWorkingV: sv
+        )
+        // Slowly-varying inputs: K = sin-ish ramp, V = cos-ish ramp.
+        var kFlatData = [Float](repeating: 0, count: nKVHeads * headDim)
+        var vFlatData = [Float](repeating: 0, count: nKVHeads * headDim)
+        for h in 0..<nKVHeads {
+            for d in 0..<headDim {
+                kFlatData[h * headDim + d] = Float(d) / Float(headDim) * 2 - 1   // -1..1
+                vFlatData[h * headDim + d] = Float(d) / Float(headDim) * 4 - 2   // -2..2
+            }
+        }
+        let kFlat = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+        let vFlat = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+        kFlat.copyIn(from: kFlatData)
+        vFlat.copyIn(from: vFlatData)
+
+        runAndWait { cb in cache.appendOnGPU(kFlat: kFlat, vFlat: vFlat, on: cb) }
+        #expect(cache.length == 1)
+
+        // Dequant into working buffer + sanity-check the output for
+        // position 0 matches the input within int8 precision.
+        var dqK: Tensor!
+        var dqV: Tensor!
+        runAndWait { cb in
+            let pair = cache.prepareForAttention(on: cb)
+            dqK = pair.k
+            dqV = pair.v
+        }
+
+        let kOut = dqK.toArray(as: Float.self)
+        let vOut = dqV.toArray(as: Float.self)
+        // Tolerance: range/255 per group, so worst-case ~ (max-min)/255.
+        // For input range 2 over groupSize=32, tolerance ~ 0.008.
+        let tolK: Float = 0.01
+        let tolV: Float = 0.02
+        for h in 0..<nKVHeads {
+            for d in 0..<headDim {
+                // Position 0 lives at offset h * maxSeq * headDim + 0 * headDim + d
+                let outIdx = h * maxSeq * headDim + d
+                let expectedK = kFlatData[h * headDim + d]
+                let expectedV = vFlatData[h * headDim + d]
+                #expect(abs(kOut[outIdx] - expectedK) < tolK,
+                        "K[\(h),0,\(d)] = \(kOut[outIdx]) vs expected \(expectedK)")
+                #expect(abs(vOut[outIdx] - expectedV) < tolV,
+                        "V[\(h),0,\(d)] = \(vOut[outIdx]) vs expected \(expectedV)")
+            }
+        }
+    }
+
+    @Test("AffineQuantizedKVCache: multi-position appends + dequant returns the right slice")
+    func affineMultiPosition() {
+        let nKVHeads = 1
+        let headDim = 64
+        let maxSeq = 4
+        let groupSize = 32
+        let (sk, sv) = makeSharedWorking(nKVHeads: nKVHeads, maxSeq: maxSeq,
+                                         headDim: headDim, dtype: .f32)
+        let cache = AffineQuantizedKVCache(
+            nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+            dtype: .f32, bits: 8, groupSize: groupSize,
+            sharedWorkingK: sk, sharedWorkingV: sv
+        )
+
+        // Append 3 distinct rows.
+        for pos in 0..<3 {
+            var k = [Float](repeating: 0, count: headDim)
+            var v = [Float](repeating: 0, count: headDim)
+            for d in 0..<headDim {
+                k[d] = Float(pos) * 10 + Float(d) / Float(headDim)
+                v[d] = Float(pos) * 100 + Float(d) / Float(headDim)
+            }
+            let kT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            let vT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            kT.copyIn(from: k)
+            vT.copyIn(from: v)
+            runAndWait { cb in cache.appendOnGPU(kFlat: kT, vFlat: vT, on: cb) }
+        }
+        #expect(cache.length == 3)
+
+        var dqK: Tensor!
+        runAndWait { cb in dqK = cache.prepareForAttention(on: cb).k }
+        let kOut = dqK.toArray(as: Float.self)
+        // Each of the 3 positions should reconstruct its row within
+        // int8 precision (range here is ~10 per group → tol ~0.05).
+        let tol: Float = 0.05
+        for pos in 0..<3 {
+            for d in 0..<headDim {
+                let outIdx = pos * headDim + d
+                let expected = Float(pos) * 10 + Float(d) / Float(headDim)
+                #expect(abs(kOut[outIdx] - expected) < tol,
+                        "pos=\(pos) d=\(d) got \(kOut[outIdx]) vs \(expected)")
+            }
+        }
+    }
+
+    @Test("AffineQuantizedKVCache: bytesAllocated reflects compressed storage, not the working buffer")
+    func affineBytesAccounting() {
+        let nKVHeads = 8
+        let headDim = 128
+        let maxSeq = 4096
+        let groupSize = 64
+        let (sk, sv) = makeSharedWorking(nKVHeads: nKVHeads, maxSeq: maxSeq,
+                                         headDim: headDim, dtype: .f16)
+        let cache = AffineQuantizedKVCache(
+            nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+            dtype: .f16, bits: 8, groupSize: groupSize,
+            sharedWorkingK: sk, sharedWorkingV: sv
+        )
+        // Expected: 2 × (nKVHeads × maxSeq × (headDim/4) × 4   [u32 weights]
+        //                + 2 × nKVHeads × maxSeq × (headDim/64) × 2 [scales+biases fp16])
+        let packs = headDim / 4
+        let groups = headDim / groupSize
+        let expected = 2 * (
+            nKVHeads * maxSeq * packs * 4
+            + 2 * nKVHeads * maxSeq * groups * 2  // f16 = 2 bytes
+        )
+        #expect(cache.bytesAllocated == expected)
+        #expect(cache.bytesInUse == 0)  // length=0
     }
 }

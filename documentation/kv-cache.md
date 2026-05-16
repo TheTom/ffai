@@ -10,9 +10,9 @@ land in Phase 5.
 | Algorithm | When to use | Memory ratio | Status |
 |---|---|---|---|
 | **Raw fp16 / bf16** (`KVCache`, default) | All current models. | 1× | ✅ Shipped (Phase 2). |
-| **Affine quantization** | Memory-constrained; modest decode-tok/s tax. | ~3.5× at 4-bit | ⏳ Planned (Phase 5). |
-| **TurboQuant** | Best memory ratio at minimal quality loss. | ~6–8× at `turbo4v2` | ⏳ Planned (Phase 5). |
-| **SSM / Hybrid** | Mamba / GatedDeltaNet (Qwen 3.5, NemotronH) | n/a — stores recurrent + conv state | ⏳ Planned (Phase 5). |
+| **Affine quantization int8** (`AffineQuantizedKVCache`) | Memory-constrained; ~7% decode-tok/s tax. | ~0.55× (45% smaller) measured on Qwen3 1.7B | ✅ Shipped (Phase 5c — int8 only; int4 + int6 are follow-ups). |
+| **TurboQuant** | Best memory ratio at minimal quality loss. | ~6–8× at `turbo4v2` | ⏳ Planned (Phase 5d). |
+| **SSM / Hybrid** | Mamba / GatedDeltaNet (Qwen 3.5, NemotronH) | n/a — stores recurrent + conv state | ⏳ Planned (Phase 5e). |
 | **Batched** | Multi-stream decode (speculative, B>1 serving) | linear in B | ⏳ Planned (Phase 8+). |
 
 The shipped raw cache is what every demo / test exercises today.
@@ -48,25 +48,63 @@ multi-turn or streaming.
 
 ## Choosing a configuration
 
-Today, only the raw cache exists, so the choice is implicit. The API
-surface for picking variants is in place via `LoadOptions.kvCache`:
+Two schemes ship today, selectable via `LoadOptions.kvCache`:
 
 ```swift
-public enum KVCacheKind: Sendable {
-    case raw                // unquantized fp16 / bf16  (shipped)
-    // .affineQuantized — Phase 5
-    // .turbo            — Phase 5
+public enum KVCacheKind: Sendable, Equatable {
+    case raw                                                // default
+    case affineQuantized(bits: Int = 8, groupSize: Int = 64) // Phase 5c
+    // .turbo  — Phase 5d
 }
 ```
 
-When the Phase 5 variants land, the same field selects them:
+Activating the int8 affine cache:
 
 ```swift
 let model = try await Model.load(
-    "mlx-community/Qwen3-4B-4bit",
-    options: LoadOptions(kvCache: .affineQuantized)  // Phase 5
+    "mlx-community/Qwen3-1.7B-4bit",
+    options: LoadOptions(kvCache: .affineQuantized(bits: 8, groupSize: 64))
 )
 ```
+
+Or via the CLI:
+
+```bash
+ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache int8
+```
+
+### How `AffineQuantizedKVCache` works
+
+Per attention layer the cache holds three packed buffers per K (and
+V): `kWeights` (u32, 4 int8 values per word), `kScales` (fp16/bf16,
+per-group), `kBiases` (fp16/bf16, per-group). All layers in one
+`makeKVCache(...)` call share **one** pair of working buffers
+sized `[nKVHeads, maxSeq, headDim]` in the model dtype. On
+`appendOnGPU(...)` the `quantize_kv_int8` kernel writes the new
+row into the layer's compressed storage. On `prepareForAttention(...)`
+(called before SDPA) the `bulk_dequant_kv_int8` kernel materialises
+the live slice into the shared working buffer, which SDPA then
+reads. Metal's default hazard tracking serializes the working-buffer
+reuse across layers within a single command buffer.
+
+### Measured on Qwen3 1.7B 4-bit at maxSeq=40960
+
+|  | Raw | int8 affine | Δ |
+|---|---|---|---|
+| KV cache (alloc) | 4.38 GB | 2.32 GB | −47% |
+| Peak GPU | 5.28 GB | 3.38 GB | −36% |
+| Decode tok/s | 46.7 | 43.6 | −7% |
+| Greedy output | "...Paris...Washington, D.C. So, the capital of the United Kingdom is" | "...Paris...Washington, D.C. The capital of the United Kingdom is London," | matches first ~13 tokens, then minor drift |
+
+### Coming next (5c follow-ups)
+
+- **int4 + int6 variants** — same kernel shape, byte-packed
+  storage (mirror the existing dequant_gather_int{3,5,6} pattern).
+  int4 should land ~3.5× memory savings vs raw.
+- **Fused dequant-into-SDPA** — today each attention step pays
+  one extra dequant kernel dispatch. A fused
+  `bulk_dequant + sdpa_decode` kernel removes the working-buffer
+  materialisation entirely.
 
 ## Multi-turn / streaming
 

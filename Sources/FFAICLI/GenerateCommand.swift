@@ -61,6 +61,9 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "PRNG seed for reproducible sampling.")
     var seed: UInt64?
 
+    @Option(name: .long, help: "KV cache scheme: \"raw\" (default fp16/bf16) or \"int8\" (affine-quantized, ~40% memory savings).")
+    var kvCache: String?
+
     func run() async throws {
         // Apply --debug + --profiling before any FFAI work so the
         // model-load path is captured.
@@ -73,7 +76,17 @@ struct GenerateCommand: AsyncParsableCommand {
 
         print("ffai \(FFAI.version) — loading \(model)…")
         let loadStart = Date()
-        let m = try await Model.load(model)
+        // Build LoadOptions with the requested KV cache scheme.
+        var loadOpts = LoadOptions()
+        switch (kvCache ?? "raw").lowercased() {
+        case "raw":
+            loadOpts.kvCache = .raw
+        case "int8", "affine", "affine8", "affinequantized":
+            loadOpts.kvCache = .affineQuantized(bits: 8, groupSize: 64)
+        default:
+            throw ValidationError("Unknown --kv-cache \"\(kvCache ?? "")\". Use \"raw\" or \"int8\".")
+        }
+        let m = try await Model.load(model, options: loadOpts)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")
 
         if verbose {

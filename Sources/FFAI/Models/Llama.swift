@@ -172,7 +172,8 @@ public struct LlamaDense: LlamaVariant {
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
             nKVHeads: nKVHeads, headDim: headDim, vocab: vocab,
-            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype
+            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype,
+            kvCacheKind: options.kvCache
         )
     }
 }
@@ -233,7 +234,7 @@ public final class LlamaLayer: Module {
     ///
     /// All work is queued on `cmd` — no commit/wait inside. Caller is
     /// responsible for committing once at end-of-token and waiting.
-    func forward(_ h: Tensor, position: Int, cache: KVCache,
+    func forward(_ h: Tensor, position: Int, cache: any KVCacheProtocol,
                  cmd: MTLCommandBuffer, device: Device) -> Tensor {
         // Attention
         let xNorm = inputNorm(h, on: cmd)
@@ -256,9 +257,12 @@ public final class LlamaLayer: Module {
                           on: cmd)
 
         // SDPA — cache is [nKVHeads, maxSeq, headDim]; kernel takes
-        // n_kv = filled length (post-append), kv_stride = maxSeq.
+        // n_kv = filled length (post-append), kv_stride = maxSeq. For
+        // affine-quantized caches, prepareForAttention queues a
+        // bulk-dequant pass into the shared working buffer first.
+        let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
         let attnOut = Ops.sdpaDecode(
-            q: qRotated, k: cache.kBuffer, v: cache.vBuffer,
+            q: qRotated, k: cacheK, v: cacheV,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
             nKV: cache.length, kvStride: cache.maxSeq,
             scale: scale, on: cmd)
@@ -287,11 +291,15 @@ public final class LlamaModel: LanguageModel {
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let ropeTheta: Float
     public let dtype: DType
+    /// Cache scheme to use when `makeKVCache(...)` is called. Set at
+    /// construction time from `LoadOptions.kvCache`.
+    public let kvCacheKind: KVCacheKind
 
     init(embedTokens: AnyEmbedding, layers: [LlamaLayer],
          finalNorm: RMSNorm, lmHead: AnyLinear,
          hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
-         vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType) {
+         vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType,
+         kvCacheKind: KVCacheKind = .raw) {
         self.embedTokens = embedTokens
         self.layers = layers
         self.finalNorm = finalNorm
@@ -305,6 +313,7 @@ public final class LlamaModel: LanguageModel {
         self.maxSeq = maxSeq
         self.ropeTheta = ropeTheta
         self.dtype = dtype
+        self.kvCacheKind = kvCacheKind
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -320,11 +329,34 @@ public final class LlamaModel: LanguageModel {
         return out
     }
 
-    /// Make a fresh KV cache for one inference session.
-    public func makeKVCache(maxSeq: Int?, device: Device) -> [KVCache] {
+    /// Make a fresh KV cache for one inference session. The concrete
+    /// type depends on `kvCacheKind` (set from LoadOptions at load
+    /// time): raw `KVCache` for `.raw`, `AffineQuantizedKVCache` (with
+    /// a shared working buffer pair) for `.affineQuantized`.
+    public func makeKVCache(maxSeq: Int?, device: Device) -> [any KVCacheProtocol] {
         let cap = maxSeq ?? self.maxSeq
-        return (0..<nLayers).map { _ in
-            KVCache(nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap, dtype: dtype, device: device)
+        switch kvCacheKind {
+        case .raw:
+            return (0..<nLayers).map { _ in
+                KVCache(nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                        dtype: dtype, device: device)
+            }
+        case .affineQuantized(let bits, let groupSize):
+            // One shared working buffer pair across every layer's
+            // cache — gives the real memory savings vs per-layer
+            // working buffers.
+            let sharedK = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            let sharedV = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            return (0..<nLayers).map { _ in
+                AffineQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                    dtype: dtype, bits: bits, groupSize: groupSize,
+                    sharedWorkingK: sharedK, sharedWorkingV: sharedV,
+                    device: device
+                )
+            }
         }
     }
 
@@ -334,7 +366,7 @@ public final class LlamaModel: LanguageModel {
     /// All N layers + embedding + final norm + lm head are queued on
     /// ONE MTLCommandBuffer with a single commit + wait at the end.
     public func forward(tokenId: Int, position: Int,
-                        caches: [KVCache], device: Device) -> Tensor {
+                        caches: [any KVCacheProtocol], device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
 
         // Embedding
@@ -365,7 +397,7 @@ public final class LlamaModel: LanguageModel {
     /// (the chosen token id) cross CPU↔GPU per token instead of vocab_size
     /// floats.
     public func forwardSample(tokenId: Int, position: Int,
-                              caches: [KVCache], device: Device) -> Int {
+                              caches: [any KVCacheProtocol], device: Device) -> Int {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)

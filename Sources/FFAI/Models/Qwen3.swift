@@ -201,7 +201,8 @@ public struct Qwen3Dense: Qwen3Variant {
             finalNorm: finalNorm, lmHead: lmHead,
             hidden: hidden, nLayers: nLayers, nHeads: nHeads,
             nKVHeads: nKVHeads, headDim: headDim, vocab: vocab,
-            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype
+            maxSeq: maxSeq, ropeTheta: theta, dtype: activationDtype,
+            kvCacheKind: options.kvCache
         )
     }
 }
@@ -255,7 +256,7 @@ public final class Qwen3Layer: Module {
     /// Single-token forward pass. Same shape as LlamaLayer.forward but
     /// applies q_norm / k_norm to each head's [head_dim] vector before
     /// RoPE. All work queued on `cmd`, no commit/wait inside.
-    func forward(_ h: Tensor, position: Int, cache: KVCache,
+    func forward(_ h: Tensor, position: Int, cache: any KVCacheProtocol,
                  cmd: MTLCommandBuffer, device: Device) -> Tensor {
         // Attention
         let xNorm = inputNorm(h, on: cmd)
@@ -284,8 +285,9 @@ public final class Qwen3Layer: Module {
                           vFlat: v.reshaped(to: [nKVHeads, headDim]),
                           on: cmd)
 
+        let (cacheK, cacheV) = cache.prepareForAttention(on: cmd)
         let attnOut = Ops.sdpaDecode(
-            q: qRotated, k: cache.kBuffer, v: cache.vBuffer,
+            q: qRotated, k: cacheK, v: cacheV,
             nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
             nKV: cache.length, kvStride: cache.maxSeq,
             scale: scale, on: cmd)
@@ -326,11 +328,13 @@ public final class Qwen3Model: LanguageModel {
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let ropeTheta: Float
     public let dtype: DType
+    public let kvCacheKind: KVCacheKind
 
     init(embedTokens: AnyEmbedding, layers: [Qwen3Layer],
          finalNorm: RMSNorm, lmHead: AnyLinear,
          hidden: Int, nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
-         vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType) {
+         vocab: Int, maxSeq: Int, ropeTheta: Float, dtype: DType,
+         kvCacheKind: KVCacheKind = .raw) {
         self.embedTokens = embedTokens
         self.layers = layers
         self.finalNorm = finalNorm
@@ -338,6 +342,7 @@ public final class Qwen3Model: LanguageModel {
         self.hidden = hidden; self.nLayers = nLayers; self.nHeads = nHeads
         self.nKVHeads = nKVHeads; self.headDim = headDim; self.vocab = vocab
         self.maxSeq = maxSeq; self.ropeTheta = ropeTheta; self.dtype = dtype
+        self.kvCacheKind = kvCacheKind
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -353,15 +358,32 @@ public final class Qwen3Model: LanguageModel {
         return out
     }
 
-    public func makeKVCache(maxSeq: Int?, device: Device) -> [KVCache] {
+    public func makeKVCache(maxSeq: Int?, device: Device) -> [any KVCacheProtocol] {
         let cap = maxSeq ?? self.maxSeq
-        return (0..<nLayers).map { _ in
-            KVCache(nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap, dtype: dtype, device: device)
+        switch kvCacheKind {
+        case .raw:
+            return (0..<nLayers).map { _ in
+                KVCache(nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                        dtype: dtype, device: device)
+            }
+        case .affineQuantized(let bits, let groupSize):
+            let sharedK = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            let sharedV = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            return (0..<nLayers).map { _ in
+                AffineQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                    dtype: dtype, bits: bits, groupSize: groupSize,
+                    sharedWorkingK: sharedK, sharedWorkingV: sharedV,
+                    device: device
+                )
+            }
         }
     }
 
     public func forward(tokenId: Int, position: Int,
-                        caches: [KVCache], device: Device) -> Tensor {
+                        caches: [any KVCacheProtocol], device: Device) -> Tensor {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)
@@ -384,7 +406,7 @@ public final class Qwen3Model: LanguageModel {
     }
 
     public func forwardSample(tokenId: Int, position: Int,
-                              caches: [KVCache], device: Device) -> Int {
+                              caches: [any KVCacheProtocol], device: Device) -> Int {
         let cmd = device.makeCommandBuffer()
 
         let tokenBuf = device.makeBuffer(length: 4)
