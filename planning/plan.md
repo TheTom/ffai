@@ -577,18 +577,33 @@ Done: `feat(phase-5): CPU sampling pipeline (...)` —
 against `mlx-community/Qwen3-1.7B-4bit`: greedy deterministic at
 ~53 tok/s; seeded non-greedy reproducible at ~36 tok/s.
 
-### Phase 5b — GPU softmax + categorical sample kernel (next)
+### Phase 5b — GPU softmax + categorical sample kernel ✅ SHIPPED
 
-Move the sample pipeline onto the GPU so the per-token logits
-readback goes away. Two metaltile kernels (or one fused):
+One fused metaltile kernel: `softmax_categorical_sample` —
+cooperative 256-thread reduction (max + sum-exp) followed by a
+single-threaded inverse-CDF walk. Used by the Generate decode
+loop's `gpu-categorical` path for the pure-temperature case
+(T > 0, no top-K / top-P / min-P / rep-penalty). Logits stay on
+GPU; only the chosen token id (4 bytes) flows back. Top-K / top-P /
+min-P / rep-penalty kernels deferred — those need a sort or
+radix-select kernel which is a separate follow-up.
 
-- `softmax_temperature` — applies `T` + stable softmax in-place
-- `categorical_sample` — picks token from prob distribution given a
-  CPU-supplied uniform draw, via parallel prefix scan + atomic-min
+Done: metaltile `feat(phase-5b): softmax_categorical_sample kernel`
+on the `ek/sampling-kernels` branch (commit `e663118`); FFAI
+`feat(phase-5b): GPU softmax+categorical sample path for
+pure-temperature decoding` on main (commit `507095a`). Verified
+end-to-end against `mlx-community/Qwen3-1.7B-4bit` with synthetic
+correctness sweeps at vocab=4, 32, and 152K (model-shaped).
 
-Top-K / top-P / rep-penalty stay on the CPU path until a sort/select
-kernel lands; the most common case (just `temperature`) becomes
-pure-GPU. Branch: `ek/sampling-kernels` in metaltile.
+**Follow-ups not yet done:**
+
+- Per-family `forwardSampleCategorical` fusion (single cmdbuf for
+  forward + sample). Default impl uses two cmdbufs today, so
+  `gpu-categorical` runs at the same tok/s as `cpu-sample` — the
+  perf win lands with fusion.
+- Parallel prefix-scan replacement for the single-thread CDF walk
+  (currently ~150µs at vocab=152K).
+- GPU top-K / top-P / min-P / rep-penalty kernels.
 
 ### Phase 5c — Affine-quantized KV cache (4 / 6 / 8-bit)
 

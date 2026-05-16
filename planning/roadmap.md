@@ -33,21 +33,24 @@ fully phased build-out (deliverables, kernels, tests per phase) see
 - **Single-stream KV cache** (raw fp16 / bf16). Append + slice on the
   GPU via the `kv_cache_update` kernel — no per-layer CPU sync.
   Quantized + TurboQuant + SSM/GDN caches land in Phase 5+.
-- **Full sampling pipeline** (Phase 5a). `temperature`, `top-K`,
+- **Full sampling pipeline** (Phase 5a + 5b). `temperature`, `top-K`,
   `top-P`, `min-P`, `repetition penalty`, seeded reproducible
   sampling — all wired through `GenerationParameters` + CLI flags
   (`--temperature`, `--top-k`, `--top-p`, `--min-p`,
-  `--repetition-penalty`, `--seed`). Greedy stays on the GPU argmax
-  fast path (no logits readback); non-greedy reads logits to CPU
-  and runs the pipeline there (~30% decode-tok/s tax). A fully-on-GPU
-  sample kernel is on the `ek/sampling-kernels` metaltile branch
-  for a later commit.
+  `--repetition-penalty`, `--seed`). Three execution paths:
+  *greedy-GPU* (T==0, no filters — argmax kernel); *gpu-categorical*
+  (T>0, no filters — new `softmax_categorical_sample` kernel,
+  logits stay on GPU); *cpu-sample* (any filter — CPU readback +
+  full pipeline). Per-family `forwardSampleCategorical` fusion and
+  GPU filter kernels (top-K / top-P / min-P sort) are follow-ups.
 
 ## Planned
 
 | Capability | Phase | Notes |
 |---|---|---|
-| **GPU softmax + categorical sample kernel** | 5b | Eliminates the per-token logits readback when sampling. Branch: `ek/sampling-kernels` in metaltile. |
+| Per-family `forwardSampleCategorical` fusion | 5b+ | Today's default impl uses 2 cmdbufs (forward + sample); fusing into 1 unlocks the real `gpu-categorical` perf win. Llama / Qwen 3 each get the per-family override. |
+| GPU filter kernels (top-K / top-P / min-P sort) | 5b+ | Today's filter-bearing paths fall back to `cpu-sample`. GPU filters need a sort or radix-select kernel. |
+| Parallel prefix-scan CDF walk | 5b+ | Replaces the single-thread CDF walk in `softmax_categorical_sample` (~150µs at vocab=152K today). |
 | Quantized KV cache (affine 4 / 6 / 8-bit) | 5c | ~3.5× memory at 4-bit; modest decode-tok/s tax. Needs quantize-on-append + bulk-dequant kernels + cache-abstraction refactor (protocol over the concrete `KVCache` class). |
 | TurboQuant compressed-domain attention | 5d | ~6-8× memory. Block-wise MSE codec with asymmetric K/V bits. Substantial research-grade codec port — multiple sessions. |
 | SSM / GatedDeltaNet hybrid models (Qwen 3.5, NemotronH, Mamba) | 5e | New `SSMStateCache` + `gated_delta_step` / `ssm_kernel` kernels. Requires Mamba selective-scan port. |
