@@ -3,7 +3,7 @@
 **Fucking Fast Apple Inference.**
 
 A minimal, dependency-light LLM inference library for Apple Silicon, built on
-pre-compiled Metal kernels generated from the [metaltile](https://github.com/ekryski/metaltile)
+pre-compiled Metal kernels generated from the [metaltile](https://github.com/houseofwaffles/metaltile)
 DSL. No Python. No MLX. No C compilation. No JIT. No four-repo dependency chain.
 
 **Just really fucking fast AI!** 🚀
@@ -51,7 +51,7 @@ deep-dives (KV cache, quantization, performance, capabilities) see
 Install via SwiftPM:
 
 ```swift
-.package(url: "https://github.com/ekryski/FFAI", from: "0.1.0")
+.package(url: "https://github.com/houseofwaffles/FFAI", from: "0.1.0")
 ```
 
 Then generate text in five lines:
@@ -146,8 +146,8 @@ inference dispatch loop) see
 ## Contributing
 
 ```bash
-git clone https://github.com/ekryski/FFAI && cd FFAI
-git clone https://github.com/ekryski/metaltile ../metaltile   # sibling
+git clone https://github.com/houseofwaffles/FFAI && cd FFAI
+git clone https://github.com/houseofwaffles/metaltile ../metaltile   # sibling
 ./scripts/setup-dev.sh                                        # toolchains + first build
 make test                                                     # 122 tests, ~30s
 ```

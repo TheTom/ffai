@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   build_and_test:
-    if: github.repository_owner == 'ekryski'
+    if: github.repository_owner == 'houseofwaffles'
     name: Build and test (Apple Silicon)
     runs-on: macos-15
     timeout-minutes: 30
@@ -35,7 +35,7 @@ jobs:
       - name: Checkout sibling metaltile
         uses: actions/checkout@v4
         with:
-          repository: ekryski/metaltile
+          repository: houseofwaffles/metaltile
           ref: main
           path: metaltile
 
