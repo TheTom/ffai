@@ -38,7 +38,9 @@ print(result.text)
 
 ## CLI
 
-The same surface ships as the `ffai` executable:
+The same surface ships as the `ffai` executable. See
+[using-the-cli.md](using-the-cli.md) for how to build the binary and
+get it on `PATH`; once that's done:
 
 ```bash
 ffai --model unsloth/Llama-3.2-1B --prompt "Once upon a time"
@@ -233,7 +235,7 @@ Task {
 to the `LanguageModel` protocol:
 
 ```swift
-let caches = model.engine.makeKVCache()
+let caches = model.engine.makeLayerCaches()
 
 // Prefill: feed each prompt token through the same forward path.
 var nextToken = 0

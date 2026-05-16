@@ -92,9 +92,11 @@ public struct <Family>Dense: <Family>Variant {
 }
 
 public final class <Family>Model: LanguageModel, @unchecked Sendable {
-    public func makeKVCache() -> [KVCache] { ... }
-    public func forward(tokenId: Int, position: Int, caches: [KVCache]) -> Tensor { ... }
-    public func forwardSample(tokenId: Int, position: Int, caches: [KVCache]) -> Int { ... }
+    public func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol] { ... }
+    public func forward(tokenId: Int, position: Int,
+                        caches: [any LayerCacheProtocol], device: Device) -> Tensor { ... }
+    public func forwardSample(tokenId: Int, position: Int,
+                              caches: [any LayerCacheProtocol], device: Device) -> Int { ... }
 }
 ```
 

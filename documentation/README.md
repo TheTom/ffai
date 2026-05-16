@@ -9,6 +9,8 @@ every page in the tree so you can jump straight to a topic.
 - [Installation](installation.md) — SwiftPM / Xcode setup, platform
   requirements, sibling-metaltile checkout.
 - [Quick start](quickstart.md) — generate text in 5 lines.
+- [Using the CLI](using-the-cli.md) — build the `ffai` binary and run
+  it via `swift run`, the built path, or a `PATH` symlink.
 - [Architecture](architecture.md) — the three-layer stack
   (`metaltile` Rust → `MetalTileSwift` → `FFAI`), build pipeline, and
   per-token dispatch loop.

@@ -10,8 +10,8 @@ land in Phase 5.
 | Algorithm | When to use | Memory ratio | Status |
 |---|---|---|---|
 | **Raw fp16 / bf16** (`KVCache`, default) | All current models. | 1× | ✅ Shipped (Phase 2). |
-| **Affine quantization int8** (`AffineQuantizedKVCache`) | Memory-constrained; ~7% decode-tok/s tax. | ~0.55× (45% smaller) measured on Qwen3 1.7B | ✅ Shipped (Phase 5c). |
-| **Affine quantization int4** (`AffineQuantizedKVCache`) | Tight memory; same speed as int8. | ~0.31× (69% smaller, group_size=32) | ✅ Shipped (Phase 5c). |
+| **`affine8`** (`AffineQuantizedKVCache`, 8-bit) | Memory-constrained; ~7% decode-tok/s tax. | ~0.55× (45% smaller) measured on Qwen3 1.7B | ✅ Shipped (Phase 5c). |
+| **`affine4`** (`AffineQuantizedKVCache`, 4-bit) | Tight memory; same speed as `affine8`. | ~0.31× (69% smaller, group_size=32) | ✅ Shipped (Phase 5c). |
 | **TurboQuant** | Best memory ratio at minimal quality loss. | ~6–8× at `turbo4v2` | ⏳ Planned (Phase 5d). |
 | **SSM / Hybrid** | Mamba / GatedDeltaNet (Qwen 3.5, NemotronH) | n/a — stores recurrent + conv state | ⏳ Planned (Phase 5e). |
 | **Batched** | Multi-stream decode (speculative, B>1 serving) | linear in B | ⏳ Planned (Phase 8+). |
@@ -39,13 +39,13 @@ context length; appends bump an `offset` rather than reallocating.
 This is the same shape MLX uses, minus the Metal compile latency.
 
 ```swift
-let caches = model.engine.makeKVCache()  // [KVCache], one per layer
+let caches = model.engine.makeLayerCaches()  // [any LayerCacheProtocol], one per layer
 ```
 
-`makeKVCache()` is on the `LanguageModel` protocol — `LlamaModel` and
-`Qwen3Model` both implement it. The user owns the cache lifetime;
-keep it across `forward(...)` / `forwardSample(...)` calls for
-multi-turn or streaming.
+`makeLayerCaches()` is on the `LanguageModel` protocol — `LlamaModel`,
+`Qwen3Model`, and `Mamba2Model` all implement it. The user owns the
+cache lifetime; keep it across `forward(...)` / `forwardSample(...)`
+calls for multi-turn or streaming.
 
 ## Choosing a configuration
 
@@ -59,7 +59,7 @@ public enum KVCacheKind: Sendable, Equatable {
 }
 ```
 
-Activating the int8 affine cache:
+Activating the 8-bit affine cache:
 
 ```swift
 let model = try await Model.load(
@@ -71,7 +71,7 @@ let model = try await Model.load(
 Or via the CLI:
 
 ```bash
-ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache int8
+ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache affine8
 ```
 
 ### How `AffineQuantizedKVCache` works
@@ -79,7 +79,7 @@ ffai --model mlx-community/Qwen3-1.7B-4bit --prompt "..." --kv-cache int8
 Per attention layer the cache holds three packed buffers per K (and
 V): `kWeights` (u32, 4 int8 values per word), `kScales` (fp16/bf16,
 per-group), `kBiases` (fp16/bf16, per-group). All layers in one
-`makeKVCache(...)` call share **one** pair of working buffers
+`makeLayerCaches(...)` call share **one** pair of working buffers
 sized `[nKVHeads, maxSeq, headDim]` in the model dtype. On
 `appendOnGPU(...)` the `quantize_kv_int8` kernel writes the new
 row into the layer's compressed storage. On `prepareForAttention(...)`
@@ -90,7 +90,7 @@ reuse across layers within a single command buffer.
 
 ### Measured on Qwen3 1.7B 4-bit at maxSeq=40960
 
-|  | Raw | int8 affine | int4 affine | Δ vs raw |
+|  | Raw | affine8 | affine4 | Δ vs raw |
 |---|---|---|---|---|
 | KV cache (alloc) | 4.38 GB | 2.32 GB | 1.37 GB | −47% / −69% |
 | Peak GPU | 5.28 GB | 3.38 GB | 2.44 GB | −36% / −54% |
@@ -99,22 +99,22 @@ reuse across layers within a single command buffer.
 
 ### Per-bit `groupSize` choice
 
-| Bits | Default `groupSize` | Why |
+| Scheme | Default `groupSize` | Why |
 |---|---|---|
-| int8 | 64 | Plenty of precision per group; matches mlx-format weight-quant convention. |
-| int4 | **32** | 4 bits per element ÷ a wider group loses too much discriminative power on K/V — decode degenerates into repetition at group_size=64. TurboQuant-style rotation (Phase 5d) would let larger groups work. |
+| `affine8` | 64 | Plenty of precision per group; matches mlx-format weight-quant convention. |
+| `affine4` | **32** | 4 bits per element ÷ a wider group loses too much discriminative power on K/V — decode degenerates into repetition at group_size=64. TurboQuant-style rotation (Phase 5d) would let larger groups work. |
 
 ### Coming next (5c follow-ups)
 
-- **int6 variant** — byte-packed sub-byte storage (mirror the
-  existing dequant_gather_int6 pattern). Memory between int4 and
-  int8.
+- **`affine6` variant** — byte-packed sub-byte storage (mirror the
+  existing dequant_gather_int6 pattern). Memory between `affine4` and
+  `affine8`.
 - **Fused dequant-into-SDPA** — today each attention step pays
   one extra dequant kernel dispatch. A fused
   `bulk_dequant + sdpa_decode` kernel removes the working-buffer
   materialisation entirely.
 - **TurboQuant** (Phase 5d) — block-wise MSE codec with asymmetric
-  K/V bits + dense rotation; will recover full quality at int4
+  K/V bits + dense rotation; will recover full quality at 4-bit
   group_size=64.
 
 ## Multi-turn / streaming
@@ -124,7 +124,7 @@ the cache across calls (see [quickstart.md § Lower-level
 API](quickstart.md#lower-level-api)):
 
 ```swift
-let caches = model.engine.makeKVCache()
+let caches = model.engine.makeLayerCaches()
 
 func respond(_ prompt: String, position: inout Int) -> String {
     var pos = position
