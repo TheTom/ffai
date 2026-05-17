@@ -94,8 +94,9 @@ body:
       options:
         - label: "🔍 Research — searching docs, finding related issues, understanding APIs"
         - label: "💡 Ideation — brainstorming the design, weighing trade-offs"
-        - label: "⌨️ Implementation — writing code snippets / reproducers"
+        - label: "⌨️ Implementation — writing code snippets / reproducers or updating documentation"
         - label: "🧪 Testing — running test cases to verify the bug or proposal"
+        - label: "📚 Documentation — writing this issue's content"
         - label: "✋ No AI used — this is hand-written"
     validations:
       required: true

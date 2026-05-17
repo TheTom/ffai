@@ -79,8 +79,9 @@ Fixes #
 
 - [ ] 🔍 **Research** — searching docs, prior art, related issues
 - [ ] 💡 **Ideation** — brainstorming approach, weighing trade-offs
-- [ ] ⌨️ **Implementation** — writing the actual diff
+- [ ] ⌨️ **Implementation** — writing the actual code / documentation
 - [ ] 🧪 **Testing** — writing or running test cases
+- [ ] 📚 **Documentation** — writing this PR's content
 - [ ] ✋ **No AI used** — this is hand-written
 
 ## Final checklist
