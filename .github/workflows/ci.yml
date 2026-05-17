@@ -105,22 +105,20 @@ jobs:
           cargo run --release --bin tile -- build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
 
-      - name: Build (with tests)
-        # `--build-tests` produces the xctest bundle alongside the
-        # library so the subsequent `swift test --skip-build` step has
-        # something to load. Without it, --skip-build fails with
-        # "FFAIPackageTests.xctest doesn't exist" (and works only by
-        # accident when the .build cache happens to hold a prior bundle).
-        # Debug config auto-enables -enable-testing — no need to pass
-        # it explicitly here (release.yml does because release config
-        # doesn't auto-enable it).
-        run: swift build --build-tests
-
-      - name: Run unit tests
+      - name: Run unit tests (with coverage)
         # FFAITests (~215 cases) + MetalTileSwiftTests (kernel round-trip).
         # Integration tests (ModelTests) are deliberately excluded — they
         # ship a different way (release.yml runs them right before tagging).
-        run: swift test --enable-code-coverage --skip-build --filter "FFAITests|MetalTileSwiftTests"
+        #
+        # One swift test invocation handles compile + coverage
+        # instrumentation + run in a single pass. A separate `swift build`
+        # step is intentionally NOT used here: --enable-code-coverage
+        # needs -profile-generate / -profile-coverage-mapping to be on at
+        # compile time, which --skip-build cannot apply retroactively. The
+        # symptom is tests pass but the run exits 1 with "The folder
+        # 'codecov' doesn't exist". Letting swift test own the build keeps
+        # the coverage and testability flags in lockstep.
+        run: swift test --enable-code-coverage --filter "FFAITests|MetalTileSwiftTests"
 
       - name: Coverage summary
         if: always()
