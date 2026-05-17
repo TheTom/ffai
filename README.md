@@ -80,7 +80,7 @@ CLI equivalent (the `ffai` executable target):
 ffai --model unsloth/Llama-3.2-1B --prompt "Once upon a time"
 ```
 
-See [`documentation/quickstart.md`](documentation/quickstart.md) for
+See [`quickstart.md`](documentation/quickstart.md) for
 streaming, chat templates, capability gating, and lower-level
 forward APIs. Using a non-default cache directory (external SSD,
 shared cache between Python tools, etc.)? See
@@ -91,7 +91,7 @@ shared cache between Python tools, etc.)? See
 Two architecture families ship today; both run real HuggingFace
 checkpoints end-to-end. Adding a new family is one Swift file plus
 test fixtures — see
-[`documentation/adding-a-model.md`](documentation/adding-a-model.md).
+[`adding-a-model.md`](documentation/adding-a-model.md).
 
 | Family | Variants | Sizes | Quantizations |
 |---|---|---|---|
@@ -102,7 +102,7 @@ Quant layouts follow the **mlx-community** packed-uint32 format
 (weights + scales + biases per group). Pass any HuggingFace repo ID
 and the loader resolves architecture, downloads the snapshot, and
 routes to the right family. See
-[`documentation/models.md`](documentation/models.md) for the full
+[`models.md`](documentation/models.md) for the full
 matrix and known gaps.
 
 **Coming next** (per [`planning/plan.md`](planning/plan.md)): Qwen 3.5
@@ -145,52 +145,13 @@ inference dispatch loop) see
 
 ## Contributing
 
-Read **[`CONTRIBUTING.md`](CONTRIBUTING.md)** first — it covers the
-issue-first rule, what good PRs look like, and how to disclose
-AI-assisted contributions.
+Read **[`CONTRIBUTING.md`](CONTRIBUTING.md)** first — it covers:
 
-### Setup
-
-```bash
-git clone https://github.com/thewafflehaus/FFAI && cd FFAI
-git clone https://github.com/thewafflehaus/metaltile ../metaltile   # sibling
-./scripts/setup-dev.sh                                        # toolchains + first build
-make test                                                     # full unit suite
-```
-
-`setup-dev.sh` verifies Xcode CLI tools + `xcrun metal`, the Swift
-toolchain, Cargo (for the metaltile `tile` CLI), and the sibling
-metaltile checkout; resolves SPM deps; and runs the first build to
-populate `kernels.metallib`.
-
-### Common Make targets
-
-| Target | What |
-|---|---|
-| `make build` | Regenerate kernels + `swift build` (debug) |
-| `make build-release` | Same, release config |
-| `make test` | Regenerate kernels + `swift test` |
-| `make coverage` | `swift test --enable-code-coverage` + summary |
-| `make regenerate-kernels` | Run `tile build --emit all` only |
-| `make format` | `swift-format` the repo in place |
-| `make docs` | Lint markdown + (if `../ffai-website` exists) preview the docs site locally |
-| `make clean` | Remove `.build/` + generated artifacts |
-
-### Where to read next
-
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution guidelines, AI disclosure.
-- [`documentation/developing/`](documentation/developing/) — dev workflow, testing, adding a model, publishing.
-- [`planning/architecture.md`](planning/architecture.md) — architectural invariants.
-- [`planning/roadmap.md`](planning/roadmap.md) — what's shipped vs planned.
-
-User-facing documentation lives at
-[**ffai.dev**](https://thewafflehaus.github.io/ffai-website/) (built
-from the markdown in this repo's [`documentation/`](documentation/),
-the top-level `README.md`, and `planning/architecture.md` +
-`planning/roadmap.md`). Site source:
-[thewafflehaus/ffai-website](https://github.com/thewafflehaus/ffai-website).
-For the release → docs publishing flow see
-[`documentation/developing/publishing.md`](documentation/developing/publishing.md).
+- the community guidelines;
+- issue-first rule;
+- what good PRs look like;
+- how we deal with AI-assisted contributions; and
+- how to get started! 🚀
 
 ## License
 
