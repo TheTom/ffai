@@ -5,7 +5,7 @@ guidelines keep contributions coherent and the maintainer queue sane.
 
 **TL;DR:**
 - Open an issue **before** opening a PR.
-- PRs without a linked issue **will be closed**.
+- PRs without a linked issue **will be automatically closed**.
 - Tests + docs land with the code that needs them.
 - AI-assisted contributions are welcome (preferred, even) — disclose
   how you used AI in the issue/PR template.
@@ -31,7 +31,7 @@ metadata.
 - **Scoped tightly.** One logical change per PR. If it touches three
   unrelated things, that's three PRs.
 - **Tests for behavior changes**, **docs for user-visible changes**.
-  See [`documentation/developing/testing.md`](documentation/developing/testing.md)
+  See [`testing.md`](documentation/developing/testing.md)
   for what kind of test goes where; see
   [`documentation/`](documentation/README.md) for the docs surface.
 - **Passes CI** (`make test`) before requesting review.
@@ -55,8 +55,8 @@ Two rules:
 2. **Curate before opening.** An AI-assisted PR should read no
    differently from a hand-written one: tight description, linked
    issue, scoped diff, tests, docs. Don't paste raw assistant output.
-   If the diff is sprawling or the description is vague, tighten it
-   before opening.
+   If the diff is sprawling or the description is vague or overly verbose, 
+   tighten it before opening.
 
 The same applies to issues — if your assistant produces a
 2000-word writeup, condense to what's actually relevant before
@@ -66,12 +66,11 @@ filing.
 
 The usual: no spam, no off-topic content, no harassment, no
 back-seat-driving on closed issues. Maintainer discretion on what
-counts. Repeated violations → blocked from the org.
+counts. Repeated violations → blocked from the org/repos.
 
 ## Setup
 
-See the top-level [`README.md` § Contributing](README.md#contributing)
-for clone + sibling-metaltile + `make test` instructions.
+See the [developing.md](./documentation/developing/developing.md) file for how to clone the repo, get your developer environment set up, and start building!
 
 ## Deeper reading
 
