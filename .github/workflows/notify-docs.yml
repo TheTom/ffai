@@ -1,40 +1,112 @@
 name: Trigger docs rebuild
 
-# When markdown the docs site renders changes on main, ping the
-# ffai-website repo so it rebuilds against the new commit. Avoids
-# polling and keeps the published site in lockstep with main.
+# Docs are versioned by FFAI release. Every published release fires a
+# `ffai-release-published` repository_dispatch at ffai-website so the
+# site is rebuilt against the immutable release tag, generates a
+# Changelog entry from the release body, and updates the version label
+# in the UI. Pushes to main no longer publish docs — preview locally
+# by cloning ffai-website and pointing its sync script at your
+# FFAI working copy (FFAI_REPO_PATH=… pnpm dev).
 #
-# Requires a `WEBSITE_DISPATCH_TOKEN` repo secret with a fine-scoped
-# PAT (or GitHub App token) that has `contents: write` on
-# thewafflehaus/ffai-website. See README#Contributing for setup.
+# Requires a `WEBSITE_DISPATCH_TOKEN` repo secret — a fine-scoped PAT
+# with `contents: write` on thewafflehaus/ffai-website. See
+# README#Contributing for setup.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'README.md'
-      - 'documentation/**'
-      - 'planning/architecture.md'
-      - 'planning/roadmap.md'
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'FFAI release tag to dispatch for (defaults to latest)'
+        required: false
+        type: string
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # `release.body` may contain newlines / quotes; emit it as a
+            # heredoc via $GITHUB_OUTPUT's `<<DELIM` syntax so jq later
+            # gets the whole thing as one string.
+            {
+              echo "tag=${{ github.event.release.tag_name }}"
+              echo "name=${{ github.event.release.name }}"
+              echo "url=${{ github.event.release.html_url }}"
+              echo "published_at=${{ github.event.release.published_at }}"
+              echo "body<<__BODY_EOF__"
+              cat <<'__INNER_EOF__'
+              ${{ github.event.release.body }}
+              __INNER_EOF__
+              echo "__BODY_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch — look up the named tag (or latest).
+            if [ -n "$INPUT_TAG" ]; then
+              data=$(gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json tagName,name,url,publishedAt,body)
+            else
+              data=$(gh release view --repo "$GITHUB_REPOSITORY" \
+                       --json tagName,name,url,publishedAt,body)
+            fi
+            {
+              echo "tag=$(echo "$data" | jq -r .tagName)"
+              echo "name=$(echo "$data" | jq -r .name)"
+              echo "url=$(echo "$data" | jq -r .url)"
+              echo "published_at=$(echo "$data" | jq -r .publishedAt)"
+              echo "body<<__BODY_EOF__"
+              echo "$data" | jq -r .body
+              echo "__BODY_EOF__"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fire repository_dispatch at thewafflehaus/ffai-website
         env:
           GH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_NAME: ${{ steps.meta.outputs.name }}
+          RELEASE_URL: ${{ steps.meta.outputs.url }}
+          RELEASE_PUBLISHED_AT: ${{ steps.meta.outputs.published_at }}
+          RELEASE_BODY: ${{ steps.meta.outputs.body }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "WEBSITE_DISPATCH_TOKEN not configured — skipping dispatch."
             echo "Add a fine-scoped PAT under Settings → Secrets → Actions to enable."
             exit 0
           fi
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "No release tag resolved — skipping dispatch."
+            exit 0
+          fi
+          # Build payload via jq so newlines / quotes in the body don't
+          # break shell escaping.
+          payload=$(jq -nc \
+            --arg tag "$RELEASE_TAG" \
+            --arg name "$RELEASE_NAME" \
+            --arg url "$RELEASE_URL" \
+            --arg published_at "$RELEASE_PUBLISHED_AT" \
+            --arg body "$RELEASE_BODY" \
+            '{
+              event_type: "ffai-release-published",
+              client_payload: {
+                tag: $tag,
+                name: $name,
+                url: $url,
+                published_at: $published_at,
+                body: $body
+              }
+            }')
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/thewafflehaus/ffai-website/dispatches \
-            -d '{"event_type":"ffai-docs-changed","client_payload":{"sha":"${{ github.sha }}","ref":"${{ github.ref }}"}}'
-          echo "dispatched ffai-docs-changed for ${GITHUB_SHA::7}"
+            -d "$payload"
+          echo "dispatched ffai-release-published for $RELEASE_TAG"
