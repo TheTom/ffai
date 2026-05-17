@@ -131,12 +131,14 @@ jobs:
           cargo run --release --bin tile -- build --emit all \
             --out ${{ github.workspace }}/FFAI/Sources/MetalTileSwift
 
-      - name: Build (release, with tests)
-        # `--build-tests` compiles the xctest bundle alongside the
-        # library so the subsequent `swift test --skip-build` steps
-        # can reuse it. Without this, --skip-build fails with
-        # "FFAIPackageTests.xctest doesn't exist".
-        run: swift build -c release --build-tests
+      - name: Build (release, with tests + testability)
+        # `--build-tests` produces the xctest bundle so the subsequent
+        # `swift test --skip-build` steps don't have to rebuild it.
+        # `-Xswiftc -enable-testing` is needed in release config because
+        # Swift PM only auto-enables testability in debug — without it,
+        # `@testable import MetalTileSwift` in MetalTileSwiftTests fails
+        # at compile time with "module ... was not compiled for testing".
+        run: swift build -c release --build-tests -Xswiftc -enable-testing
 
       - name: Run unit tests
         # FFAITests + MetalTileSwiftTests. CI on the merged branch
