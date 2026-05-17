@@ -129,10 +129,13 @@ jobs:
         # ModelTests pull HF snapshots and run real end-to-end inference
         # against Llama / Qwen3 (×5 quants) / Mamba 2. Each load peaks
         # 3-8 GB on GPU; macos-latest M1 runners cap at 7 GB RAM, so
-        # parallel suites OOM-thrash. `--num-workers 1` forces one suite
-        # in memory at a time. `--enable-code-coverage` merges into the
-        # same .profdata file the unit-tests step wrote.
-        run: swift test --enable-code-coverage --skip-build --filter "ModelTests" --num-workers 1
+        # parallel suites OOM-thrash. `--parallel --num-workers 1`
+        # enables the test scheduler but caps it at one worker, so suites
+        # run effectively serially with only one model resident in memory
+        # at a time. (Swift PM rejects `--num-workers` without
+        # `--parallel`, hence the pair.) `--enable-code-coverage` merges
+        # into the same .profdata file the unit-tests step wrote.
+        run: swift test --enable-code-coverage --skip-build --filter "ModelTests" --parallel --num-workers 1
 
       - name: Coverage summary
         if: always()
