@@ -1,20 +1,28 @@
 name: CI
 
-# Build and test FFAI on Apple Silicon. Runs on every push to main and
-# every PR. Phase 0 surface only; expands as later phases land.
+# Build and test FFAI on Apple Silicon. Runs on:
+#   - every push to `main` (release branch — gate before tagging)
+#   - every push to `dev`  (working branch — catch regressions early)
+#   - every PR targeting either branch
+#
+# The release workflow runs its own pre-tag test pass on the release
+# commit too — see .github/workflows/release.yml.
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
 
 concurrency:
+  # Don't cancel in-progress runs on protected branches (main, dev) so
+  # the green-build history stays intact; do cancel earlier runs on the
+  # same feature branch as a contributor pushes new commits.
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev' }}
 
 jobs:
   build_and_test:

@@ -182,6 +182,36 @@ a GitHub Action.
 For best practices, testing conventions, benchmarking, and porting
 new models see [`documentation/developing/`](documentation/developing/developing.md).
 
+### Branching and releases
+
+Day-to-day work happens on **`dev`**. `main` only ever advances via
+"release PR" merges. Both branches get full CI on push + PR.
+
+When it's time to cut a release:
+
+1. Open a PR `dev` → `main` titled `Release vX.Y.Z`.
+2. Wait for CI to pass + a review. Merge the PR.
+3. Switch to GitHub UI → Actions → **Release** → Run workflow on
+   `main` with the right `bump_type` (patch / minor / major) and
+   `prerelease_tag` (alpha / beta / rc / none).
+
+That workflow runs a clean test pass on the release commit, then
+[`scripts/release.sh`](scripts/release.sh) computes the next version
+from the most recent reachable tag, creates a `release/<tag>` branch
+(kept open for hotfixes) and an annotated tag, pushes both, then
+`gh release create --generate-notes` publishes the GitHub Release.
+PR-title categorization happens via [`.github/release.yml`](.github/release.yml)
++ the [`auto-label`](.github/workflows/auto-label.yml) workflow.
+
+The `release: published` event automatically fires
+[`notify-docs.yml`](.github/workflows/notify-docs.yml), which
+dispatches the [ffai-website](https://github.com/thewafflehaus/ffai-website)
+build against the new tag — pulling in the latest docs + generating
+a Changelog entry from the release body.
+
+For local dry-runs of the version-bump logic:
+`PUSH=0 BUMP_TYPE=patch ./scripts/release.sh`.
+
 ## License
 
 Apache-2.0.

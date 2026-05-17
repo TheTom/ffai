@@ -98,12 +98,17 @@ or cancel runs; it can't modify ffai-website's repo contents.
 
 ### Releasing → publishing flow
 
-1. Land doc changes on this repo's `main` along with the code changes
-   they describe.
-2. Cut a new GitHub release (`gh release create v0.1.1 --generate-notes …`).
-3. `notify-docs.yml` fires automatically; the site rebuilds within a
-   minute or two and the Changelog gets a new section from the release
-   body.
+1. Land doc changes on `dev` alongside the code changes they describe.
+2. Open a PR `dev` → `main` titled `Release vX.Y.Z`. Wait for CI;
+   merge.
+3. Trigger the **Release** workflow from the GitHub UI (Actions →
+   Release → Run workflow on `main`). Pick the right `bump_type` +
+   `prerelease_tag`; it runs tests, then
+   [`scripts/release.sh`](../scripts/release.sh) tags the merge commit
+   and `gh release create --generate-notes` publishes the release.
+4. The `release: published` event automatically fires
+   `notify-docs.yml`; the site rebuilds within a minute or two and
+   the Changelog gets a new section from the release body.
 
 You can also kick a rebuild manually without cutting a release:
 
