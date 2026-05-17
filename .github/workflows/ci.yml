@@ -28,7 +28,7 @@ jobs:
   build_and_test:
     if: github.repository_owner == 'thewafflehaus'
     name: Build and test (Apple Silicon)
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 30
     defaults:
       run:
