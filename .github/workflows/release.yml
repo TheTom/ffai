@@ -50,6 +50,7 @@ on:
 
 permissions:
   contents: write   # tag + release branch + GitHub Release creation
+  actions: write    # workflow_dispatch on notify-docs.yml after publish
 
 concurrency:
   group: release-${{ github.ref }}
@@ -202,8 +203,13 @@ jobs:
         run: |
           # `--target` is the release branch we just pushed. `--generate-notes`
           # uses .github/release.yml's category map to group PR titles since
-          # the previous tag. The `release:published` event fires once this
-          # returns; notify-docs.yml picks it up from there.
+          # the previous tag.
+          #
+          # GitHub deliberately suppresses workflow chaining when the
+          # release is created with GITHUB_TOKEN — the `release:published`
+          # event fires but no downstream workflow listening for it will
+          # actually run. We therefore dispatch notify-docs.yml explicitly
+          # in the next step instead of relying on the event.
           ARGS=(
             --target "$RELEASE_BRANCH"
             --title "$TAG"
@@ -214,6 +220,21 @@ jobs:
           fi
           gh release create "$TAG" "${ARGS[@]}"
 
+      - name: Trigger docs rebuild
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ steps.bump.outputs.tag }}
+        run: |
+          # Explicit chain — bypasses the GITHUB_TOKEN anti-recursion rule.
+          # `workflow_dispatch` is one of the two event types that GITHUB_TOKEN
+          # IS allowed to fire (the other is `repository_dispatch`), which is
+          # why this works while a passive `release: published` listener on
+          # notify-docs.yml would not. notify-docs.yml then resolves the
+          # release metadata and dispatches ffai-website's deploy.yml using
+          # WEBSITE_DISPATCH_TOKEN.
+          gh workflow run notify-docs.yml --ref main -F tag="$TAG"
+          echo "dispatched notify-docs.yml for $TAG"
+
       - name: Summary
         run: |
           {
@@ -222,5 +243,5 @@ jobs:
             echo "- Commit:  \`${{ steps.bump.outputs.commit }}\`"
             echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}"
             echo ""
-            echo "notify-docs.yml will fire on the \`release: published\` event and rebuild ffai-website."
+            echo "notify-docs.yml has been dispatched and will rebuild ffai-website against this tag."
           } >> "$GITHUB_STEP_SUMMARY"
