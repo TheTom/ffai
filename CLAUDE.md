@@ -6,10 +6,15 @@ Global software-development conventions (planning, issues, git workflow, testing
 
 ## Build / test / bench / profile
 
-- Install + build: [`documentation/installation.md`](documentation/installation.md), [`documentation/quickstart.md`](documentation/quickstart.md)
+- Install + build: [`documentation/installation.md`](documentation/installation.md), [`documentation/quickstart.md`](documentation/quickstart.md). Quick local loop: `make regenerate-kernels` then `make build`.
 - CLI: [`documentation/using-the-cli.md`](documentation/using-the-cli.md)
 - Bench + profile: [`documentation/benchmarking.md`](documentation/benchmarking.md), [`documentation/performance.md`](documentation/performance.md), [`documentation/observability.md`](documentation/observability.md)
-- Tests: [`documentation/developing/testing.md`](documentation/developing/testing.md). **Target ≥ 80% line coverage on unit tests.** Integration tests cover real-model coherence and live in `Tests/ModelTests/`.
+- **Tests**: always go through the `make` targets, never bare `swift test`. Each `Tests/ModelTests/*` suite loads multi-GB HuggingFace snapshots; running them in parallel pins the GPU and OOMs the box.
+  - `make test-unit` — `FFAITests` + `MetalTileSwiftTests` (fast, parallel-safe). Matches `.github/workflows/ci.yml`.
+  - `make test-integration` — `ModelTests` only, gated to `--parallel --num-workers 1` so just one model is resident at a time. Matches `.github/workflows/release.yml`'s "Run integration tests (serialized)" step.
+  - `make test` — runs `test-unit` then `test-integration` in sequence (the full local CI gate).
+  - `make coverage` / `scripts/coverage.sh` — unit suite with coverage instrumentation (mirrors ci.yml's coverage step).
+  - **Target ≥ 80 % line coverage on unit tests.** Integration tests cover real-model coherence and live in `Tests/ModelTests/`. See [`documentation/developing/testing.md`](documentation/developing/testing.md) for the longer-form story.
 
 ## Branch base
 
