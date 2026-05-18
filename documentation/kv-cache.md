@@ -12,7 +12,7 @@ land in Phase 5.
 | **Raw fp16 / bf16** (`KVCache`, default) | All current models. | 1× | ✅ Shipped (Phase 2). |
 | **`affine8`** (`AffineQuantizedKVCache`, 8-bit) | Memory-constrained; ~7% decode-tok/s tax. | ~0.55× (45% smaller) measured on Qwen3 1.7B | ✅ Shipped (Phase 5c). |
 | **`affine4`** (`AffineQuantizedKVCache`, 4-bit) | Tight memory; same speed as `affine8`. | ~0.31× (69% smaller, group_size=32) | ✅ Shipped (Phase 5c). |
-| **TurboQuant** | Best memory ratio at minimal quality loss. | ~6–8× at `turbo4v2` | ⏳ Planned (Phase 5d). |
+| **AURA** (Adaptive Unified Rotated Activations, `AURAQuantizedKVCache`) | Best memory ratio at minimal quality loss. | ~6–8× at `aura4v2` | ⏳ Planned (Phase 5d). See [`papers/aura-compression-algorithm.md`](../papers/aura-compression-algorithm.md). |
 | **SSM / Hybrid** | Mamba / GatedDeltaNet (Qwen 3.5, NemotronH) | n/a — stores recurrent + conv state | ⏳ Planned (Phase 5e). |
 | **Batched** | Multi-stream decode (speculative, B>1 serving) | linear in B | ⏳ Planned (Phase 8+). |
 
@@ -102,7 +102,7 @@ reuse across layers within a single command buffer.
 | Scheme | Default `groupSize` | Why |
 |---|---|---|
 | `affine8` | 64 | Plenty of precision per group; matches mlx-format weight-quant convention. |
-| `affine4` | **32** | 4 bits per element ÷ a wider group loses too much discriminative power on K/V — decode degenerates into repetition at group_size=64. TurboQuant-style rotation (Phase 5d) would let larger groups work. |
+| `affine4` | **32** | 4 bits per element ÷ a wider group loses too much discriminative power on K/V — decode degenerates into repetition at group_size=64. AURA-style rotation (Phase 5d) would let larger groups work. |
 
 ### Coming next (5c follow-ups)
 
@@ -113,7 +113,7 @@ reuse across layers within a single command buffer.
   one extra dequant kernel dispatch. A fused
   `bulk_dequant + sdpa_decode` kernel removes the working-buffer
   materialisation entirely.
-- **TurboQuant** (Phase 5d) — block-wise MSE codec with asymmetric
+- **AURA** (Phase 5d) — block-wise MSE codec with asymmetric
   K/V bits + dense rotation; will recover full quality at 4-bit
   group_size=64.
 
@@ -154,8 +154,8 @@ From [`planning/plan.md`](../planning/plan.md):
 - **Affine quantized KV cache** — 4 / 6 / 8-bit affine group-quant
   for K and V. Self-transitions raw → quantized at `startOffset` so
   prefill stays fast. ~3.5× memory at 4-bit; modest decode-tok/s tax.
-- **TurboQuant cache** — block-wise MSE codec with asymmetric K/V
-  bits (e.g. 4-bit K, 2-bit V — `turbo4v2`). Two attention paths:
+- **AURA cache** — block-wise MSE codec with asymmetric K/V
+  bits (e.g. 4-bit K, 2-bit V — `aura4v2`). Two attention paths:
   TurboFlash compressed-domain Metal kernel (default) or
   bulk-dequant → MLXFast SDPA (opt-in). ~6-8× memory.
 - **`SSMStateCache`** — for Mamba / GatedDeltaNet families
@@ -165,7 +165,7 @@ From [`planning/plan.md`](../planning/plan.md):
   enables speculative decoding and multi-stream serving.
 
 Each lands in its own commit with the corresponding kernels in
-`metaltile`. Affine and TurboQuant are the highest-priority Phase 5
+`metaltile`. Affine and AURA are the highest-priority Phase 5
 deliverables; SSM/GDN follow.
 
 ## See also

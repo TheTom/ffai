@@ -117,7 +117,7 @@ variant. If the architecture isn't in the registry yet, you get a
 | Multi-modal (vision, audio) | Capability infrastructure in place from Phase 2; first real exercise lands in Phase 6 (Qwen 2.5/3.5-VL). |
 | Chat templates | Tokenizer's chat template is not auto-applied by `generate(...)` yet — pass the templated prompt yourself. Auto-apply lands alongside the first instruct-tuned VL model. |
 | Sampling | Greedy argmax only on the GPU path. Top-k / top-p / temperature exist as CPU helpers in `Sampling.swift`; GPU kernels for these land in Phase 5. |
-| Quantized KV cache | Raw fp16/bf16 only. Affine + TurboQuant land in Phase 5 — see [kv-cache.md](kv-cache.md). |
+| Quantized KV cache | Raw fp16/bf16 only. Affine + AURA land in Phase 5 — see [kv-cache.md](kv-cache.md). |
 | Hybrid models | Qwen 3.5 (GDN + attention) and Mamba/Mamba 2 families need new SSM kernels; Phase 5. |
 | MoE | Qwen 3.5 MoE and similar need fused-expert kernels; Phase 5. |
 | MoE / vision-tied checkpoints | Detected as `unsupportedArchitecture` until their family files land. |
@@ -127,7 +127,7 @@ variant. If the architecture isn't in the registry yet, you get a
 
 Per [`planning/plan.md`](../planning/plan.md):
 
-- **Phase 5** — TurboQuant KV cache + GDN + SSM. Unlocks Qwen 3.5
+- **Phase 5** — AURA KV cache + GDN + SSM. Unlocks Qwen 3.5
   hybrid (GDN + attention), Qwen 3.5 MoE, NemotronH, Mamba families.
 - **Phase 6** — first multi-modal model: Qwen 2.5-VL or Qwen 3.5-VL,
   exercising `Capability.visionIn` end-to-end.

@@ -21,7 +21,7 @@ Backwards compatibility with `mlx-swift-lm`.
 Three layers, all in this repo except metaltile (sibling Rust repo,
 already forked at `~/Development/personal/ai/metaltile`):
 
-1. **metaltile** (Rust) — `#[kernel]` DSL, IR, MSL codegen, CPU interpreter.
+1. **metaltile** (Rust) — `#[kernel]` DSL, IR, MSL codegen.
    Ships a `tile` CLI (`metaltile-cli`) whose `build --emit all`
    subcommand produces `kernels.metallib`, `manifest.json`, and
    `MetalTileKernels.swift`. Historical note: Phase 0 originally
@@ -66,9 +66,13 @@ phase adds tests alongside code, not after.
 
 - Every public function: at least one happy-path test
 - Every branch in business logic: at least one test per side
-- Every kernel in metaltile: numerical correctness test (CPU
-  interpreter reference) + Swift wrapper integration test (fixed
-  inputs → fixed outputs)
+- Every kernel in metaltile: correctness test against either an
+  MLX side-by-side reference (kernels under `metaltile-std/src/mlx/`,
+  via `tile bench` + `check_equiv`) or an FFAI integration test that
+  exercises the kernel on a real model (kernels under
+  `metaltile-std/src/ffai/`, no MLX upstream counterpart). The
+  `metaltile-interp` CPU interpreter crate is being dropped in
+  favour of these two paths.
 - Every model: token-by-token determinism test against a reference
   for at least one prompt + seed combination
 
@@ -412,8 +416,8 @@ Do NOT copy:
 
 - All 56 model architectures (one is enough for Phase 2)
 - VLM / Embedders
-- GigaQuant / state-replay (Phase 5d/5e — TurboQuant in mlx-swift-lm
-  was renamed to GigaQuant in FFAI)
+- AURA / state-replay (Phase 5d/5e — TurboQuant in mlx-swift-lm
+  was renamed to AURA in FFAI)
 - Quantization (Phase 3)
 
 **Done when:** `ffai --model llama-3.2-1B --prompt "Hello"` produces
@@ -462,7 +466,7 @@ for a fixed seed.
 infrastructure are stable. Adding a new model = porting its
 forward-pass shape from mlx-swift-lm and wiring it to existing
 kernels. New *model-specific* kernels (e.g. attention sinks for
-GPT-OSS, fused MoE expert kernels, GDN steps, GigaQuant codecs) get
+GPT-OSS, fused MoE expert kernels, GDN steps, AURA codecs) get
 added to the metaltile DSL as needed — driven by which model we want
 to support next, not speculatively.
 
@@ -557,13 +561,13 @@ should support 80-200 tok/s on these workloads.
 
 ---
 
-## Phase 5 — Advanced kernels (sampling, GigaQuant, GDN, SSM)
+## Phase 5 — Advanced kernels (sampling, AURA, GDN, SSM)
 
 **Goal:** Port the high-value custom kernels currently in mlx-swift-lm
 plus close the user-visible sampling gap. The custom kernels were
 the original motivator for this project — the 4-repo dance to ship
-a new GigaQuant variant (TurboQuant in mlx-swift-lm, renamed to
-GigaQuant in FFAI) is the pain we're eliminating.
+a new AURA variant (TurboQuant in mlx-swift-lm, renamed to
+AURA in FFAI) is the pain we're eliminating.
 
 Phase 5 is now sub-divided since the full scope is many sessions.
 Each sub-phase ships independently with its own commit + verification.
@@ -653,18 +657,19 @@ Follow-ups not yet done:
   step pays one extra dequant kernel dispatch. Fusing removes
   the working-buffer materialisation.
 
-### Phase 5d — GigaQuant compressed-domain attention
+### Phase 5d — AURA compressed-domain attention
 
 The original motivator (TurboQuant in mlx-swift-lm; **renamed
-GigaQuant** in FFAI — kernel names, env vars, CLI flags, and docs
-all use `giga*`). ~6-8× memory at `giga4v2`. Substantial
+AURA** in FFAI — kernel names, env vars, CLI flags, and docs
+all use `aura*`). ~6-8× memory at `aura4v2`. Substantial
 research-grade codec port (many sessions).
 
-**KV scheme naming.** Schemes are named `giga{kb}v{vb}` where `kb`
+**KV scheme naming.** Schemes are named `aura{kb}v{vb}` where `kb`
 and `vb` are the K-side and V-side bit widths. Symmetric aliases
-(`giga3`, `giga4`, `giga6`, `giga8`) map to `giga3v3`, `giga4v4`, …
-Asymmetric examples: `giga8v4`, `giga4v2`, `giga3v2`. The CLI accepts
-the same strings: `--kv-cache giga4v2`.
+(`aura3`, `aura4`, `aura6`, `aura8`) map to `aura3v3`, `aura4v4`, …
+Asymmetric examples: `aura8v4`, `aura4v2`, `aura3v2`. The CLI accepts
+the same strings: `--kv-cache aura4v2`. See `papers/aura-compression-algorithm.md`
+for the codec lineage and design rationale.
 
 **Metaltile DSL prerequisites** (must land in `metaltile` first):
 
@@ -678,24 +683,25 @@ the same strings: `--kv-cache giga4v2`.
 - Type-checked launch builder ("shape algebra" gap — closes
   `metaltile-codegen::launch_builder`).
 
-**GigaQuant kernels** (port from
+**AURA kernels** (port from
 `Libraries/MLXLMCommon/TurboQuantKernels.swift` and
 `turbo_quant.metal` / `turbo_flash_sdpa.metal` upstream; the FFAI
-copies are renamed `giga*`):
+copies are renamed `aura*` and land under
+`crates/metaltile-std/src/ffai/` per metaltile PR #19):
 
-- `giga_encode_{kb}_{dim}` — dense rotation Π + Lloyd-Max +
+- `aura_encode_{kb}_{dim}` — dense rotation Π + Lloyd-Max +
   bit-pack + norm correction.
-- `giga_encode_wht_{kb}_{dim}` — FWHT butterfly variant, no
+- `aura_encode_wht_{kb}_{dim}` — FWHT butterfly variant, no
   correction.
-- `giga_bulk_dequant_rotated_{kb}_{dim}` — dequant into the
+- `aura_bulk_dequant_rotated_{kb}_{dim}` — dequant into the
   SDPA-ready layout.
-- `giga_score_{kb}_{dim}` + `giga_value_{vb}_{dim}` —
+- `aura_score_{kb}_{dim}` + `aura_value_{vb}_{dim}` —
   compressed-domain attention reductions.
-- `giga_flash_pass1_{kb}_{vb}_{dim}` + `giga_flash_pass2` (with
+- `aura_flash_pass1_{kb}_{vb}_{dim}` + `aura_flash_pass2` (with
   causal / NR0 variants).
-- `giga_flash_sdpa_v_{kb}_{vb}_{dim}` — single-dispatch fused, with
+- `aura_flash_sdpa_v_{kb}_{vb}_{dim}` — single-dispatch fused, with
   optional attention-sinks fold (consumed by Phase 5f).
-- MSE codec internals (`giga_mse_score`, `giga_mse_weighted_sum`)
+- MSE codec internals (`aura_mse_score`, `aura_mse_weighted_sum`)
   for the rotation/codebook calibration path.
 - **DC-bias correction in the MSE codec.** Per-vector mean
   subtraction baked into the encode path; recovers the structured
@@ -704,26 +710,29 @@ copies are renamed `giga*`):
 
 **FFAI changes:**
 
-- `Sources/FFAI/GigaQuantizedKVCache.swift` — protocol conformance,
+- `Sources/FFAI/AURAQuantizedKVCache.swift` — protocol conformance,
   per-layer compressed K/V storage, rotating index buffer, two-phase
   prefill+compress, dequant working-buffer pool shared across layers.
-- `LoadOptions.kvCache = .gigaQuantized(scheme:)` where `scheme`
-  parses strings of the form `giga{kb}v{vb}` and the symmetric
+- `LoadOptions.kvCache = .auraQuantized(scheme:)` where `scheme`
+  parses strings of the form `aura{kb}v{vb}` and the symmetric
   aliases.
-- CLI flag `--kv-cache giga4v2` (and aliases `giga3`, `giga4`,
-  `giga6`, `giga8`, `giga8v4`, `giga3v2`).
+- CLI flag `--kv-cache aura4v2` (and aliases `aura3`, `aura4`,
+  `aura6`, `aura8`, `aura8v4`, `aura3v2`).
 - `Sources/FFAI/Models/{Llama,Qwen3}.swift` cast `kvCacheKind` and
-  build `GigaQuantizedKVCache` in `makeLayerCaches`.
+  build `AURAQuantizedKVCache` in `makeLayerCaches`.
 - `documentation/kv-cache.md` — full scheme table + bench numbers.
 
 **Tests:**
 
-- `Tests/MetalTileSwiftTests/Giga*` — one file per kernel,
-  numerical correctness vs CPU reference.
-- `Tests/FFAITests/GigaQuantizedKVCacheTests.swift` — encode/decode
+- `Tests/MetalTileSwiftTests/AURA*` — one file per kernel,
+  Swift-wrapper correctness against the FFAI-side reference (the
+  metaltile CPU interpreter is being dropped per the new metaltile
+  layout; correctness now comes from MLX side-by-side for `mlx/`
+  kernels or FFAI integration tests for `ffai/` kernels).
+- `Tests/FFAITests/AURAQuantizedKVCacheTests.swift` — encode/decode
   round-trip, multi-layer shared working buffer, serialize/hydrate.
-- `Tests/ModelTests/GigaQuantIntegrationTests.swift` —
-  `--kv-cache giga4v2` on Qwen 3 1.7B-4bit; coherent output +
+- `Tests/ModelTests/AURAIntegrationTests.swift` —
+  `--kv-cache aura4v2` on Qwen 3 1.7B-4bit; coherent output +
   measured memory savings.
 
 ### Phase 5e — SSM / GDN hybrid models
@@ -845,10 +854,10 @@ each new kernel + cache gets a unit test.
 
 - Symbolic sliding-window mask in SDPA decode + prefill (no buffer
   allocation; computed per-step from `(seq_offset, window_size)`).
-- `giga_flash_sdpa_v` extension: attention-sinks fold via
+- `aura_flash_sdpa_v` extension: attention-sinks fold via
   numerically-stable softmax `max(scores)` clamping + dequant.
 - Hybrid sliding-FP16 layer policy (GPT-OSS-20B): full-attention
-  layers stay on `GigaQuantizedKVCache(useBias: true)`;
+  layers stay on `AURAQuantizedKVCache(useBias: true)`;
   sliding-window layers cap at 128 tokens and stay raw FP16
   (~1.5 MB total).
 
@@ -858,7 +867,7 @@ each new kernel + cache gets a unit test.
 - `Sources/FFAI/Models/GPTOSS.swift` — family file with the
   alternating layer schedule + sinks parameter + bias-correcting
   K/V projections.
-- `LoadOptions.kvCache = .gigaQuantized(scheme:, sinks: true)`
+- `LoadOptions.kvCache = .auraQuantized(scheme:, sinks: true)`
   plumbing.
 - `documentation/kv-cache.md`, `documentation/models.md` updated.
 
@@ -866,7 +875,7 @@ each new kernel + cache gets a unit test.
 
 - `Tests/MetalTileSwiftTests/SlidingWindowMaskTests.swift`.
 - `Tests/ModelTests/GPTOSSIntegrationTests.swift` — coherent
-  `--kv-cache giga4v2` decode at 1k + 8k prompts.
+  `--kv-cache aura4v2` decode at 1k + 8k prompts.
 
 ---
 
@@ -1007,7 +1016,7 @@ Sub-phases land in priority order per
 
 - `PrefixKVCache` + `PrefixKey` + LRU + stats.
 - Per-class `serialise()` / `hydrate(from:)` on every shipped cache:
-  `KVCache`, `AffineQuantizedKVCache`, `GigaQuantizedKVCache` (incl.
+  `KVCache`, `AffineQuantizedKVCache`, `AURAQuantizedKVCache` (incl.
   compressed-mode), `SSMStateCache`, `GDNStateCache`,
   `Mamba2LayerCache`.
 - `LastAssistantOpenerPolicy` for Qwen / Gemma / GPT-OSS chat
@@ -1019,7 +1028,7 @@ Sub-phases land in priority order per
 
 ### 8.3 — Compressed-domain prefix KV cache (spec 039)
 
-- Reuses `GigaQuantizedKVCache.fusedEncodeDispatch` for snapshot-time
+- Reuses `AURAQuantizedKVCache.fusedEncodeDispatch` for snapshot-time
   batch encode. Bumps `PrefixKey.formatVersion` to 3.
 
 ### 8.4 — Batched decoding (`generateBatched`)
@@ -1107,11 +1116,11 @@ Sub-phases land in priority order per
 
 - Spec 041: drop-in Flash-tiled fused kernel for the affine
   quantized SDPA path.
-- Spec 042: cross-kernel SIMD audit — convert GigaFlash + affine
-  flash + `giga_dequant_rotated` + `mse_*` to
+- Spec 042: cross-kernel SIMD audit — convert AURAFlash + affine
+  flash + `aura_dequant_rotated` + `mse_*` to
   `simdgroup_matrix_multiply_accumulate` MMAs.
 
-### 8.23 — GigaFlash decode-time kernel uplift (spec 043)
+### 8.23 — AURAFlash decode-time kernel uplift (spec 043)
 
 - Renamed from TurboFlash. Per-simdgroup bit-unpack reuse + bf16
   V accumulator + headDim-aware tile autotune + bias-aware kernel.
@@ -1152,7 +1161,7 @@ same Model API.
 ## Out of scope / deferred
 
 - **CoreML / ANE backend.** Realistic only for boring kernels (RMSNorm,
-  RoPE, layer norm, plain GEMV at fp16/int8). GigaQuant, FWHT, online
+  RoPE, layer norm, plain GEMV at fp16/int8). AURA, FWHT, online
   softmax, recurrent SSM/GDN do not fit ANE constraints. Add a `mil/`
   codegen sibling to `msl/` in metaltile-codegen when v0.3 demand justifies it.
 - **Swift macro frontend** for kernel authoring. metaltile IR is

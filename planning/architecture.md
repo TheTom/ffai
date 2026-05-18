@@ -90,6 +90,21 @@ resources.
   default is regenerate). This makes diffs reviewable and lets
   contributors inspect what got generated without running cargo.
 - All compilation happens at build time. **Zero runtime JIT.**
+- Kernel sources in metaltile-std are split into
+  `crates/metaltile-std/src/mlx/` (each kernel has an MLX side-by-side
+  comparison via `tile bench` + `check_equiv`) and
+  `crates/metaltile-std/src/ffai/` (model-specific kernels with no
+  MLX upstream counterpart at the pinned `MLX_COMMIT`; correctness
+  validated by FFAI integration tests against real models). Kernels
+  graduate from `ffai/` to `mlx/` when an MLX counterpart ships
+  upstream or someone wires a hand-written runner. The `tile build`
+  emit pipeline is agnostic — both folders feed the same
+  `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift`
+  outputs.
+- **No CPU interpreter.** The previous `metaltile-interp` crate is
+  being dropped; correctness verification runs on the Apple Silicon
+  GPU via either MLX side-by-side (`mlx/` kernels) or FFAI integration
+  tests on real models (`ffai/` kernels).
 
 ---
 
@@ -201,7 +216,7 @@ entirely.
    • repo id "Qwen/Qwen3.5-9B-VL"          OR
    • local path "/path/to/local-model"
    • LoadOptions(capabilities: [.textIn, .textOut],
-                 kvCache: .gigaQuantized(scheme: "giga4v2"),
+                 kvCache: .auraQuantized(scheme: "aura4v2"),
                  lazyCapabilities: true)
        │
        ▼
@@ -540,7 +555,7 @@ between them is `[seq, hidden]` activations plus a position map.
 Encoder modules are independent of the backbone's choice of cache
 type — vision and audio activations always live in plain fp16 / bf16
 since they're encoder-resident and don't get cached across tokens.
-GigaQuant / affine quant only apply to the backbone KV cache.
+AURA / affine quant only apply to the backbone KV cache.
 
 ---
 
@@ -891,7 +906,7 @@ type without the outer loop knowing the difference.
     LayerMixer = AttentionMixer | GDNMixer | Mamba2Mixer | MLPOnly
 
   Per-layer cache also picks its type:
-    cache[i] = KVCache | AffineQuantizedKVCache | GigaQuantizedKVCache
+    cache[i] = KVCache | AffineQuantizedKVCache | AURAQuantizedKVCache
                                        (attention layers)
              | GDNStateCache            (GDN layers)
              | Mamba2LayerCache         (SSM layers — conv + state)
@@ -1025,7 +1040,7 @@ caches roll back to the accepted prefix and the loop continues.
   │  for each layer cache:                                   │
   │    switch cache {                                        │
   │      case KVCache:               truncate to prefix_len  │
-  │      case GigaQuantizedKVCache:  truncate compressed slab│
+  │      case AURAQuantizedKVCache:  truncate compressed slab│
   │      case GDNStateCache:         state_replay(prefix_len)│
   │      case Mamba2LayerCache:      ssm_replay(prefix_len)  │
   │      case MLPOnly:               (stateless)             │
@@ -1091,7 +1106,7 @@ floor.
   │                                                         │
   │  Caches                                                 │
   │   KVCache • AffineQuantizedKVCache •                    │
-  │   GigaQuantizedKVCache • SSMStateCache •                │
+  │   AURAQuantizedKVCache • SSMStateCache •                │
   │   GDNStateCache • Mamba2LayerCache •                    │
   │   BatchedKVCache • BatchedHybridCache •                 │
   │   PrefixKVCache • StateReplayCache                      │
