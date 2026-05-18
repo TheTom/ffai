@@ -98,7 +98,7 @@ format-check: ## check formatting without modifying files
 	swift-format lint --configuration .swift-format --recursive . && echo "format OK"
 
 # ─── Docs ─────────────────────────────────────────────────────────────
-# User-facing documentation lives at https://thewafflehaus.github.io/ffai-website/
+# User-facing documentation lives at https://ffai.dev
 # (source: github.com/thewafflehaus/ffai-website).
 #
 # The website fetches markdown from this repo at build time, so committing
