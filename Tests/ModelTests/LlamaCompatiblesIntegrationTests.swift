@@ -85,4 +85,86 @@ struct LlamaCompatiblesIntegrationTests {
         )
         expectCoherentOutput(result.generatedTokens, label: "OLMo 2 1B bf16")
     }
+
+    @Test("SmolLM3-3B (SmolLM3ForCausalLM, every-Nth attention layer) decodes coherently")
+    func smolLM3() async throws {
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially {
+                try await Model.load("mlx-community/SmolLM3-3B-bf16")
+            }
+        } catch {
+            print("SmolLM3 test skipped: \(error)")
+            return
+        }
+        // SmolLM3 3B: hidden=2048, nLayers=36, nHeads=16, nKVHeads=4.
+        #expect(m.engine.hidden == 2048)
+        let result = try await m.generate(
+            prompt: "Once upon a time, in a quiet village",
+            parameters: GenerationParameters(maxTokens: 64, temperature: 0)
+        )
+        expectCoherentOutput(result.generatedTokens, label: "SmolLM3 3B bf16")
+    }
+
+    @Test("Granite-3-2B-Instruct (GraniteForCausalLM) decodes coherently")
+    func granite3() async throws {
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially {
+                try await Model.load("mlx-community/granite-3.0-2b-instruct-bf16")
+            }
+        } catch {
+            print("Granite 3 test skipped: \(error)")
+            return
+        }
+        // Granite 3 2B canonical: hidden=2048, nLayers=40, nHeads=32,
+        // nKVHeads=8, headDim=64.
+        #expect(m.engine.hidden == 2048)
+        let result = try await m.generate(
+            prompt: "Once upon a time, in a quiet village",
+            parameters: GenerationParameters(maxTokens: 64, temperature: 0)
+        )
+        expectCoherentOutput(result.generatedTokens, label: "Granite 3 2B bf16")
+    }
+
+    @Test("InternLM2-1.8B-Chat (InternLM2ForCausalLM) decodes coherently")
+    func internLM2() async throws {
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially {
+                try await Model.load("mlx-community/internlm2-chat-1_8b-bf16")
+            }
+        } catch {
+            print("InternLM 2 test skipped: \(error)")
+            return
+        }
+        // InternLM 2 1.8B canonical: hidden=2048, nLayers=24, nHeads=16,
+        // nKVHeads=8, headDim=128.
+        #expect(m.engine.hidden == 2048)
+        let result = try await m.generate(
+            prompt: "Once upon a time, in a quiet village",
+            parameters: GenerationParameters(maxTokens: 64, temperature: 0)
+        )
+        expectCoherentOutput(result.generatedTokens, label: "InternLM2 1.8B bf16")
+    }
+
+    @Test("SmolLM-360M (SmolLMForCausalLM, original family) decodes coherently")
+    func smolLM1() async throws {
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially {
+                try await Model.load("mlx-community/SmolLM-360M-Instruct-bf16")
+            }
+        } catch {
+            print("SmolLM 1 test skipped: \(error)")
+            return
+        }
+        // SmolLM 1 360M canonical: hidden=960, nLayers=32, nHeads=15,
+        // nKVHeads=5, headDim=64.
+        let result = try await m.generate(
+            prompt: "Once upon a time, in a quiet village",
+            parameters: GenerationParameters(maxTokens: 64, temperature: 0)
+        )
+        expectCoherentOutput(result.generatedTokens, label: "SmolLM 360M bf16")
+    }
 }

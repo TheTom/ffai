@@ -13,6 +13,41 @@ import Testing
 @Suite("DeepSeek R1 Distill integration", .serialized)
 struct DeepSeekR1DistillIntegrationTests {
 
+    @Test("R1-Distill-Llama-8B (Llama architecture) generates coherent output")
+    func r1DistillLlama() async throws {
+        // 8B parameters in 4-bit ≈ 4.5 GB on disk. Uses
+        // model_type='llama' / arch='LlamaForCausalLM' so it flows
+        // through our base Llama loader without any DeepSeek-specific
+        // plumbing.
+        let modelId = "mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit"
+        let prompt = "Once upon a time, in a quiet village"
+        let maxTokens = 64
+
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        } catch {
+            print("R1-Distill-Llama test skipped: \(error)")
+            return
+        }
+
+        // 8B shape sanity:
+        //   hidden = 4096, nLayers = 32, nHeads = 32, nKVHeads = 8,
+        //   headDim = 128, intermediate = 14336.
+        #expect(m.engine.hidden == 4096)
+        #expect(m.engine.nLayers == 32)
+        #expect(m.engine.nHeads == 32)
+        #expect(m.engine.nKVHeads == 8)
+        #expect(m.engine.headDim == 128)
+
+        let result = try await m.generate(
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
+        )
+        #expect(result.tokensPerSecond > 0)
+        expectCoherentOutput(result.generatedTokens, label: "R1-Distill-Llama-8B")
+    }
+
     @Test("R1-Distill-Qwen-1.5B (Qwen 2 architecture) generates coherent output")
     func r1DistillQwen() async throws {
         // Smallest distill — 1.5B parameters in 4-bit ≈ 800 MB on disk.
