@@ -21,6 +21,30 @@ struct LayersTests {
         }
     }
 
+    @Test("Linear forward with bias — y = Wx + b")
+    func linearForwardWithBias() {
+        autoreleasepool {
+            // W = [[1, 2], [3, 4], [5, 6]] @ [7, 8] = [23, 53, 83]
+            // + bias [0.5, -1, 100] = [23.5, 52, 183]
+            let w = Tensor.empty(shape: [3, 2], dtype: .f32)
+            w.copyIn(from: [Float(1), 2, 3, 4, 5, 6])
+            let b = Tensor.empty(shape: [3], dtype: .f32)
+            b.copyIn(from: [Float(0.5), -1, 100])
+            let layer = Linear(weight: w, bias: b)
+            let x = Tensor.empty(shape: [3], dtype: .f32) // 3 elements; bias add reads matching shape
+            // gemv produces [3]; we want the layer to broadcast bias [3] over the output [3].
+            x.copyIn(from: [Float(7), 8, 0])  // last element wasted (gemv reads only 2)
+            // Use a 2-element x to match weight in_features=2.
+            let xReal = Tensor.empty(shape: [2], dtype: .f32)
+            xReal.copyIn(from: [Float(7), 8])
+            var out: Tensor!
+            runAndWait { cb in out = layer(xReal, on: cb) }
+            #expect(out.toArray(as: Float.self) == [Float(23.5), 52, 183])
+            // parameters() must surface both weight + bias for SafeTensors binding.
+            #expect(layer.parameters().map { $0.0 } == ["weight", "bias"])
+        }
+    }
+
     @Test("Embedding forward — gather rows")
     func embeddingForward() {
         autoreleasepool {

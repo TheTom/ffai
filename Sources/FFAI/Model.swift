@@ -66,6 +66,17 @@ public enum ModelRegistry {
             return try loadPhi(config: config, weights: weights,
                                options: options, device: device)
         }
+        // Qwen 2 / 2.5 — Llama-shaped arch with QKV biases. The
+        // bias-aware Linear in Layers.swift handles the layout
+        // transparently; just route the dispatch.
+        if let arch = config.architecture, Qwen2.architectures.contains(arch) {
+            return try loadLlama(config: config, weights: weights,
+                                 options: options, device: device)
+        }
+        if let mt = config.modelType, Qwen2.modelTypes.contains(mt) {
+            return try loadLlama(config: config, weights: weights,
+                                 options: options, device: device)
+        }
         if let arch = config.architecture, Qwen3.architectures.contains(arch) {
             return try loadQwen3(config: config, weights: weights,
                                  options: options, device: device)

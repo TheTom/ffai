@@ -10,18 +10,36 @@ import Metal
 public final class Linear: Module {
     /// weight shape [out_features, in_features], row-major.
     public let weight: Tensor
+    /// Optional bias shape [out_features]. `nil` means no bias (the
+    /// 3-series + Mistral7B default). Qwen 2.x, BLOOM, some Falcon and
+    /// older variants ship biases on the QKV projections.
+    public let bias: Tensor?
 
-    public init(weight: Tensor) {
+    public init(weight: Tensor, bias: Tensor? = nil) {
         precondition(weight.shape.count == 2, "Linear: weight must be 2D")
+        if let b = bias {
+            precondition(b.shape == [weight.shape[0]],
+                         "Linear: bias shape \(b.shape) must match output features \([weight.shape[0]])")
+            precondition(b.dtype == weight.dtype,
+                         "Linear: bias dtype must match weight dtype")
+        }
         self.weight = weight
+        self.bias = bias
     }
 
     public func parameters() -> [(String, Tensor)] {
-        [("weight", weight)]
+        if let b = bias {
+            return [("weight", weight), ("bias", b)]
+        }
+        return [("weight", weight)]
     }
 
     public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
-        Ops.gemv(weight: weight, input: x, on: cmd)
+        let y = Ops.gemv(weight: weight, input: x, on: cmd)
+        if let b = bias {
+            return Ops.add(y, b, on: cmd)
+        }
+        return y
     }
 }
 
@@ -108,7 +126,13 @@ public func loadLinear(
             bits: q.bits, groupSize: q.groupSize
         ))
     }
-    return AnyLinear(Linear(weight: try bundle.tensor(named: "\(base).weight")))
+    let weight = try bundle.tensor(named: "\(base).weight")
+    // Bias is optional — present on Qwen 2.x QKV projections, BLOOM,
+    // older Falcon, etc. Absent on the 3-series + Mistral7B + Phi-3.
+    let bias = bundle.has("\(base).bias")
+        ? try bundle.tensor(named: "\(base).bias")
+        : nil
+    return AnyLinear(Linear(weight: weight, bias: bias))
 }
 
 // ─── Embedding ───────────────────────────────────────────────────────
