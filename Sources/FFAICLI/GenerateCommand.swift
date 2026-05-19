@@ -61,8 +61,14 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "PRNG seed for reproducible sampling.")
     var seed: UInt64?
 
-    @Option(name: .long, help: "KV cache scheme: \"raw\" (default fp16/bf16), \"affine8\" (~45% smaller), or \"affine4\" (~70% smaller).")
+    @Option(name: .long, help: "KV cache scheme: \"raw\" (default fp16/bf16), \"affine8\" (~45% smaller), \"affine4\" (~70% smaller), \"aura\" (Phase 5d default aura4v4 ~5x smaller), or any \"auraNvM\" recipe.")
     var kvCache: String?
+
+    @Option(name: .long, help: "Maximum positions retained per attention layer. Past this, the cache evicts in FIFO order with the first --kv-keep slots pinned. 0 / unset means unbounded (cap at model max_position_embeddings).")
+    var kvWindowSize: Int?
+
+    @Option(name: .long, help: "Number of initial positions kept across FIFO eviction (attention sinks). Default 0. Only meaningful when --kv-window-size is set.")
+    var kvWindowKeep: Int?
 
     func run() async throws {
         // Apply --debug + --profiling before any FFAI work so the
@@ -78,7 +84,8 @@ struct GenerateCommand: AsyncParsableCommand {
         let loadStart = Date()
         // Build LoadOptions with the requested KV cache scheme.
         var loadOpts = LoadOptions()
-        switch (kvCache ?? "raw").lowercased() {
+        let rawKVKind = (kvCache ?? "raw").lowercased()
+        switch rawKVKind {
         case "raw":
             loadOpts.kvCache = .raw
         case "affine8":
@@ -90,8 +97,24 @@ struct GenerateCommand: AsyncParsableCommand {
             // loops. TurboQuant-style rotation would let group_size=64
             // work at 4-bit; that's Phase 5d.
             loadOpts.kvCache = .affineQuantized(bits: 4, groupSize: 32)
+        case _ where rawKVKind.hasPrefix("aura"):
+            guard let scheme = AURAScheme.parse(rawKVKind) else {
+                throw ValidationError("Unknown AURA recipe \"\(rawKVKind)\". Try \"aura\", \"aura4\", \"aura4v2\", \"aura3\", \"aura8\".")
+            }
+            loadOpts.kvCache = .auraQuantized(scheme: scheme)
         default:
-            throw ValidationError("Unknown --kv-cache \"\(kvCache ?? "")\". Use \"raw\", \"affine8\", or \"affine4\".")
+            throw ValidationError("Unknown --kv-cache \"\(kvCache ?? "")\". Use \"raw\", \"affine8\", \"affine4\", or any \"auraNvM\" recipe.")
+        }
+
+        // Sliding-window / FIFO eviction. Translates the CLI pair
+        // (--kv-window-size, --kv-window-keep) into LoadOptions.kvEviction.
+        // Validation deferred to KVEvictionState's preconditions so the
+        // error site is colocated with the policy logic.
+        if let size = kvWindowSize, size > 0 {
+            let keep = kvWindowKeep ?? 0
+            loadOpts.kvEviction = .window(maxSize: size, keep: keep)
+        } else if (kvWindowKeep ?? 0) != 0 {
+            throw ValidationError("--kv-window-keep requires --kv-window-size to be set.")
         }
         let m = try await Model.load(model, options: loadOpts)
         print("loaded in \(String(format: "%.2f", Date().timeIntervalSince(loadStart)))s")

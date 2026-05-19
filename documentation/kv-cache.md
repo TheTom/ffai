@@ -12,7 +12,8 @@ land in Phase 5.
 | **Raw fp16 / bf16** (`KVCache`, default) | All current models. | 1× | ✅ Shipped (Phase 2). |
 | **`affine8`** (`AffineQuantizedKVCache`, 8-bit) | Memory-constrained; ~7% decode-tok/s tax. | ~0.55× (45% smaller) measured on Qwen3 1.7B | ✅ Shipped (Phase 5c). |
 | **`affine4`** (`AffineQuantizedKVCache`, 4-bit) | Tight memory; same speed as `affine8`. | ~0.31× (69% smaller, group_size=32) | ✅ Shipped (Phase 5c). |
-| **AURA** (Adaptive Unified Rotated Activations, `AURAQuantizedKVCache`) | Best memory ratio at minimal quality loss. | ~6–8× at `aura4v2` | ⏳ Planned (Phase 5d). See [`papers/aura-compression-algorithm.md`](../papers/aura-compression-algorithm.md). |
+| **AURA** (Adaptive Unified Rotated Activations, `AURAQuantizedKVCache`) | Best memory ratio at minimal quality loss. | ~6–8× at `aura4v2` | ✅ Shipped (Phase 5d, first-light: identity rotation; SRHT rotation queued for Phase 5d.E). See [`papers/aura-compression-algorithm.md`](../papers/aura-compression-algorithm.md). |
+| **Sliding window / FIFO eviction** (`.window(maxSize:keep:)`) | Long-running streams; capped memory regardless of context length. | Caps each layer's KV at `maxSize` positions independent of model `max_position_embeddings`. | ✅ Shipped — composes with every cache scheme above. |
 | **SSM / Hybrid** | Mamba / GatedDeltaNet (Qwen 3.5, NemotronH) | n/a — stores recurrent + conv state | ⏳ Planned (Phase 5e). |
 | **Batched** | Multi-stream decode (speculative, B>1 serving) | linear in B | ⏳ Planned (Phase 8+). |
 
@@ -116,6 +117,73 @@ reuse across layers within a single command buffer.
 - **AURA** (Phase 5d) — block-wise MSE codec with asymmetric
   K/V bits + dense rotation; will recover full quality at 4-bit
   group_size=64.
+
+## Sliding window / FIFO eviction
+
+Every cache implementation supports a bounded "rolling" mode where the
+oldest non-sink positions are evicted as new tokens stream in. Useful
+for indefinitely-long sessions, agent loops that re-prompt with
+growing context, or any workload where the upper bound on context
+matters more than perfect recall.
+
+Set `LoadOptions.kvEviction` (or `--kv-window-size` / `--kv-window-keep`
+on the CLI):
+
+```swift
+let model = try await Model.load(
+    "mlx-community/Qwen3-1.7B-bf16",
+    options: LoadOptions(
+        kvCache: .auraQuantized(scheme: .aura4v2),
+        kvEviction: .window(maxSize: 2048, keep: 4)
+    )
+)
+```
+
+```bash
+ffai --model mlx-community/Qwen3-1.7B-bf16 \
+     --kv-cache aura4v2 \
+     --kv-window-size 2048 \
+     --kv-window-keep 4 \
+     --prompt "..."
+```
+
+What that does:
+
+- The cache buffer is still allocated for `maxSeq` (the model's
+  `max_position_embeddings`); `maxSize` controls only how many
+  *positions* the cache reports as live to SDPA.
+- The first `keep` positions are pinned — they're written linearly
+  and never evicted. These map to the **attention-sink** tokens of
+  Xiao et al. (2023): inputs the model relies on as anchor points,
+  typically the first 4 tokens (BOS + tokenizer-special).
+- After the cache fills, the next `maxSize - keep` slots act as a
+  FIFO ring: slot `keep + ((absolute - keep) % (maxSize - keep))`
+  is overwritten by the new token's K/V.
+- Each K row was RoPE'd at its absolute insertion position, so
+  softmax stays correct regardless of buffer order — the kernels see
+  the same `[nKVHeads, maxSeq, headDim]` shape with `nKV = length`.
+
+The AURA cache also zeroes the packed-u32 row before re-encoding,
+since the encode kernel `atomic_or`s into shared memory and stale
+bits from a prior token would OR through into the new codebook
+indices.
+
+`KVCacheProtocol.absolutePosition` keeps growing monotonically across
+rotations — use it (instead of `length`) when computing RoPE for the
+next decode token.
+
+### Caveats
+
+- **Prefill larger than the window**: prefill writes tokens one at a
+  time, so a prompt longer than `maxSize` rotates older tokens out
+  before generation starts. The model has whatever K/V was last
+  written for those positions. Practically: pick `maxSize ≥ prompt
+  tokens you care about`.
+- **No partial-recall fast path**: there's no "summary token" or
+  attention-sink merge yet (Xiao et al. propose averaging older
+  positions into the sinks). The current implementation is the
+  vanilla rotating-buffer baseline that downstream perf-papers
+  build on.
 
 ## Multi-turn / streaming
 
