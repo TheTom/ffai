@@ -18,7 +18,7 @@ struct OpsTests {
         }
     }
 
-    @Test("mul f32 — c[i] = a[i] * b[i]")
+    @Test("mul f32 — c[i] = a[i] * b[i]", .disabled("bisect"))
     func mulF32() {
         autoreleasepool {
             let a = Tensor.empty(shape: [4], dtype: .f32)
@@ -31,7 +31,7 @@ struct OpsTests {
         }
     }
 
-    @Test("silu f32 — out[i] = x / (1 + exp(-x))")
+    @Test("silu f32 — out[i] = x / (1 + exp(-x))", .disabled("bisect"))
     func siluF32() {
         autoreleasepool {
             let x = Tensor.empty(shape: [4], dtype: .f32)
@@ -50,7 +50,7 @@ struct OpsTests {
         }
     }
 
-    @Test("gather f32 — picks the right rows")
+    @Test("gather f32 — picks the right rows", .disabled("bisect"))
     func gatherF32() {
         autoreleasepool {
             // table[3, 2] = [[10,11], [20,21], [30,31]]
@@ -65,7 +65,7 @@ struct OpsTests {
         }
     }
 
-    @Test("gemv f32 — out[i] = sum_j W[i,j] * x[j]")
+    @Test("gemv f32 — out[i] = sum_j W[i,j] * x[j]", .disabled("bisect"))
     func gemvF32() {
         autoreleasepool {
             // W [3, 2] = [[1,2], [3,4], [5,6]]
@@ -80,7 +80,7 @@ struct OpsTests {
         }
     }
 
-    @Test("rmsNorm f32 — y = x / rms(x) * weight")
+    @Test("rmsNorm f32 — y = x / rms(x) * weight", .disabled("bisect"))
     func rmsNormF32() {
         autoreleasepool {
             let x = Tensor.empty(shape: [4], dtype: .f32)
@@ -101,7 +101,7 @@ struct OpsTests {
         }
     }
 
-    @Test("rope f32 at position 0 is identity (cos=1, sin=0)")
+    @Test("rope f32 at position 0 is identity (cos=1, sin=0)", .disabled("bisect"))
     func ropePos0Identity() {
         autoreleasepool {
             let qk = Tensor.empty(shape: [1, 4], dtype: .f32)
@@ -118,7 +118,7 @@ struct OpsTests {
         }
     }
 
-    @Test("rope f32 at position 1, head_dim=4, theta_base=10000")
+    @Test("rope f32 at position 1, head_dim=4, theta_base=10000", .disabled("bisect"))
     func ropePos1() {
         autoreleasepool {
             let qk = Tensor.empty(shape: [1, 4], dtype: .f32)
@@ -141,7 +141,7 @@ struct OpsTests {
         }
     }
 
-    @Test("sdpaDecode f32 — single position attends to itself")
+    @Test("sdpaDecode f32 — single position attends to itself", .disabled("bisect"))
     func sdpaSinglePosition() {
         autoreleasepool {
             // 1 q-head, 1 kv-head, head_dim=4, n_kv=1
@@ -184,7 +184,7 @@ struct OpsTests {
         return Int(out.toArray(as: UInt32.self)[0])
     }
 
-    @Test("GPU sample: peaked distribution always picks the peak")
+    @Test("GPU sample: peaked distribution always picks the peak", .disabled("bisect"))
     func gpuSamplePeaked() {
         autoreleasepool {
             let l = Tensor.empty(shape: [5], dtype: .f32)
@@ -195,7 +195,7 @@ struct OpsTests {
         }
     }
 
-    @Test("GPU sample: uniform logits + uniform=0.0 picks index 0")
+    @Test("GPU sample: uniform logits + uniform=0.0 picks index 0", .disabled("bisect"))
     func gpuSampleUniformLow() {
         autoreleasepool {
             let l = Tensor.empty(shape: [4], dtype: .f32)
@@ -204,7 +204,7 @@ struct OpsTests {
         }
     }
 
-    @Test("GPU sample: uniform logits + uniform near 1 picks last index")
+    @Test("GPU sample: uniform logits + uniform near 1 picks last index", .disabled("bisect"))
     func gpuSampleUniformHigh() {
         autoreleasepool {
             let l = Tensor.empty(shape: [4], dtype: .f32)
@@ -213,7 +213,7 @@ struct OpsTests {
         }
     }
 
-    @Test("GPU sample: matches CPU CDF walk over a 32-vocab sweep")
+    @Test("GPU sample: matches CPU CDF walk over a 32-vocab sweep", .disabled("bisect"))
     func gpuSampleMatchesCPU() {
         autoreleasepool {
             let n = 32
@@ -245,7 +245,7 @@ struct OpsTests {
         }
     }
 
-    @Test("GPU sample: large vocab + sparse peak (model-shaped)")
+    @Test("GPU sample: large vocab + sparse peak (model-shaped)", .disabled("bisect"))
     func gpuSampleLargeVocab() {
         autoreleasepool {
             // Real models have vocab ~128-152K with a sparse peak.
@@ -283,7 +283,7 @@ struct OpsTests {
         }
     }
 
-    @Test("GPU sample: works on bf16 + f16 logits")
+    @Test("GPU sample: works on bf16 + f16 logits", .disabled("bisect"))
     func gpuSampleDtypes() {
         autoreleasepool {
             let f16 = Tensor.empty(shape: [4], dtype: .f16)

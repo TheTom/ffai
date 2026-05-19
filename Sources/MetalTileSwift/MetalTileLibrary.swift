@@ -92,8 +92,15 @@ public final class MetalTileLibrary: @unchecked Sendable {
         }
         // Cap in-flight cmdbuf count to apply backpressure at the Metal
         // layer. See `defaultMaxCommandBufferCount` for the rationale.
+        let cap = Self.defaultMaxCommandBufferCount
+        // Emit at process startup so we can verify FFAI_MAX_COMMAND_BUFFERS
+        // is actually being honored. Cheap (one line on stderr per process).
+        // Remove once the freeze diagnostic settles.
+        FileHandle.standardError.write(Data(
+            "[MetalTileLibrary] maxCommandBufferCount=\(cap) (FFAI_MAX_COMMAND_BUFFERS=\(ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"] ?? "<unset>"))\n".utf8
+        ))
         guard let queue = device.makeCommandQueue(
-            maxCommandBufferCount: Self.defaultMaxCommandBufferCount
+            maxCommandBufferCount: cap
         ) else {
             throw MetalTileLibraryError.noCommandQueue
         }
