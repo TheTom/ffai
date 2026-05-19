@@ -5,7 +5,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("GenerationParameters", .serialized)
+@Suite("GenerationParameters")
 struct GenerationParametersTests {
 
     @Test("Init defaults match the documented baseline")

@@ -7,7 +7,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ThinkingSplit", .serialized)
+@Suite("ThinkingSplit")
 struct ThinkingSplitTests {
 
     @Test("ThinkingFormat allCases includes every documented format")

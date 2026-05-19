@@ -7,7 +7,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Quantized GEMV (int4)", .serialized)
+@Suite("Quantized GEMV (int4)")
 struct QuantizedOpsTests {
     static let groupSize = 8   // smallest valid group_size (multiple of 8)
     static let inDim = 16      // 2 groups

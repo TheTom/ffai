@@ -7,7 +7,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("ConvStateCache + conv1d_causal_step kernel", .serialized)
+@Suite("ConvStateCache + conv1d_causal_step kernel")
 struct ConvStateCacheTests {
 
     // MARK: - State cache plumbing

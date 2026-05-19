@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("BufferPool", .serialized)
+@Suite("BufferPool")
 struct BufferPoolTests {
     @Test("acquire then release reuses the same buffer")
     func reuse() {

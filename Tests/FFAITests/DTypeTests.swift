@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("DType", .serialized)
+@Suite("DType")
 struct DTypeTests {
     @Test("byteSize matches expected")
     func byteSizes() {

@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("MemoryStats", .serialized)
+@Suite("MemoryStats")
 struct MemoryStatsTests {
 
     @Test("MemorySnapshot.capture returns plausible non-zero values")

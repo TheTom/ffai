@@ -201,6 +201,9 @@ public enum Ops {
         precondition(weight.dtype == input.dtype, "gemv: dtype mismatch")
         let outDim = weight.shape[0]
         let inDim = weight.shape[1]
+        if let reason = OpsValidation.validateGemv(outDim: outDim, inDim: inDim) {
+            preconditionFailure("Ops.gemv: \(reason)")
+        }
         let result = out ?? Tensor.empty(shape: [outDim], dtype: weight.dtype)
         // Reduction kernel: one threadgroup per output row.
         // dispatchThreads dispatches outDim*tgWidth threads in groups
@@ -253,20 +256,11 @@ public enum Ops {
         let epsBuf = device.makeBuffer(length: 4)
         memcpy(epsBuf.contents(), &epsValue, 4)
 
-        // The kernel processes 4 elements per thread (`N = TPG * 4`), so
-        // the threadgroup width MUST be `n / 4`. Hardcoding `tgWidth = 256`
-        // makes the kernel read OOB when `n < 1024` and drop elements when
-        // `n > 1024`. See crates/metaltile-std/src/mlx/rms_norm.rs:36-46
-        // for the kernel-side `N = TPG * 4` invariant.
-        //
-        // The kernel also requires TPG be a multiple of 32 (one full Apple
-        // simdgroup). The generated MSL computes `n_simd = TPG / 32` for
-        // the cross-simdgroup combine; with TPG < 32 the combine reads
-        // zero everywhere and `tg_ssq` collapses to 0 — silent miscompute.
-        // Combined: **n must be a multiple of 128 (32 lanes × 4 elements)**
-        // and **n / 4 must be ≤ 1024** (Apple's TPG cap).
-        precondition(n % 128 == 0, "rmsNorm: n=\(n) must be a multiple of 128 (32-lane simdgroup × 4 elements/thread)")
-        precondition(n / 4 <= 1024, "rmsNorm: n=\(n) > 4096 — exceeds the 1024-thread cap of this kernel; use rmsNormRows or a chunked variant for larger rows")
+        // Kernel-invariant validation. See OpsValidation.swift for the
+        // full reasoning + a CI-runnable test of each precondition.
+        if let reason = OpsValidation.validateRmsNorm(n: n) {
+            preconditionFailure("Ops.rmsNorm: \(reason)")
+        }
         let tgWidth = n / 4
         let grid = MTLSize(width: tgWidth, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
@@ -320,11 +314,11 @@ public enum Ops {
         memcpy(epsBuf.contents(), &epsValue, 4)
 
         // Reduction kernel: one threadgroup per row. Per-row invariant
-        // is `rowSize = TPG * 4` AND TPG must be a multiple of 32 (full
-        // Apple simdgroup) — see Ops.rmsNorm above for the kernel-MSL
-        // walkthrough + why TPG < 32 silently produces tg_ssq=0.
-        precondition(rowSize % 128 == 0, "rmsNormRows: rowSize=\(rowSize) must be a multiple of 128 (32-lane simdgroup × 4 elements/thread)")
-        precondition(rowSize / 4 <= 1024, "rmsNormRows: rowSize=\(rowSize) > 4096 — exceeds the 1024-thread cap of this kernel")
+        // is the same as the single-row dispatch — see OpsValidation
+        // for the full reasoning and CI-runnable tests.
+        if let reason = OpsValidation.validateRmsNorm(n: rowSize) {
+            preconditionFailure("Ops.rmsNormRows: \(reason)")
+        }
         let tgWidth = rowSize / 4
         let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
@@ -622,8 +616,6 @@ public enum Ops {
         precondition(weight.dtype == .u32, "dequantGemv: weight must be u32 (packed)")
         precondition(scales.dtype == input.dtype && biases.dtype == input.dtype,
                      "dequantGemv: scales/biases dtype must match input")
-        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
-                     "dequantGemv: bits must be one of 3, 4, 5, 6, or 8")
         let outDim = weight.shape[0]
         let packedPerRow = weight.shape[1]
         // Storage layout: bytes per row = in_dim * bits / 8.
@@ -632,6 +624,15 @@ public enum Ops {
         let inDim = packedPerRow * 32 / bits
         precondition(input.elementCount == inDim,
                      "dequantGemv: input \(input.elementCount) ≠ in_dim \(inDim)")
+        // Kernel-invariant validation (silent-miscompute footguns:
+        // partial trailing group, unaligned pack tail, undersized
+        // scales/biases). See OpsValidation.validateDequantGemv.
+        if let reason = OpsValidation.validateDequantGemv(
+            outDim: outDim, inDim: inDim, bits: bits, groupSize: groupSize,
+            scalesCount: scales.elementCount, biasesCount: biases.elementCount
+        ) {
+            preconditionFailure("Ops.dequantGemv: \(reason)")
+        }
         let result = out ?? Tensor.empty(shape: [outDim], dtype: input.dtype)
         // Reduction kernel: one threadgroup per output row.
         let tgWidth = 256
@@ -1282,14 +1283,37 @@ public enum Ops {
     /// [n_kv_heads, kv_stride, head_dim] where kv_stride is the physical
     /// capacity (maxSeq) and nKV is how many positions to attend to.
     /// Output: [n_q_heads, head_dim].
+    ///
+    /// Dispatch invariants (see `crates/metaltile-std/src/ffai/sdpa_decode.rs`):
+    ///   * `head_dim == 128` — one threadgroup is 32 simdgroups × 32 lanes;
+    ///     each lane owns 4 consecutive Q/K/V elements (128 / 32 = 4).
+    ///     Other head-dim specializations (64, 256) are queued but not
+    ///     emitted yet — using a non-128 head_dim with this kernel
+    ///     reads OOB and pins the GPU.
+    ///   * 1 threadgroup per Q head, 1024 threads per threadgroup
+    ///     (32 simdgroups × 32 lanes). `tgid_x = q_head`.
     public static func sdpaDecode(q: Tensor, k: Tensor, v: Tensor,
                                   nQHeads: Int, nKVHeads: Int, headDim: Int,
                                   nKV: Int, kvStride: Int,
                                   scale: Float, on cmd: MTLCommandBuffer,
                                   into out: Tensor? = nil) -> Tensor {
+        // Kernel-invariant validation — see OpsValidation.swift for the
+        // full reasoning + CI-runnable tests. The 2026-05-19 GPU freeze
+        // came from this wrapper accepting head_dim=4 with no check.
+        if let reason = OpsValidation.validateSdpaDecode(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            nKV: nKV, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaDecode: \(reason)")
+        }
         let result = out ?? Tensor.empty(shape: [nQHeads, headDim], dtype: q.dtype)
-        let totalThreads = nQHeads * headDim
-        let (grid, tg) = elementwiseGrid(totalThreads)
+        // One threadgroup per q-head, 1024 threads per group. Reduction-mode
+        // kernel reads `tgid_x` as the q-head; we lay out a 1D thread grid
+        // of `nQHeads * 1024` threads so Metal slices it into `nQHeads`
+        // threadgroups of 1024.
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let headsPerGroup = nQHeads / nKVHeads
         switch q.dtype {
         case .f32:
@@ -1356,6 +1380,10 @@ public enum Ops {
                      "Ops.auraEncode: rotation/boundaries/codebook must be f32")
         precondition(packedOut.dtype == .u32, "Ops.auraEncode: packed_out must be u32")
         precondition(normsOut.dtype == .f32, "Ops.auraEncode: norms_out must be f32")
+        // Kernel-invariant validation — see OpsValidation.swift.
+        if let reason = OpsValidation.validateAuraEncode(rows: rows, dim: dim, bits: bits) {
+            preconditionFailure("Ops.auraEncode: \(reason)")
+        }
         // One threadgroup per row; `dim` threads per group (each thread
         // owns one rotated coordinate). Reduction-mode kernels declare
         // their own grid via `tgid_x` + `tid`.

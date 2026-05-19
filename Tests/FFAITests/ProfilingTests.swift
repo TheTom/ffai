@@ -5,7 +5,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Profiling", .serialized)
+@Suite("Profiling")
 struct ProfilingTests {
 
     @Test("ProfileLevel rawValue + ordering")

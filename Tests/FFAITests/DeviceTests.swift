@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("Device", .serialized)
+@Suite("Device")
 struct DeviceTests {
     @Test("shared device + queue available")
     func shared() {

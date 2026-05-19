@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("SafeTensors", .serialized)
+@Suite("SafeTensors")
 struct SafeTensorsTests {
     /// Build a minimal valid safetensors file in `directory` containing one
     /// f32 tensor named `tensorName` with the given values + shape.

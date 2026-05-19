@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ModelLocator", .serialized)
+@Suite("ModelLocator")
 struct ModelLocatorTests {
     @Test("isLocalPath classifies paths vs repo ids")
     func classify() {

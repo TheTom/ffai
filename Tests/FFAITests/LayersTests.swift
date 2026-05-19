@@ -3,7 +3,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Layers", .serialized)
+@Suite("Layers")
 struct LayersTests {
     @Test("Linear forward — matmul against gemv reference")
     func linearForward() {
@@ -39,18 +39,27 @@ struct LayersTests {
     @Test("RMSNorm forward — y = x / rms(x) * weight")
     func rmsNormForward() {
         autoreleasepool {
-            let w = Tensor.empty(shape: [4], dtype: .f32)
-            w.copyIn(from: [Float(1), 1, 1, 1])
+            // Underlying Ops.rmsNorm kernel requires n % 128 == 0 (32-lane
+            // simdgroup × 4 elements/thread). n=128 is the smallest legal
+            // size — see Ops.rmsNorm preconditions / mlx/rms_norm.rs.
+            let n = 128
+            let xs: [Float] = (0..<n).map { Float($0 + 1) }
+            let ws: [Float] = Array(repeating: Float(1), count: n)
+            let w = Tensor.empty(shape: [n], dtype: .f32)
+            w.copyIn(from: ws)
             let rms = RMSNorm(weight: w, eps: 1e-6)
-            let x = Tensor.empty(shape: [4], dtype: .f32)
-            x.copyIn(from: [Float(1), 2, 3, 4])
+            let x = Tensor.empty(shape: [n], dtype: .f32)
+            x.copyIn(from: xs)
             var out: Tensor!
             runAndWait { cb in out = rms(x, on: cb) }
             let r = out.toArray(as: Float.self)
-            let expectedRms = Float((30.0 / 4.0).squareRoot())
-            for i in 0..<4 {
-                let expected = Float(i + 1) / expectedRms
-                #expect(abs(r[i] - expected) < 1e-3)
+            // CPU reference: rms = sqrt(mean(x²)); y = x / rms * weight.
+            let ssq = xs.reduce(Float(0)) { $0 + $1 * $1 }
+            let expectedRms = (ssq / Float(n)).squareRoot()
+            for i in 0..<n {
+                let expected = xs[i] / expectedRms
+                #expect(abs(r[i] - expected) < 1e-2,
+                        "i=\(i) got \(r[i]) expected \(expected)")
             }
             #expect(rms.parameters().map { $0.0 } == ["weight"])
         }

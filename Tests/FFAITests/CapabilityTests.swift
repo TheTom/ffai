@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Capability", .serialized)
+@Suite("Capability")
 struct CapabilityTests {
     @Test("textOnly contains exactly textIn + textOut")
     func textOnlySet() {

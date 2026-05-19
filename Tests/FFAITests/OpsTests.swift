@@ -3,7 +3,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Ops", .serialized)
+@Suite("Ops")
 struct OpsTests {
     @Test("add f32 — c[i] = a[i] + b[i]")
     func addF32() {
@@ -153,27 +153,49 @@ struct OpsTests {
     @Test("sdpaDecode f32 — single position attends to itself")
     func sdpaSinglePosition() {
         autoreleasepool {
-            // 1 q-head, 1 kv-head, head_dim=4, n_kv=1
-            let q = Tensor.empty(shape: [1, 4], dtype: .f32)
-            let k = Tensor.empty(shape: [1, 4, 4], dtype: .f32)  // [n_kv_heads, kv_stride=4, head_dim]
-            let v = Tensor.empty(shape: [1, 4, 4], dtype: .f32)
-            q.copyIn(from: [Float(1), 0, 0, 0])
-            // Only the first position is filled
-            var kData = [Float](repeating: 0, count: 16)
-            kData[0] = 1; kData[1] = 0; kData[2] = 0; kData[3] = 0
+            // Kernel invariant: head_dim must be 128 (32 simdgroups × 32 lanes ×
+            // 4 elements/lane). Below 128 the wrapper preconditions catch it;
+            // before the preconditions existed, the test ran with head_dim=4
+            // and pinned the GPU.
+            let D = 128
+            let kvStride = 4   // pre-allocated capacity
+            let nKV = 1        // only the first position is filled
+            let nQHeads = 1
+            let nKVHeads = 1
+
+            let q = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+
+            // Q is the unit vector e_0; K[0] is the same so dot(Q, K[0]) = 1.
+            var qData = [Float](repeating: 0, count: nQHeads * D)
+            qData[0] = 1
+            q.copyIn(from: qData)
+
+            var kData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            kData[0] = 1                              // K[head=0, pos=0, d=0]
             k.copyIn(from: kData)
-            var vData = [Float](repeating: 0, count: 16)
-            vData[0] = 7; vData[1] = 8; vData[2] = 9; vData[3] = 10
+
+            // V[0] is an arbitrary recognizable vector; positions [1..3]
+            // are zero so even if the kernel read past `n_kv` we'd notice.
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for d in 0..<D { vData[d] = Float(d + 1) }   // [1, 2, …, 128]
             v.copyIn(from: vData)
 
             var out: Tensor!
             runAndWait { cb in
                 out = Ops.sdpaDecode(q: q, k: k, v: v,
-                                     nQHeads: 1, nKVHeads: 1, headDim: 4,
-                                     nKV: 1, kvStride: 4, scale: 1.0, on: cb)
+                                     nQHeads: nQHeads, nKVHeads: nKVHeads,
+                                     headDim: D,
+                                     nKV: nKV, kvStride: kvStride,
+                                     scale: 1.0, on: cb)
             }
-            // Single KV → softmax([single_score]) = 1 → output = v[0]
-            #expect(out.toArray(as: Float.self) == [7, 8, 9, 10])
+            // n_kv = 1 → softmax([single_score]) = 1 → output == V[0].
+            let r = out.toArray(as: Float.self)
+            for d in 0..<D {
+                #expect(abs(r[d] - Float(d + 1)) < 1e-4,
+                        "out[\(d)] = \(r[d]), expected \(d + 1)")
+            }
         }
     }
 

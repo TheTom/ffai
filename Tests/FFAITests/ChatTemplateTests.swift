@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ChatTemplate types", .serialized)
+@Suite("ChatTemplate types")
 struct ChatTemplateTests {
 
     @Test("ChatMessage.Role rawValues are stable")

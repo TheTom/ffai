@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ModelConfig", .serialized)
+@Suite("ModelConfig")
 struct ModelConfigTests {
     static func writeConfig(_ json: String) throws -> URL {
         let dir = FileManager.default.temporaryDirectory

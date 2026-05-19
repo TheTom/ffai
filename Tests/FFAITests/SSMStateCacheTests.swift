@@ -8,7 +8,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("SSMStateCache + ssm_step kernel", .serialized)
+@Suite("SSMStateCache + ssm_step kernel")
 struct SSMStateCacheTests {
 
     // MARK: - State cache plumbing
