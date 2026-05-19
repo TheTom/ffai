@@ -80,7 +80,7 @@ struct OpsTests {
         }
     }
 
-    @Test("rmsNorm f32 — y = x / rms(x) * weight", .disabled("bisect"))
+    @Test("rmsNorm f32 — y = x / rms(x) * weight")
     func rmsNormF32() {
         autoreleasepool {
             let x = Tensor.empty(shape: [4], dtype: .f32)
