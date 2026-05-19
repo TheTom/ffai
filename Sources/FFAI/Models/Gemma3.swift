@@ -573,13 +573,19 @@ public final class Gemma3Model: LanguageModel {
     public func forward(tokenId: Int, position: Int,
                         caches: [any LayerCacheProtocol],
                         on cmd: MTLCommandBuffer, device: Device) -> Tensor {
-        // Embed lookup + sqrt(hidden) scale.
+        // Embed lookup + sqrt(hidden) scale. The scale buffer is
+        // pre-baked at load time (`Gemma3Dense.loadModel`) and tied
+        // to the activation dtype.
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
         let h0 = embedTokens(tokenTensor, on: cmd).reshaped(to: [hidden])
-        var h = Ops.mul(h0, embedScale, on: cmd)
+        // GEMMA3_DISABLE_EMBED_SCALE skips the scale to isolate
+        // first-light bugs — see the integration test header for the
+        // open questions on Gemma 3 coherence.
+        let skipEmbedScale = ProcessInfo.processInfo.environment["GEMMA3_DISABLE_EMBED_SCALE"] == "1"
+        var h = skipEmbedScale ? h0 : Ops.mul(h0, embedScale, on: cmd)
 
         for (i, layer) in layers.enumerated() {
             h = layer.forward(h, position: position,
