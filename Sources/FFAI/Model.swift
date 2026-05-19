@@ -140,6 +140,16 @@ public final class Model: @unchecked Sendable {
         return _currentState
     }
 
+    /// Maximum number of lifecycle events buffered when no consumer is
+    /// reading from `events`. The default `AsyncStream` policy is
+    /// `.unbounded`, which leaks events forever if nobody subscribes
+    /// (the common case — most callers don't attach an `events` task).
+    /// 64 is well above the typical event count per generation
+    /// (~6: idle → loading → ready → generating → idle, plus a few
+    /// capability flips) but small enough that the unconsumed-events
+    /// retention is bounded.
+    public static let eventsBufferCapacity = 64
+
     public let events: AsyncStream<ModelLifecycleEvent>
     private let eventsContinuation: AsyncStream<ModelLifecycleEvent>.Continuation
 
@@ -155,8 +165,13 @@ public final class Model: @unchecked Sendable {
         self.availableCapabilities = availableCapabilities
         self.enabledCapabilities = enabledCapabilities
         self.defaultGenerationParameters = defaultGenerationParameters
-        var cont: AsyncStream<ModelLifecycleEvent>.Continuation!
-        self.events = AsyncStream { c in cont = c }
+        // Bounded buffer — when no consumer is reading, keep the most
+        // recent `eventsBufferCapacity` events and drop older ones.
+        // Avoids the unbounded-growth leak from the default policy.
+        let (stream, cont) = AsyncStream<ModelLifecycleEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.eventsBufferCapacity)
+        )
+        self.events = stream
         self.eventsContinuation = cont
     }
 
