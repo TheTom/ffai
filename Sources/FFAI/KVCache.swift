@@ -74,7 +74,21 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
     public let kBuffer: Tensor   // [nKVHeads, maxSeq, headDim]
     public let vBuffer: Tensor   // [nKVHeads, maxSeq, headDim]
 
-    public private(set) var length: Int = 0
+    /// Lock-protected fill count. Safe today even without the lock —
+    /// single-threaded decode — but Phase 8's batched / speculative
+    /// decode coordinates multiple Tasks against one cache. The lock
+    /// makes the `(read position, queue dispatch, increment)` sequence
+    /// in `appendOnGPU` atomic so concurrent appenders don't queue
+    /// dispatches against the same position.
+    ///
+    /// `NSLock` rather than `OSAllocatedUnfairLock<Int>` because the
+    /// critical section captures `MTLCommandBuffer` (not Sendable),
+    /// which `OSAllocatedUnfairLock.withLock`'s `@Sendable` closure
+    /// signature rejects. NSLock has no such restriction and the
+    /// performance difference at decode-step granularity is noise.
+    private let lengthLock = NSLock()
+    private var _length: Int = 0
+    public var length: Int { lengthLock.withLock { _length } }
 
     public init(nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
                 device: Device = .shared) {
@@ -93,20 +107,23 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
     /// callers that don't have a live MTLCommandBuffer; the inference
     /// path uses `appendOnGPU` instead, which is sync-free.
     public func append(kFlat: Tensor, vFlat: Tensor) {
-        precondition(length < maxSeq, "KVCache: capacity exhausted")
         precondition(kFlat.dtype == dtype && vFlat.dtype == dtype, "KVCache: dtype mismatch")
-        let bytesPerHead = headDim * dtype.byteSize
-        let kSrc = kFlat.buffer.contents().advanced(by: kFlat.offset)
-        let vSrc = vFlat.buffer.contents().advanced(by: vFlat.offset)
-        for h in 0..<nKVHeads {
-            let dstHeadOffset = (h * maxSeq + length) * headDim * dtype.byteSize
-            let kDst = kBuffer.buffer.contents().advanced(by: kBuffer.offset + dstHeadOffset)
-            let vDst = vBuffer.buffer.contents().advanced(by: vBuffer.offset + dstHeadOffset)
-            let srcOffset = h * bytesPerHead
-            kDst.copyMemory(from: kSrc.advanced(by: srcOffset), byteCount: bytesPerHead)
-            vDst.copyMemory(from: vSrc.advanced(by: srcOffset), byteCount: bytesPerHead)
+        lengthLock.withLock {
+            precondition(_length < maxSeq, "KVCache: capacity exhausted")
+            let pos = _length
+            let bytesPerHead = headDim * dtype.byteSize
+            let kSrc = kFlat.buffer.contents().advanced(by: kFlat.offset)
+            let vSrc = vFlat.buffer.contents().advanced(by: vFlat.offset)
+            for h in 0..<nKVHeads {
+                let dstHeadOffset = (h * maxSeq + pos) * headDim * dtype.byteSize
+                let kDst = kBuffer.buffer.contents().advanced(by: kBuffer.offset + dstHeadOffset)
+                let vDst = vBuffer.buffer.contents().advanced(by: vBuffer.offset + dstHeadOffset)
+                let srcOffset = h * bytesPerHead
+                kDst.copyMemory(from: kSrc.advanced(by: srcOffset), byteCount: bytesPerHead)
+                vDst.copyMemory(from: vSrc.advanced(by: srcOffset), byteCount: bytesPerHead)
+            }
+            _length = pos + 1
         }
-        length += 1
     }
 
     /// Append one timestep on the GPU via Ops.kvCacheUpdate. The dispatch
@@ -117,18 +134,21 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
     /// dispatches see the updated count.
     public func appendOnGPU(kFlat: Tensor, vFlat: Tensor,
                             on cmd: MTLCommandBuffer) {
-        precondition(length < maxSeq, "KVCache: capacity exhausted")
         precondition(kFlat.dtype == dtype && vFlat.dtype == dtype, "KVCache: dtype mismatch")
-        Ops.kvCacheUpdate(src: kFlat, into: kBuffer,
-                          nKVHeads: nKVHeads, headDim: headDim,
-                          maxSeq: maxSeq, position: length, on: cmd)
-        Ops.kvCacheUpdate(src: vFlat, into: vBuffer,
-                          nKVHeads: nKVHeads, headDim: headDim,
-                          maxSeq: maxSeq, position: length, on: cmd)
-        length += 1
+        lengthLock.withLock {
+            precondition(_length < maxSeq, "KVCache: capacity exhausted")
+            let pos = _length
+            Ops.kvCacheUpdate(src: kFlat, into: kBuffer,
+                              nKVHeads: nKVHeads, headDim: headDim,
+                              maxSeq: maxSeq, position: pos, on: cmd)
+            Ops.kvCacheUpdate(src: vFlat, into: vBuffer,
+                              nKVHeads: nKVHeads, headDim: headDim,
+                              maxSeq: maxSeq, position: pos, on: cmd)
+            _length = pos + 1
+        }
     }
 
-    public func reset() { length = 0 }
+    public func reset() { lengthLock.withLock { _length = 0 } }
 
     /// Raw cache exposes its storage buffers directly; no per-step
     /// work is needed before SDPA.
@@ -193,7 +213,11 @@ public final class AffineQuantizedKVCache: KVCacheProtocol, @unchecked Sendable 
     public let sharedWorkingK: Tensor   // [nKVHeads, maxSeq, headDim] T
     public let sharedWorkingV: Tensor
 
-    public private(set) var length: Int = 0
+    /// Lock-protected fill count. See `KVCache.lengthLock` for the
+    /// rationale — same Phase-8 concurrent-decode prep.
+    private let lengthLock = NSLock()
+    private var _length: Int = 0
+    public var length: Int { lengthLock.withLock { _length } }
 
     public init(nKVHeads: Int, headDim: Int, maxSeq: Int, dtype: DType,
                 bits: Int, groupSize: Int,
@@ -236,22 +260,25 @@ public final class AffineQuantizedKVCache: KVCacheProtocol, @unchecked Sendable 
         kBiases.zero(); vBiases.zero()
     }
 
-    public func reset() { length = 0 }
+    public func reset() { lengthLock.withLock { _length = 0 } }
 
     public func appendOnGPU(kFlat: Tensor, vFlat: Tensor,
                             on cmd: MTLCommandBuffer) {
-        precondition(length < maxSeq, "AffineQuantizedKVCache: capacity exhausted")
         precondition(kFlat.dtype == dtype && vFlat.dtype == dtype,
                      "AffineQuantizedKVCache: dtype mismatch")
-        Ops.quantizeKVAffine(src: kFlat,
-                             weights: kWeights, scales: kScales, biases: kBiases,
-                             nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
-                             groupSize: groupSize, position: length, bits: bits, on: cmd)
-        Ops.quantizeKVAffine(src: vFlat,
-                             weights: vWeights, scales: vScales, biases: vBiases,
-                             nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
-                             groupSize: groupSize, position: length, bits: bits, on: cmd)
-        length += 1
+        lengthLock.withLock {
+            precondition(_length < maxSeq, "AffineQuantizedKVCache: capacity exhausted")
+            let pos = _length
+            Ops.quantizeKVAffine(src: kFlat,
+                                 weights: kWeights, scales: kScales, biases: kBiases,
+                                 nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+                                 groupSize: groupSize, position: pos, bits: bits, on: cmd)
+            Ops.quantizeKVAffine(src: vFlat,
+                                 weights: vWeights, scales: vScales, biases: vBiases,
+                                 nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+                                 groupSize: groupSize, position: pos, bits: bits, on: cmd)
+            _length = pos + 1
+        }
     }
 
     public func prepareForAttention(on cmd: MTLCommandBuffer) -> (k: Tensor, v: Tensor) {

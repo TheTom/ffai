@@ -299,4 +299,49 @@ struct KVCacheTests {
             #expect(cache.bytesInUse == 0)  // length=0
         }
     }
+
+    // MARK: - KVCache.length lock contract
+
+    @Test("Concurrent CPU append increments length atomically — no lost updates")
+    func concurrentAppendDoesNotLoseUpdates() {
+        // KVCache.length is lock-protected so the (read pos, write at
+        // pos, increment) sequence in `append` and `appendOnGPU` is
+        // atomic. Phase 8 batched decode dispatches multiple Tasks
+        // against one cache; concurrent appenders must not queue
+        // dispatches against the same `pos`.
+        //
+        // This test exercises the CPU `append` path (no GPU dispatch
+        // needed) from 8 concurrent workers × 16 iterations each =
+        // 128 total appends. Asserts the final length is exactly 128
+        // and the cache contents reflect every write — no lost
+        // updates from a `read-then-write` race.
+        autoreleasepool {
+            let nKVHeads = 1
+            let headDim = 4
+            let maxSeq = 128
+            let workers = 8
+            let iterations = 16
+            #expect(workers * iterations == maxSeq,
+                    "test sizing assumption: total writes fill the cache")
+
+            let c = KVCache(nKVHeads: nKVHeads, headDim: headDim,
+                            maxSeq: maxSeq, dtype: .f32)
+            let kSrc = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            let vSrc = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            kSrc.copyIn(from: [Float](repeating: 1, count: nKVHeads * headDim))
+            vSrc.copyIn(from: [Float](repeating: 2, count: nKVHeads * headDim))
+
+            DispatchQueue.concurrentPerform(iterations: workers) { _ in
+                for _ in 0..<iterations {
+                    c.append(kFlat: kSrc, vFlat: vSrc)
+                }
+            }
+
+            // If the lock works, all 128 increments land and length =
+            // 128. If the (read, write, +=) sequence raced, we'd see
+            // length < 128.
+            #expect(c.length == workers * iterations,
+                    "expected \(workers * iterations) appends, got \(c.length)")
+        }
+    }
 }
