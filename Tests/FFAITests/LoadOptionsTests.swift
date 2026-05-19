@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("LoadOptions")
+@Suite("LoadOptions", .serialized)
 struct LoadOptionsTests {
     @Test("defaults — text capabilities + raw KV + eager dispatch + prewarm")
     func defaults() {

@@ -8,7 +8,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("SSMStateCache + ssm_step kernel")
+@Suite("SSMStateCache + ssm_step kernel", .serialized)
 struct SSMStateCacheTests {
 
     private func runAndWait(_ block: (MTLCommandBuffer) -> Void) {

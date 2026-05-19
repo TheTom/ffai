@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("GenerationStats")
+@Suite("GenerationStats", .serialized)
 struct GenerationStatsTests {
 
     private func makeStats(

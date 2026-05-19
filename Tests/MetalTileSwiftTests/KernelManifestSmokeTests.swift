@@ -27,7 +27,7 @@ import Metal
 import Testing
 @testable import MetalTileSwift
 
-@Suite("Kernel manifest PSO smoke")
+@Suite("Kernel manifest PSO smoke", .serialized)
 struct KernelManifestSmokeTests {
 
     /// JSON shape mirrored from `metaltile-codegen::emit::write_manifest`.

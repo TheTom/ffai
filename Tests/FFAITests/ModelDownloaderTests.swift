@@ -5,7 +5,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ModelDownloader")
+@Suite("ModelDownloader", .serialized)
 struct ModelDownloaderTests {
     @Test("download config.json only")
     func downloadConfigOnly() async throws {

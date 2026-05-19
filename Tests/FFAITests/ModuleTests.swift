@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("Module")
+@Suite("Module", .serialized)
 struct ModuleTests {
     final class StubModule: Module {
         let params: [(String, Tensor)]

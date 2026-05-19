@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ModelLifecycle")
+@Suite("ModelLifecycle", .serialized)
 struct ModelLifecycleTests {
     @Test("LoadProgress.fraction handles total > 0 and total == 0")
     func loadProgressFraction() {

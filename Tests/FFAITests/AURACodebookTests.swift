@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("AURACodebook")
+@Suite("AURACodebook", .serialized)
 struct AURACodebookTests {
 
     @Test("supportedBits covers 2/3/4/8")
@@ -106,7 +106,7 @@ struct AURACodebookTests {
     }
 }
 
-@Suite("AURAScheme")
+@Suite("AURAScheme", .serialized)
 struct AURASchemeTests {
 
     @Test("default scheme is aura4v4 (symmetric 4-bit)")
@@ -164,7 +164,7 @@ struct AURASchemeTests {
     }
 }
 
-@Suite("LoadOptions — AURA")
+@Suite("LoadOptions — AURA", .serialized)
 struct LoadOptionsAURATests {
 
     @Test("auraQuantized round-trips through KVCacheKind")

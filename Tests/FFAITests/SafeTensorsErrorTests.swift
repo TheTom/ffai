@@ -4,7 +4,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("SafeTensors errors")
+@Suite("SafeTensors errors", .serialized)
 struct SafeTensorsErrorTests {
     static func writeRaw(_ bytes: [UInt8], filename: String = "model.safetensors") throws -> URL {
         let dir = FileManager.default.temporaryDirectory

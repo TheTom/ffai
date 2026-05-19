@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("FFAI")
+@Suite("FFAI", .serialized)
 struct FFAITests {
     // Don't pin to a literal — release.sh auto-rewrites FFAI.version
     // to match the tag it's cutting (see publishing.md). Pinning here

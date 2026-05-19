@@ -7,7 +7,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Ops dtypes (f16 + bf16)")
+@Suite("Ops dtypes (f16 + bf16)", .serialized)
 struct OpsDtypeTests {
     func runAndWait(_ block: (MTLCommandBuffer) -> Void) {
         let cb = Device.shared.makeCommandBuffer()

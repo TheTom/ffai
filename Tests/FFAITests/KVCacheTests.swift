@@ -3,7 +3,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("KVCache")
+@Suite("KVCache", .serialized)
 struct KVCacheTests {
     @Test("init creates zeroed K/V buffers of the right shape")
     func initShape() {

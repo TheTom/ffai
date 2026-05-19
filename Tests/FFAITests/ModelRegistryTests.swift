@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("ModelRegistry + ModelError")
+@Suite("ModelRegistry + ModelError", .serialized)
 struct ModelRegistryTests {
     static func writeBundle(in dir: URL) throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -8,7 +8,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Perplexity / KL divergence math")
+@Suite("Perplexity / KL divergence math", .serialized)
 struct PerplexityTests {
 
     /// Build a 1-row fp32 logits tensor from a Swift array.

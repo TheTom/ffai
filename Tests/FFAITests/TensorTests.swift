@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("Tensor")
+@Suite("Tensor", .serialized)
 struct TensorTests {
     @Test("empty allocates correct byte length")
     func empty() {

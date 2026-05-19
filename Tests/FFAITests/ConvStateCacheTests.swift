@@ -7,7 +7,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("ConvStateCache + conv1d_causal_step kernel")
+@Suite("ConvStateCache + conv1d_causal_step kernel", .serialized)
 struct ConvStateCacheTests {
 
     private func runAndWait(_ block: (MTLCommandBuffer) -> Void) {

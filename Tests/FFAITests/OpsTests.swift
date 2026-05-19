@@ -3,7 +3,7 @@ import Metal
 import Testing
 @testable import FFAI
 
-@Suite("Ops")
+@Suite("Ops", .serialized)
 struct OpsTests {
     func runAndWait(_ block: (MTLCommandBuffer) -> Void) {
         let cb = Device.shared.makeCommandBuffer()

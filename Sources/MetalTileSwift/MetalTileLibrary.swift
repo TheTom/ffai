@@ -36,6 +36,35 @@ public final class MetalTileLibrary: @unchecked Sendable {
     public let library: MTLLibrary
     public let metallibURL: URL
 
+    /// Maximum number of in-flight (uncompleted) `MTLCommandBuffer`s the
+    /// shared command queue keeps before `makeCommandBuffer()` blocks on
+    /// the next caller. Default 32.
+    ///
+    /// Why: with Swift Testing's default in-bundle parallelism, 35+ test
+    /// suites each spin up their own cmdbufs concurrently. Without an
+    /// explicit cap, Metal's command queue happily accepts hundreds of
+    /// cmdbufs in flight — which starves the WindowServer's compositor
+    /// of GPU time and (observed locally) eventually crashes WindowServer
+    /// and locks up the box. The same pile-up can happen in production
+    /// if many callers dispatch concurrently without their own backpressure.
+    ///
+    /// Override at runtime via the `FFAI_MAX_COMMAND_BUFFERS` env var
+    /// (positive integer). Useful when triaging perf-vs-stability
+    /// tradeoffs without rebuilding.
+    ///
+    /// 32 was picked as a middle ground: high enough that decode-loop
+    /// pipelining still benefits from queue depth, low enough that a
+    /// runaway parallel test can't drown the compositor before
+    /// `waitUntilCompleted` drains in-flight work.
+    public static let defaultMaxCommandBufferCount: Int = {
+        if let raw = ProcessInfo.processInfo.environment["FFAI_MAX_COMMAND_BUFFERS"],
+           let parsed = Int(raw), parsed > 0
+        {
+            return parsed
+        }
+        return 32
+    }()
+
     /// Process-wide singleton. Lazily initialized; throws on first access if
     /// the system has no default Metal device or the metallib can't be loaded.
     public static let shared: MetalTileLibrary = {
@@ -50,7 +79,11 @@ public final class MetalTileLibrary: @unchecked Sendable {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw MetalTileLibraryError.noDefaultDevice
         }
-        guard let queue = device.makeCommandQueue() else {
+        // Cap in-flight cmdbuf count to apply backpressure at the Metal
+        // layer. See `defaultMaxCommandBufferCount` for the rationale.
+        guard let queue = device.makeCommandQueue(
+            maxCommandBufferCount: Self.defaultMaxCommandBufferCount
+        ) else {
             throw MetalTileLibraryError.noCommandQueue
         }
         let url = try Self.locateMetallib()

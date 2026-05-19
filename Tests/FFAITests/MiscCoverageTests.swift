@@ -6,7 +6,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Misc coverage")
+@Suite("Misc coverage", .serialized)
 struct MiscCoverageTests {
     @Test("ModelDownloader rejects malformed repo id")
     func badRepoID() async {

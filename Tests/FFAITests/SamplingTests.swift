@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Sampling")
+@Suite("Sampling", .serialized)
 struct SamplingTests {
     @Test("argmax over f32 picks the largest")
     func argmaxF32() {

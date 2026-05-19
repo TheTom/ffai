@@ -1,7 +1,7 @@
 import Testing
 @testable import FFAI
 
-@Suite("AURARotation")
+@Suite("AURARotation", .serialized)
 struct AURARotationTests {
 
     @Test("hadamardMatrix is the Sylvester Hadamard at dim=2/4/8")

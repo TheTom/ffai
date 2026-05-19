@@ -11,7 +11,7 @@ import Metal
 import Testing
 @testable import MetalTileSwift
 
-@Suite("vector_add_f32 round-trip")
+@Suite("vector_add_f32 round-trip", .serialized)
 struct VectorAddTests {
     @Test("a + b produces expected output")
     func vectorAdd() throws {

@@ -7,7 +7,7 @@ import Foundation
 import Testing
 @testable import FFAI
 
-@Suite("Bench")
+@Suite("Bench", .serialized)
 struct BenchTests {
 
     // MARK: - BenchMethod enum
