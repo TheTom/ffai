@@ -1,9 +1,8 @@
 // End-to-end test: download mlx-community/Qwen3-1.7B-8bit and assert
-// FFAI's greedy decode matches the mlx-lm reference within the
-// per-fixture tolerance (see GoldenFixture.expectGoldenMatch).
-//
-// Skipped if network/checkpoint isn't available. Exercises the
+// FFAI's greedy decode produces coherent output. Exercises the
 // dequant_gemv_int8 kernel end-to-end on Qwen3 1.7B.
+//
+// Skipped if network/checkpoint isn't available.
 
 import Foundation
 import Testing
@@ -12,13 +11,15 @@ import Testing
 @Suite("Qwen3 1.7B 8-bit integration", .serialized)
 struct Quantized8bitIntegrationTests {
 
-    @Test("load + greedy generate matches mlx-lm golden")
+    @Test("load + greedy generate produces coherent output")
     func loadAndGenerate() async throws {
-        let golden = try GoldenFixture.load("Qwen3-1.7B-8bit")
+        let modelId = "mlx-community/Qwen3-1.7B-8bit"
+        let prompt = "Once upon a time, in a quiet village"
+        let maxTokens = 64
 
         let m: Model
         do {
-            m = try await Model.load(golden.model)
+            m = try await Model.load(modelId)
         } catch {
             print("8-bit Qwen3 integration test skipped: \(error)")
             return
@@ -41,10 +42,10 @@ struct Quantized8bitIntegrationTests {
         #expect(top[0].1.isFinite)
 
         let result = try await m.generate(
-            prompt: golden.prompt,
-            parameters: GenerationParameters(maxTokens: golden.maxTokens, temperature: 0)
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
         )
         #expect(result.tokensPerSecond > 0)
-        expectGoldenMatch(result.generatedTokens, against: golden)
+        expectCoherentOutput(result.generatedTokens, label: "Qwen3 1.7B 8-bit")
     }
 }

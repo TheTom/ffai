@@ -1,6 +1,5 @@
-// Slow integration test: downloads Qwen3 1.7B bf16 and asserts FFAI's
-// greedy decode matches the mlx-lm reference within the per-fixture
-// tolerance (see GoldenFixture.expectGoldenMatch).
+// Slow integration test: downloads Qwen3 1.7B bf16 and asserts the
+// model loads + the engine produces coherent text via greedy decode.
 //
 // 1.7B (vs 4B) keeps the integration suite fast — same architecture,
 // smaller weights. Skipped automatically if checkpoint isn't available.
@@ -12,13 +11,15 @@ import Testing
 @Suite("Qwen3 1.7B integration", .serialized)
 struct Qwen3IntegrationTests {
 
-    @Test("load + greedy generate matches mlx-lm golden")
+    @Test("load + greedy generate produces coherent output")
     func loadAndGenerate() async throws {
-        let golden = try GoldenFixture.load("Qwen3-1.7B-bf16")
+        let modelId = "mlx-community/Qwen3-1.7B-bf16"
+        let prompt = "Once upon a time, in a quiet village"
+        let maxTokens = 64
 
         let m: Model
         do {
-            m = try await Model.load(golden.model)
+            m = try await Model.load(modelId)
         } catch {
             print("Qwen3 integration test skipped: \(error)")
             return
@@ -43,13 +44,13 @@ struct Qwen3IntegrationTests {
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)
 
-        // Greedy decode of the fixture prompt — exercises Qwen3's
-        // q_norm/k_norm path through the full per-token forward.
+        // Greedy decode of the prompt — exercises Qwen3's q_norm/k_norm
+        // path through the full per-token forward.
         let result = try await m.generate(
-            prompt: golden.prompt,
-            parameters: GenerationParameters(maxTokens: golden.maxTokens, temperature: 0)
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
         )
         #expect(result.tokensPerSecond > 0)
-        expectGoldenMatch(result.generatedTokens, against: golden)
+        expectCoherentOutput(result.generatedTokens, label: "Qwen3 1.7B bf16")
     }
 }

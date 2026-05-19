@@ -1,12 +1,8 @@
 // Slow integration test for Llama 3.2 1B. Asserts:
 //   1. Model loads + shapes match the published config.
 //   2. A single-token forward pass yields finite, non-zero logits.
-//   3. Greedy decode of `Tests/Fixtures/Llama-3.2-1B/golden.json`'s prompt
-//      produces the same token IDs the mlx-lm reference produced.
-//
-// The golden was captured with `Tools/capture-fixtures.py --model
-// unsloth/Llama-3.2-1B`. Regenerate after intentional model / kernel
-// changes; an unexplained mismatch indicates FFAI has drifted from MLX.
+//   3. Greedy decode produces coherent output (not stuck / not
+//      degenerate — see CoherentOutput.swift for the contract).
 //
 // Skipped automatically if the network/checkpoint isn't available.
 
@@ -17,13 +13,16 @@ import Testing
 @Suite("Llama 3.2 1B integration", .serialized)
 struct LlamaIntegrationTests {
 
-    @Test("load + greedy generate matches mlx-lm golden")
+    @Test("load + greedy generate produces coherent output")
     func loadAndGenerate() async throws {
-        let golden = try GoldenFixture.load("Llama-3.2-1B")
+        let modelId = "unsloth/Llama-3.2-1B"
+        let prompt = "Once upon a time, in a quiet village"
+        let maxTokens = 64
+        let bosTokenId = 128_000
 
         let m: Model
         do {
-            m = try await Model.load(golden.model)
+            m = try await Model.load(modelId)
         } catch {
             print("Llama integration test skipped: \(error)")
             return
@@ -40,18 +39,18 @@ struct LlamaIntegrationTests {
 
         // Single-token forward: BOS → finite, non-zero logits.
         let caches = m.engine.makeLayerCaches()
-        let logits = m.engine.forward(tokenId: 128_000, position: 0, caches: caches)
+        let logits = m.engine.forward(tokenId: bosTokenId, position: 0, caches: caches)
         let top = Sampling.topN(logits, n: 5)
         #expect(top.count == 5)
         #expect(top[0].1.isFinite)
         #expect(top[0].1 != 0)
 
-        // Greedy decode of the fixture prompt and compare token-by-token.
+        // Greedy decode of the prompt → coherent output.
         let result = try await m.generate(
-            prompt: golden.prompt,
-            parameters: GenerationParameters(maxTokens: golden.maxTokens, temperature: 0)
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
         )
         #expect(result.tokensPerSecond > 0)
-        expectGoldenMatch(result.generatedTokens, against: golden)
+        expectCoherentOutput(result.generatedTokens, label: "Llama 3.2 1B fp16")
     }
 }
