@@ -63,9 +63,23 @@ public final class SafeTensorsFile: @unchecked Sendable {
     }
 
     public let url: URL
-    public let mappedBase: UnsafeMutableRawPointer
-    public let mappedLength: Int
     public let entries: [String: Entry]
+
+    /// The mmap is held only while we copy each tensor's bytes into a
+    /// freshly-allocated `MTLBuffer` (the copy is unavoidable because
+    /// `makeBuffer(bytesNoCopy:)` needs 16 KiB page-aligned pointers
+    /// and safetensors offsets aren't aligned). Once every entry is
+    /// copied, the mmap has no callers and we `munmap` immediately —
+    /// otherwise we'd retain the file's virtual-address footprint for
+    /// the whole life of the `SafeTensorsFile`, which can be tens of
+    /// GB for a quantized checkpoint.
+    private var mappedBase: UnsafeMutableRawPointer?
+    private var mappedLength: Int = 0
+
+    /// Test-visible: `true` if init finished without munmap'ing the
+    /// region (a bug — see `Phase C #3` post-mortem). Production
+    /// expects this to be `false` after a successful `init`.
+    internal var isMmapRetained: Bool { mappedBase != nil }
 
     public init(url: URL, device: Device = .shared) throws {
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -163,14 +177,27 @@ public final class SafeTensorsFile: @unchecked Sendable {
                                  shape: shape, buffer: perTensorBuf)
         }
 
+        // All tensor bytes have been copied into MTLBuffers above; the
+        // mmap is no longer referenced by anything. Drop it now rather
+        // than holding it until `deinit` — for a 10 GB quantized
+        // checkpoint that's 10 GB of virtual address space freed
+        // immediately after load.
+        munmap(mapped, totalBytes)
+
         self.url = url
-        self.mappedBase = mapped
-        self.mappedLength = totalBytes
+        self.mappedBase = nil
+        self.mappedLength = 0
         self.entries = parsed
     }
 
     deinit {
-        munmap(mappedBase, mappedLength)
+        // Defensive — under the current code path the mmap is unmap'd
+        // at the end of init, so this is a no-op. Kept in case a
+        // future change introduces a path that holds the mapping past
+        // init (e.g. for true zero-copy when page-alignment lands).
+        if let base = mappedBase, mappedLength > 0 {
+            munmap(base, mappedLength)
+        }
     }
 
     /// Get a Tensor view over a named entry (no copy). Each tensor has
