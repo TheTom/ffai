@@ -18,7 +18,7 @@ struct OpsTests {
         }
     }
 
-    @Test("mul f32 — c[i] = a[i] * b[i]", .disabled("bisect"))
+    @Test("mul f32 — c[i] = a[i] * b[i]")
     func mulF32() {
         autoreleasepool {
             let a = Tensor.empty(shape: [4], dtype: .f32)
@@ -31,7 +31,7 @@ struct OpsTests {
         }
     }
 
-    @Test("silu f32 — out[i] = x / (1 + exp(-x))", .disabled("bisect"))
+    @Test("silu f32 — out[i] = x / (1 + exp(-x))")
     func siluF32() {
         autoreleasepool {
             let x = Tensor.empty(shape: [4], dtype: .f32)
@@ -50,7 +50,7 @@ struct OpsTests {
         }
     }
 
-    @Test("gather f32 — picks the right rows", .disabled("bisect"))
+    @Test("gather f32 — picks the right rows")
     func gatherF32() {
         autoreleasepool {
             // table[3, 2] = [[10,11], [20,21], [30,31]]
@@ -65,7 +65,7 @@ struct OpsTests {
         }
     }
 
-    @Test("gemv f32 — out[i] = sum_j W[i,j] * x[j]", .disabled("bisect"))
+    @Test("gemv f32 — out[i] = sum_j W[i,j] * x[j]")
     func gemvF32() {
         autoreleasepool {
             // W [3, 2] = [[1,2], [3,4], [5,6]]
