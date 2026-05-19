@@ -43,7 +43,39 @@ passed directly to `ffai` (`ffai -m … -p …` is equivalent to
 | Subcommand | One-liner | More |
 |---|---|---|
 | `generate` (default) | Stream a single prompt's continuation to stdout. | `ffai generate --help` |
+| `inspect` | Load a model and dump architecture + tokenization + top-K logits for a fixed probe prompt. The first thing to reach for when a new model produces broken output. | `ffai inspect --help` |
 | `bench` | Run a benchmark method against a model, append to a per-day report. | [benchmarking.md](benchmarking.md) |
+
+### `inspect` — model bring-up diagnostic
+
+When a new model checkpoint isn't producing coherent text, run
+`ffai inspect <repo>` before anything else. The output is structured
+in five sections:
+
+1. **Architecture** — family + dtype + every shape the loader inferred from
+   `config.json` (hidden / nLayers / nHeads / nKVHeads / head_dim / vocab
+   / max_position_embeddings). Tells you instantly whether the loader
+   parsed the right config.
+2. **Capabilities** — what the family declares it can do vs what
+   `LoadOptions` enabled.
+3. **Tokenizer** — per-token decode of a fixed prompt. Catches
+   tokenization regressions (wrong special-token IDs, missing merges,
+   model-vs-tokenizer mismatch) at a glance.
+4. **KV cache** — bytes allocated, per-layer stride, eviction policy.
+   For Gemma 3 / GPT-OSS, per-layer eviction shows up here.
+5. **Top-K next-token logits** — runs prefill and prints the K
+   most-likely continuations of the probe prompt. NaN logits get
+   flagged with a debug-checklist hint; values are model-comparable
+   (e.g. for `Once upon a time, in a quiet` you want to see `" village"`,
+   `" little"`, `" forest"`, `" valley"`, not `"<pad>"`).
+
+```bash
+ffai inspect -m mlx-community/gemma-3-1b-it-bf16 -p "Once upon a time, in a quiet"
+# → top-5: " village" +34.0, " little" +31.25, " valley" +29.88, …
+```
+
+Pair with `--debug` (per-subsystem trace dump) and `--profiling 1`
+(wallclock breakdown) for full visibility into where a problem hides.
 
 Common cross-cutting flags (`--stats`, `--debug`, `--profiling`) are
 documented in [observability.md](observability.md).
