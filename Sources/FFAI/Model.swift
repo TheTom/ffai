@@ -46,6 +46,26 @@ public enum ModelRegistry {
             return try loadLlama(config: config, weights: weights,
                                  options: options, device: device)
         }
+        // Mistral and Llama share the same weight layout + forward shape.
+        // The Mistral family enum routes through the Llama loader so
+        // every Mistral 7B / Nemo / Small checkpoint Just Works without
+        // a separate dense engine.
+        if let arch = config.architecture, Mistral.architectures.contains(arch) {
+            return try loadLlama(config: config, weights: weights,
+                                 options: options, device: device)
+        }
+        if let mt = config.modelType, Mistral.modelTypes.contains(mt) {
+            return try loadLlama(config: config, weights: weights,
+                                 options: options, device: device)
+        }
+        if let arch = config.architecture, Phi.architectures.contains(arch) {
+            return try loadPhi(config: config, weights: weights,
+                               options: options, device: device)
+        }
+        if let mt = config.modelType, Phi.modelTypes.contains(mt) {
+            return try loadPhi(config: config, weights: weights,
+                               options: options, device: device)
+        }
         if let arch = config.architecture, Qwen3.architectures.contains(arch) {
             return try loadQwen3(config: config, weights: weights,
                                  options: options, device: device)
@@ -85,6 +105,19 @@ public enum ModelRegistry {
         options: LoadOptions, device: Device
     ) throws -> Loaded {
         let variant = try Qwen3.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
+    public static func loadPhi(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Phi.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
