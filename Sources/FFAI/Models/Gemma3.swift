@@ -356,6 +356,67 @@ private func floatToBf16Bits(_ f: Float) -> UInt16 {
     return UInt16(truncatingIfNeeded: rounded)
 }
 
+// ─── Test-only re-exports ────────────────────────────────────────────
+//
+// The bf16 / f16 conversion helpers above are file-private, but the
+// Gemma 3 fold + embed-scale path is the most likely first-light bug
+// site. Expose them via `…ForTest` shims so Tests/ can pin the
+// round-trip math without forcing the implementation into the public
+// FFAI surface.
+//
+// Keep these strictly testing-related — they're not part of the
+// library's exported API and may move when the proper f16 / bf16
+// dtype helpers consolidate (Phase 6.x).
+
+public func bf16BitsToFloatForTest(_ bits: UInt16) -> Float {
+    bf16BitsToFloat(bits)
+}
+public func floatToBf16BitsForTest(_ f: Float) -> UInt16 {
+    floatToBf16Bits(f)
+}
+public func halfBitsToFloatForTest(_ bits: UInt16) -> Float {
+    halfBitsToFloat(bits)
+}
+public func floatToHalfBitsForTest(_ f: Float) -> UInt16 {
+    floatToHalfBits(f)
+}
+public func fillScalarForTest(_ t: Tensor, scalar: Float, dtype: DType) {
+    fillScalar(t, scalar: scalar, dtype: dtype)
+}
+/// Mirrors the dtype-dispatch loop inside `loadGemmaRMSNorm` so tests
+/// can verify the +1 fold round-trip against a synthetic input buffer
+/// without going through SafeTensors. Returns a fresh shared-storage
+/// MTLBuffer holding the folded values.
+public func gemmaFoldRMSNormForTest(
+    inputBuf: MTLBuffer, count n: Int, dtype: DType, device: Device
+) -> MTLBuffer {
+    let bytes = n * dtype.byteSize
+    let outBuf = device.makeBuffer(length: bytes)
+    let srcPtr = inputBuf.contents()
+    let dstPtr = outBuf.contents()
+    switch dtype {
+    case .f32:
+        let src = srcPtr.bindMemory(to: Float.self, capacity: n)
+        let dst = dstPtr.bindMemory(to: Float.self, capacity: n)
+        for i in 0..<n { dst[i] = src[i] + 1.0 }
+    case .f16:
+        let src = srcPtr.bindMemory(to: UInt16.self, capacity: n)
+        let dst = dstPtr.bindMemory(to: UInt16.self, capacity: n)
+        for i in 0..<n {
+            dst[i] = floatToHalfBits(halfBitsToFloat(src[i]) + 1.0)
+        }
+    case .bf16:
+        let src = srcPtr.bindMemory(to: UInt16.self, capacity: n)
+        let dst = dstPtr.bindMemory(to: UInt16.self, capacity: n)
+        for i in 0..<n {
+            dst[i] = floatToBf16Bits(bf16BitsToFloat(src[i]) + 1.0)
+        }
+    default:
+        fatalError("gemmaFoldRMSNormForTest: unsupported dtype \(dtype)")
+    }
+    return outBuf
+}
+
 // MARK: - Gemma3Layer
 
 public final class Gemma3Layer: Module {
