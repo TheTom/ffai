@@ -101,10 +101,17 @@ resources.
   emit pipeline is agnostic — both folders feed the same
   `kernels.metallib` + `manifest.json` + `MetalTileKernels.swift`
   outputs.
-- **No CPU interpreter.** The previous `metaltile-interp` crate is
-  being dropped; correctness verification runs on the Apple Silicon
-  GPU via either MLX side-by-side (`mlx/` kernels) or FFAI integration
-  tests on real models (`ffai/` kernels).
+- **No CPU interpreter.** The `metaltile-interp` crate was dropped
+  in upstream PRs #16 / #17. Correctness verification now runs through
+  three layers on the Apple Silicon GPU:
+  (1) per-kernel `<kernel>_gpu_correctness.rs` tests under
+  `crates/metaltile-std/tests/` comparing against a naive CPU
+  reference in fp32 (pattern from PR #35);
+  (2) MLX side-by-side via `tile bench` + `check_equiv` for `mlx/`
+  kernels with an upstream counterpart;
+  (3) FFAI integration tests on real models for `ffai/` kernels.
+  Codegen-side text diffs are caught by `insta` MSL golden snapshots
+  under `crates/metaltile-codegen/tests/snapshots/` (PR #25).
 
 ---
 

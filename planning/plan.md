@@ -56,23 +56,31 @@ No JIT compilation at runtime. No Rust at runtime. No `MLX*` imports.
 
 ## Quality bar
 
-**Test coverage: 100% line coverage of FFAI + MetalTileSwift Swift code.**
-Measured via `swift test --enable-code-coverage` and the `xccov` /
-`llvm-cov` toolchain. CI fails any PR that drops coverage below the
-configured threshold. Phase 0 sets up the tooling; every subsequent
-phase adds tests alongside code, not after.
+**Test coverage: ≥ 80 % line coverage on FFAI + MetalTileSwift Swift
+code (was 100 % aspirational; the realised gate is the 80 % ratchet in
+ci.yml).** Measured via `swift test --enable-code-coverage` driven
+through `make coverage` / `scripts/coverage.sh` (matches ci.yml). CI
+fails any PR that drops coverage below the ratchet. Every phase adds
+tests alongside code, not after.
 
-**What "100%" means here:**
+**What the quality bar means here:**
 
 - Every public function: at least one happy-path test
 - Every branch in business logic: at least one test per side
-- Every kernel in metaltile: correctness test against either an
-  MLX side-by-side reference (kernels under `metaltile-std/src/mlx/`,
-  via `tile bench` + `check_equiv`) or an FFAI integration test that
-  exercises the kernel on a real model (kernels under
-  `metaltile-std/src/ffai/`, no MLX upstream counterpart). The
-  `metaltile-interp` CPU interpreter crate is being dropped in
-  favour of these two paths.
+- Every kernel in metaltile: a paired GPU correctness test under
+  `crates/metaltile-std/tests/<kernel>_gpu_correctness.rs` comparing
+  against a naive CPU reference (pattern from
+  [TheTom PR #35](https://github.com/0xClandestine/metaltile/pull/35)),
+  **plus** an MLX side-by-side check when the kernel has an upstream
+  counterpart (kernels under `metaltile-std/src/mlx/`, via `tile bench`
+  + `check_equiv`), **plus** an FFAI integration test that exercises
+  the kernel on a real model (kernels under `metaltile-std/src/ffai/`
+  where there's no MLX upstream counterpart). The `metaltile-interp`
+  CPU interpreter crate is gone (dropped in PRs #16 / #17); GPU
+  correctness + MLX side-by-side are the two correctness paths now.
+- Every codegen emit path: `insta` MSL golden snapshot under
+  `crates/metaltile-codegen/tests/msl_snapshots.rs` (pattern from
+  [PR #25](https://github.com/0xClandestine/metaltile/pull/25)).
 - Every model: token-by-token determinism test against a reference
   for at least one prompt + seed combination
 
@@ -88,15 +96,23 @@ phase adds tests alongside code, not after.
 **Test layout:**
 
 ```
-Tests/
-  MetalTileSwiftTests/   # one test file per kernel
-  FFAITests/             # Tensor, Module, Linear, KVCache, Sampling, …
-  ModelTests/            # one folder per model (Llama, Qwen3, …) with
-                         # forward-pass determinism + token-output tests
+metaltile/
+  crates/metaltile-codegen/tests/msl_snapshots.rs   # insta MSL goldens
+  crates/metaltile-codegen/tests/snapshots/         # .snap files
+  crates/metaltile-std/tests/<kernel>_gpu_correctness.rs  # one per non-trivial kernel
+  crates/metaltile/tests/error/*.rs                 # trybuild compile-fail fixtures
+
+FFAI/
+  Tests/MetalTileSwiftTests/   # PSO manifest + per-kernel Swift wrapper smoke
+  Tests/FFAITests/             # Tensor, Module, Linear, KVCache, Sampling, … (parallel-safe)
+  Tests/ModelTests/            # one folder per model — forward-pass determinism
+                               # vs mlx-lm / mlx-vlm golden fixture (serialized)
 ```
 
 Every PR that adds production code without corresponding tests is
-rejected at review. CI publishes coverage diff per PR.
+rejected at review. CI publishes coverage diff per PR. See
+[`CLAUDE.md`](../CLAUDE.md#tooling-cheat-sheet--local-dev-loop) for the
+dev-loop cheat-sheet.
 
 ---
 
@@ -223,8 +239,16 @@ Swift dispatch, with the SPM build plugin auto-invoking the emit step.
     Phase 0 surface; subsequent phases maintain it)
   - `scripts/coverage.sh` to print local coverage summary
 - **CI:**
-  - `.github/workflows/ci.yml` — Apple Silicon runner, runs `swift
-    test`, uploads coverage report, fails on coverage drop
+  - `.github/workflows/ci.yml` — Apple Silicon runner. Runs
+    `swift test --enable-code-coverage --filter "FFAITests|MetalTileSwiftTests"`
+    (unit suite only; mirrors `make test-unit`). Uploads coverage
+    report, fails on coverage drop. Integration tests are deliberately
+    excluded from PR CI — they download multi-GB HF snapshots and
+    OOM the 7 GB runner; release.yml runs them right before tagging.
+  - `.github/workflows/release.yml` — Apple Silicon runner. Runs both
+    `swift test … --filter "FFAITests|MetalTileSwiftTests"` and
+    `swift test … --filter "ModelTests" --parallel --num-workers 1`
+    (matches `make test-integration`) right before cutting a release.
   - `.github/workflows/auto-label.yml` — conventional-commit PR
     labeling (adapted from mlx-swift-lm)
   - `.github/release.yml` — release notes categorization
@@ -236,8 +260,12 @@ Swift dispatch, with the SPM build plugin auto-invoking the emit step.
   - `scripts/verify-docs.sh` — `swift package generate-documentation
     --warnings-as-errors` over each library target
   - `scripts/coverage.sh` — local coverage summary via `llvm-cov`
-  - `Makefile` — common targets: `build`, `test`, `clean`,
-    `regenerate-kernels`, `coverage`, `format`
+  - `Makefile` — common targets: `build`, `build-release`, `test`,
+    `test-unit`, `test-integration`, `clean`, `regenerate-kernels`,
+    `coverage`, `format`, `format-check`, `docs`. The `test-unit` /
+    `test-integration` split mirrors `.github/workflows/{ci,release}.yml`
+    — integration tests are gated to `--parallel --num-workers 1` so
+    only one HuggingFace snapshot is GPU-resident at a time.
   - `.swift-format` — copied verbatim from mlx-swift-lm
   - `.pre-commit-config.yaml` — copied verbatim
   - `.spi.yml` — Swift Package Index docs config, FFAI targets
