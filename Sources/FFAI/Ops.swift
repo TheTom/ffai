@@ -1406,16 +1406,20 @@ public enum Ops {
     /// into `packed_out`, and writes the norm-correction factor to
     /// `norms_out`. One threadgroup per row, `dim` threads per group.
     ///
-    /// Per-bit-width dispatch — `bits ∈ {2, 3, 4, 8}` use the
-    /// generated `aura_encode_int{2,3,4,8}_f32` kernel; the encode
-    /// kernel is f32-only (input promotion is the caller's job).
+    /// `input` accepts f32 / f16 / bf16 — the kernel casts to f32 at
+    /// the load, so production code can feed the K/V projection
+    /// directly without an explicit upcast pass. `rotation`,
+    /// `boundaries`, and `codebook` are always f32 (precision matters
+    /// for the rotation matmul + Lloyd-Max boundary comparisons).
+    ///
+    /// Per-(bits, dtype) dispatch. `bits ∈ {2, 3, 4, 8}` × dtype ∈
+    /// {f32, f16, bf16} → 12 generated kernel variants.
     public static func auraEncode(
         input: Tensor, rotation: Tensor, boundaries: Tensor, codebook: Tensor,
         packedOut: Tensor, normsOut: Tensor,
         rows: Int, dim: Int, packedWidth: Int, bits: Int,
         on cmd: MTLCommandBuffer
     ) {
-        precondition(input.dtype == .f32, "Ops.auraEncode: input must be f32 (got \(input.dtype))")
         precondition(rotation.dtype == .f32 && boundaries.dtype == .f32 && codebook.dtype == .f32,
                      "Ops.auraEncode: rotation/boundaries/codebook must be f32")
         precondition(packedOut.dtype == .u32, "Ops.auraEncode: packed_out must be u32")
@@ -1425,53 +1429,69 @@ public enum Ops {
             preconditionFailure("Ops.auraEncode: \(reason)")
         }
         // One threadgroup per row; `dim` threads per group (each thread
-        // owns one rotated coordinate). Reduction-mode kernels declare
-        // their own grid via `tgid_x` + `tid`.
-        let grid = MTLSize(width: dim, height: rows, depth: 1)
+        // owns one rotated coordinate). The kernel reads
+        // `row = program_id::<0>() = tgid_x`. We dispatch `rows * dim`
+        // total threads in a 1D grid so Metal slices into `rows`
+        // threadgroups of `dim` threads — that gives `tgid_x` the row
+        // index we want.
+        //
+        // The earlier shape `(dim, rows, 1)` with `dispatchThreads`
+        // computed threadgroups as `(1, rows, 1)`, making `tgid_x` always
+        // 0 and processing only row 0. Latent because no production
+        // caller existed; AURAQuantizedKVCache is the first.
+        let grid = MTLSize(width: dim * rows, height: 1, depth: 1)
         let tg = MTLSize(width: dim, height: 1, depth: 1)
-        switch bits {
-        case 2:
-            MetalTileKernels.aura_encode_int2_f32(
-                input: input.buffer, inputOffset: input.offset,
-                rotation: rotation.buffer, rotationOffset: rotation.offset,
-                boundaries: boundaries.buffer, boundariesOffset: boundaries.offset,
-                codebook: codebook.buffer, codebookOffset: codebook.offset,
-                packed_out: packedOut.buffer, packed_outOffset: packedOut.offset,
-                norms_out: normsOut.buffer, norms_outOffset: normsOut.offset,
-                dim: UInt32(dim), packed_width: UInt32(packedWidth),
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        case 3:
-            MetalTileKernels.aura_encode_int3_f32(
-                input: input.buffer, inputOffset: input.offset,
-                rotation: rotation.buffer, rotationOffset: rotation.offset,
-                boundaries: boundaries.buffer, boundariesOffset: boundaries.offset,
-                codebook: codebook.buffer, codebookOffset: codebook.offset,
-                packed_out: packedOut.buffer, packed_outOffset: packedOut.offset,
-                norms_out: normsOut.buffer, norms_outOffset: normsOut.offset,
-                dim: UInt32(dim), packed_width: UInt32(packedWidth),
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        case 4:
-            MetalTileKernels.aura_encode_int4_f32(
-                input: input.buffer, inputOffset: input.offset,
-                rotation: rotation.buffer, rotationOffset: rotation.offset,
-                boundaries: boundaries.buffer, boundariesOffset: boundaries.offset,
-                codebook: codebook.buffer, codebookOffset: codebook.offset,
-                packed_out: packedOut.buffer, packed_outOffset: packedOut.offset,
-                norms_out: normsOut.buffer, norms_outOffset: normsOut.offset,
-                dim: UInt32(dim), packed_width: UInt32(packedWidth),
-                gridSize: grid, threadgroupSize: tg, on: cmd)
-        case 8:
-            MetalTileKernels.aura_encode_int8_f32(
-                input: input.buffer, inputOffset: input.offset,
-                rotation: rotation.buffer, rotationOffset: rotation.offset,
-                boundaries: boundaries.buffer, boundariesOffset: boundaries.offset,
-                codebook: codebook.buffer, codebookOffset: codebook.offset,
-                packed_out: packedOut.buffer, packed_outOffset: packedOut.offset,
-                norms_out: normsOut.buffer, norms_outOffset: normsOut.offset,
-                dim: UInt32(dim), packed_width: UInt32(packedWidth),
-                gridSize: grid, threadgroupSize: tg, on: cmd)
+        let dimU = UInt32(dim)
+        let pwU = UInt32(packedWidth)
+
+        // Per-(bits, dtype) routing. The kernel layout, argument order,
+        // and grid shape are identical across all 12 variants — only the
+        // function name changes — so a small local helper keeps the
+        // switch readable.
+        @inline(__always)
+        func dispatchEncode(
+            _ kernel: (MTLBuffer, Int, MTLBuffer, Int, MTLBuffer, Int,
+                       MTLBuffer, Int, MTLBuffer, Int, MTLBuffer, Int,
+                       UInt32, UInt32, MTLSize, MTLSize, MTLCommandBuffer) -> Void
+        ) {
+            kernel(
+                input.buffer, input.offset,
+                rotation.buffer, rotation.offset,
+                boundaries.buffer, boundaries.offset,
+                codebook.buffer, codebook.offset,
+                packedOut.buffer, packedOut.offset,
+                normsOut.buffer, normsOut.offset,
+                dimU, pwU, grid, tg, cmd
+            )
+        }
+
+        switch (bits, input.dtype) {
+        case (2, .f32):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int2_f32(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (2, .f16):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int2_f16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (2, .bf16): dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int2_bf16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (3, .f32):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int3_f32(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (3, .f16):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int3_f16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (3, .bf16): dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int3_bf16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (4, .f32):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int4_f32(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (4, .f16):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int4_f16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (4, .bf16): dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int4_bf16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (8, .f32):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int8_f32(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (8, .f16):  dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int8_f16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
+        case (8, .bf16): dispatchEncode { i, io, r, ro, b, bo, c, co, p, po, n, no, d, pw, g, t, cmd in
+            MetalTileKernels.aura_encode_int8_bf16(input: i, inputOffset: io, rotation: r, rotationOffset: ro, boundaries: b, boundariesOffset: bo, codebook: c, codebookOffset: co, packed_out: p, packed_outOffset: po, norms_out: n, norms_outOffset: no, dim: d, packed_width: pw, gridSize: g, threadgroupSize: t, on: cmd) }
         default:
-            fatalError("Ops.auraEncode: unsupported bits=\(bits) (use 2 / 3 / 4 / 8)")
+            fatalError("Ops.auraEncode: unsupported (bits=\(bits), input.dtype=\(input.dtype))")
         }
     }
 

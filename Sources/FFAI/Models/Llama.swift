@@ -357,8 +357,43 @@ public final class LlamaModel: LanguageModel {
                     device: device
                 )
             }
-        case .auraQuantized:
-            fatalError("Llama: .auraQuantized cache not yet wired — pending AURAQuantizedKVCache + W_o rotation fold (Phase 5d.C follow-up).")
+        case .auraQuantized(let scheme):
+            // Build codec data once, share across layers. Identity
+            // rotation for first-light — see AURAQuantizedKVCache
+            // header for the SRHT+W_o-fold follow-up.
+            let rotationData = AURARotation.identityMatrix(dim: headDim)
+            let rotation = Tensor.empty(shape: [headDim, headDim], dtype: .f32, device: device)
+            rotation.copyIn(from: rotationData)
+
+            let kCodebookData = AURACodebook.centroids(dim: headDim, bits: scheme.keyBits)
+            let kBoundariesData = AURACodebook.boundaries(dim: headDim, bits: scheme.keyBits)
+            let vCodebookData = AURACodebook.centroids(dim: headDim, bits: scheme.valueBits)
+            let vBoundariesData = AURACodebook.boundaries(dim: headDim, bits: scheme.valueBits)
+
+            let kCodebook = Tensor.empty(shape: [kCodebookData.count], dtype: .f32, device: device)
+            kCodebook.copyIn(from: kCodebookData)
+            let kBoundaries = Tensor.empty(shape: [kBoundariesData.count], dtype: .f32, device: device)
+            kBoundaries.copyIn(from: kBoundariesData)
+            let vCodebook = Tensor.empty(shape: [vCodebookData.count], dtype: .f32, device: device)
+            vCodebook.copyIn(from: vCodebookData)
+            let vBoundaries = Tensor.empty(shape: [vBoundariesData.count], dtype: .f32, device: device)
+            vBoundaries.copyIn(from: vBoundariesData)
+
+            let sharedK = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            let sharedV = Tensor.empty(shape: [nKVHeads, cap, headDim],
+                                       dtype: dtype, device: device)
+            return (0..<nLayers).map { _ in
+                AURAQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: cap,
+                    dtype: dtype, scheme: scheme,
+                    rotation: rotation,
+                    kCodebook: kCodebook, kBoundaries: kBoundaries,
+                    vCodebook: vCodebook, vBoundaries: vBoundaries,
+                    sharedWorkingK: sharedK, sharedWorkingV: sharedV,
+                    device: device
+                )
+            }
         }
     }
 
