@@ -292,8 +292,8 @@ Run from each repo's root (metaltile vs FFAI rows distinguished in the table).
 | metaltile | Bench regression baseline | `make tile snap` then `make tile diff` | Reject perf regressions vs the saved baseline |
 | metaltile | GPU device info | `make tile device` | Confirm Metal version / native bf16 / Apple-family flag |
 | FFAI | Kernel refresh | `make regenerate-kernels` | Pulls metaltile worktree, emits MSL + Swift wrappers into `Sources/MetalTileSwift/` |
-| FFAI | Unit gate | `make test-unit` | `FFAITests` + `MetalTileSwiftTests`, serialized locally (see Makefile header on the GPU-freeze workaround) |
-| FFAI | Unit gate (parallel) | `make test-unit-parallel` | OPT-IN. May freeze the box on this hardware — for triage only |
-| FFAI | Integration gate | `make test-integration` | `ModelTests` with `--parallel --num-workers 1`; mirrors release.yml |
+| FFAI | Unit gate | `make test-unit` | `FFAITests` + `MetalTileSwiftTests` at `FFAI_MAX_COMMAND_BUFFERS=16` (production parity) |
+| FFAI | Integration gate | `make test-integration` | `ModelTests` at production cap + `--parallel --num-workers 1` for memory pressure; mirrors release.yml |
 | FFAI | Full gate | `make test` | Both in sequence |
+| FFAI | Stress canary | `make test-stress` | Production cap with uncapped parallelism; run after touching dispatch code |
 | FFAI | Coverage | `make coverage` | Unit suite coverage instrumentation (matches ci.yml's coverage step) |

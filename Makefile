@@ -51,80 +51,71 @@ regenerate-kernels: ## run `tile build --emit all` to regenerate metallib + Swif
 
 # ─── Test ─────────────────────────────────────────────────────────────
 #
-# Three layers prevent the parallel-test GPU pile-up that crashed the
-# WindowServer pre-mitigation:
+# Production-parity defaults. The 2026-05-19 GPU-pin root cause —
+# wrong-dispatch-shape Ops wrappers — is fixed at the source (see the
+# post-mortem in papers/ and OpsValidation in Sources/FFAI/). Test
+# runs now use the same FFAI_MAX_COMMAND_BUFFERS=16 cap as production,
+# so anything that passes in CI is proven safe under production load.
 #
-#  1. **`FFAI_MAX_COMMAND_BUFFERS=1` for `make test-unit`.** Forces the
-#     shared MTLCommandQueue's max-in-flight depth to 1, which means
-#     Metal blocks the 2nd concurrent `makeCommandBuffer()` caller
-#     until the 1st cmdbuf completes. Because every GPU-touching test
-#     calls `cmd.waitUntilCompleted()` before returning, this gives us
-#     ACTUAL global GPU-access serialization across parallel suites
-#     without writing any async-lock plumbing. The cap-of-1 only
-#     affects this test invocation; production keeps the default 16.
+# Defense in depth still in place:
 #
-#     Why this works where `.serialized` (per-suite trait) doesn't:
-#     `.serialized` only orders tests WITHIN a suite. Swift Testing
-#     still runs different @Suite types concurrently, and there's no
-#     CLI flag that disables that. The Metal-layer cap doesn't care
-#     who the callers are — it sees `makeCommandBuffer()` calls and
-#     blocks the surplus.
+#  1. **OpsValidation** preconditions on every reduction-mode wrapper.
+#     Catches degenerate dispatch shapes (wrong head_dim, wrong n,
+#     etc.) before the kernel ever launches.
 #
 #  2. **Thread-safe shared state.** PSOCache uses single-flight
-#     compilation (compileLock) so two parallel suites can't both
-#     compile the same PSO and produce a corrupted pipeline. BufferPool
-#     uses NSLock. See PSOCache.swift + BufferPool.swift for the
-#     specifics.
+#     compilation (compileLock) so parallel suites can't both compile
+#     the same PSO. BufferPool uses NSLock. See PSOCache.swift +
+#     BufferPool.swift.
 #
 #  3. **ModelLoadLock** (Tests/ModelTests/ModelLoadLock.swift) — global
-#     async mutex around `Model.load(...)`. Different concern from
-#     GPU access: model load is heavy on RAM + disk-IO + GPU memory
-#     allocation BEFORE any cmdbuf exists, so the queue cap doesn't
-#     apply. The lock makes Model.load() a global critical section so
-#     only one multi-GB checkpoint is loading at a time.
-#
-# Pure-Swift suites (no GPU) can run in parallel — the queue cap and
-# locks only matter when something actually dispatches. The Makefile
-# doesn't try to separate them; we let Swift Testing's default
-# scheduler do its thing and rely on the layers above to keep
-# GPU-touching parallel runs safe.
+#     async mutex around `Model.load(...)`. Different concern from GPU
+#     access: model load is heavy on RAM + disk-IO + GPU memory
+#     allocation BEFORE any cmdbuf exists. The lock makes Model.load()
+#     a global critical section so only one multi-GB checkpoint is
+#     loading at a time.
 #
 # Targets:
-# - `make test-unit`           — FFAITests + MetalTileSwiftTests with
-#                                FFAI_MAX_COMMAND_BUFFERS=1.
-# - `make test-unit-parallel`  — OPT-IN: drops the cap-of-1 to repro
-#                                pre-mitigation behavior for triage.
-# - `make test-integration`    — ModelTests with FFAI_MAX_COMMAND_BUFFERS=1
-#                                + ModelLoadLock. Matches release.yml.
-# - `make test`                — both in sequence.
+# - `make test-unit`         — FFAITests + MetalTileSwiftTests at the
+#                              production cap (FFAI_MAX_COMMAND_BUFFERS=16).
+# - `make test-integration`  — ModelTests at production cap + ModelLoadLock
+#                              + `--parallel --num-workers 1` (memory
+#                              pressure, not GPU). Matches release.yml.
+# - `make test`              — both in sequence.
+# - `make test-stress`       — canary; both suites at production cap with
+#                              integration parallelism uncapped. Run after
+#                              touching anything dispatch-related to
+#                              confirm production safety holds under
+#                              maximal parallel load.
 
 .PHONY: test
 test: regenerate-kernels test-unit test-integration ## run unit then integration test suites
 
 .PHONY: test-unit
-test-unit: regenerate-kernels ## unit + Metal tests; queue cap 1 forces serial GPU access
-	FFAI_MAX_COMMAND_BUFFERS=1 swift test --filter "FFAITests|MetalTileSwiftTests"
-
-.PHONY: test-unit-parallel
-test-unit-parallel: regenerate-kernels ## OPT-IN: triage; drops cap-of-1, hits pre-mitigation races
-	@echo "⚠️  Triage mode. Drops the queue-cap-of-1 guard. Reproduces the"
-	@echo "   PSOCache compile race / WindowServer starvation pre-mitigation."
-	@echo "   Use only when validating that the cap-of-1 in 'make test-unit'"
-	@echo "   is still required."
-	@echo ""
-	swift test --filter "FFAITests|MetalTileSwiftTests"
+test-unit: regenerate-kernels ## unit + Metal tests at production cap (FFAI_MAX_COMMAND_BUFFERS=16)
+	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "FFAITests|MetalTileSwiftTests"
 
 .PHONY: test-integration
-test-integration: regenerate-kernels ## end-to-end model tests; queue cap 1 + ModelLoadLock; matches release.yml
-	@# Queue cap of 1 forces serial GPU dispatch across parallel suites.
-	@# ModelLoadLock (Tests/ModelTests/ModelLoadLock.swift) separately
-	@# serializes Model.load() across suites so multi-GB checkpoints
-	@# load one at a time.
-	FFAI_MAX_COMMAND_BUFFERS=1 swift test --filter "ModelTests"
+test-integration: regenerate-kernels ## end-to-end model tests; production cap + ModelLoadLock; matches release.yml
+	@# ModelLoadLock (Tests/ModelTests/ModelLoadLock.swift) serializes
+	@# Model.load() across suites so multi-GB checkpoints load one at a
+	@# time. --num-workers 1 caps Swift Testing's cross-suite parallelism
+	@# to one model resident at a time (memory pressure, not GPU).
+	FFAI_MAX_COMMAND_BUFFERS=16 swift test --parallel --num-workers 1 --filter "ModelTests"
+
+.PHONY: test-stress
+test-stress: regenerate-kernels ## canary; production cap with uncapped parallelism — run after touching dispatch code
+	@echo "Stress mode. Running unit + integration at FFAI_MAX_COMMAND_BUFFERS=16"
+	@echo "with no --num-workers cap on integration. If anything regresses our"
+	@echo "wrapper-precondition / PSOCache / ModelLoadLock defenses, this is"
+	@echo "where it surfaces."
+	@echo ""
+	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "FFAITests|MetalTileSwiftTests"
+	FFAI_MAX_COMMAND_BUFFERS=16 swift test --filter "ModelTests"
 
 .PHONY: coverage
 coverage: ## swift test with coverage report (unit suite only, matches ci.yml)
-	FFAI_MAX_COMMAND_BUFFERS=1 ./scripts/coverage.sh
+	FFAI_MAX_COMMAND_BUFFERS=16 ./scripts/coverage.sh
 
 # ─── Lint / format ────────────────────────────────────────────────────
 .PHONY: format
