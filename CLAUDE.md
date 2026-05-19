@@ -89,24 +89,72 @@ The `metaltile-runtime` crate provides a few primitives that show up in producti
 ### Rust DSL philosophy
 
 - **Improve the compiler, don't hand-write MSL.** When the DSL can't express a kernel pattern, extend the codegen instead of bypassing it.
-- **Generics + macros for combinatorial variants** (bit widths, dtypes, group sizes). One generic `<T>` kernel beats five precision-specific copies. One `macro_rules!` body beats five hand-copied bit-width variants. Audit existing files for collapse opportunities whenever you touch them.
+- **Generics + macros for combinatorial variants** (bit widths, dtypes, group sizes). One generic `<T>` kernel beats five precision-specific copies. For non-generic axes (bit widths baked in as `literal` constants, fixed group sizes), wrap **the entire `#[kernel] fn` declaration + the `inventory::submit!` block** in an outer `macro_rules!` — never put a `macro_rules!` call *inside* a `#[kernel]` body. The `#[kernel]` proc-macro does not expand inner declarative macros; it sees them as opaque tokens, drops them, and silently emits an empty kernel body that `xcrun metal` accepts and that ships as all-zeros output. PR #19 on upstream metaltile shipped 37 such silently-emptied kernels (`dequant_gather`, `dequant_gemv`, `kv_cache`, `arg_reduce`, `sampling`); `ek/aura-port` `820b29c` restored them by reshaping to the outer-wrap pattern and `34300c8` added a proc-macro guard that errors on the inner-body shape — the guard is **not yet upstream**, so on `dev` the silent-drop hazard is still live (PR #50 rediscovered it independently).
 
-  **Do this:**
+  **Do this — wrap the whole kernel declaration + spec submission:**
   ```rust
-  macro_rules! dequant_gather_body {
-      ($bits:literal) => { /* one formula, bits as a literal */ };
+  macro_rules! dequant_gather_kernel {
+      ($name:ident, $bits:literal, $subop:literal) => {
+          #[kernel]
+          pub fn $name<T>(/* params */) {
+              // body uses $bits as a literal substitution — the compiler
+              // expands the outer macro BEFORE the #[kernel] proc-macro
+              // runs, so the body parser sees concrete tokens.
+              let bit_off = d * $bits;
+              // …
+          }
+          inventory::submit! { /* BenchSpec */ };
+      };
   }
-  #[kernel] pub fn dequant_gather_int3<T>(...) { dequant_gather_body!(3); }
-  #[kernel] pub fn dequant_gather_int4<T>(...) { dequant_gather_body!(4); }
-  #[kernel] pub fn dequant_gather_int8<T>(...) { dequant_gather_body!(8); }
+  dequant_gather_kernel!(dequant_gather_int3, 3u32, "int3");
+  dequant_gather_kernel!(dequant_gather_int4, 4u32, "int4");
+  dequant_gather_kernel!(dequant_gather_int8, 8u32, "int8");
   ```
 
-  **Not this:**
+  **Not this — inner macro inside the kernel body silently produces empty MSL:**
   ```rust
-  #[kernel] pub fn dequant_gather_int3<T>(...) { /* 60 lines hand-rolled int3 */ }
-  #[kernel] pub fn dequant_gather_int4<T>(...) { /* 60 lines hand-rolled int4 */ }
-  // …three more copies…
+  macro_rules! dequant_gather_body { ($bits:literal) => { /* … */ }; }
+  #[kernel] pub fn dequant_gather_int3<T>(/* params */) { dequant_gather_body!(3); }  // empty MSL
+  #[kernel] pub fn dequant_gather_int4<T>(/* params */) { dequant_gather_body!(4); }  // empty MSL
   ```
+
+  Canonical reference on `ek/aura-port`: [`crates/metaltile-std/src/ffai/dequant_gather.rs`](https://github.com/ekryski/metaltile/blob/ek/aura-port/crates/metaltile-std/src/ffai/dequant_gather.rs). Alternative reshape for hand-unrolled tree-reduction macros (`*_step!`) — replace with a DSL `for` loop over the halving strides; produces identical MSL and survives the proc-macro intact (see `ek/aura-port` `arg_reduce.rs` and `sampling.rs`).
+
+  Every kernel that uses macro composition must ship a paired GPU correctness test under `crates/metaltile-std/tests/`. `make emit-all OUT=/tmp/mt-smoke` is not sufficient on its own — empty kernel bodies compile cleanly and only manifest as wrong output at dispatch time.
+
+### Empty-body MSL — a recurring hazard, multiple root causes
+
+The macro-composition trap above (call it **class 1**) is one of at least two ways the codegen can ship a kernel whose MSL has a function header / loop header but no body. The symptom is identical: `xcrun metal` accepts the file, `make emit-all` smoke passes, the kernel dispatches without error, and the output buffer comes back all zeros. Treat the broad class with the same gravity as the dispatch-shape hazard — neither one fails loudly.
+
+**Class 2 — pass-ordering: loop header survives, body is eliminated.** metaltile commit `2971403` (`fix(const_fold): fold the entry block too, not just nested blocks`) is the canonical instance: `const_fold` walked only `kernel.blocks`, never `kernel.body`. A `BinOp(Div, Const(32), Const(8))` end-value in the entry block stayed rolled, which hid the trip count from `unroll`'s `find_const_in_block` (it looks for a direct `Op::Const`, not a still-rolled BinOp). `unroll` left the loop in the IR, but a later pass eliminated the body anyway — emitted MSL ended up with `for (uint i_0 = 0u; i_0 < v_dims_per_word; i_0 += 1u) { }` and `aura_dequant_rotated_int8_{f32,f16,bf16}` shipped as no-op stores. The unit-level `AURACodecRoundTripTests` round-trip error was ~0.07 (basically random) until the fix landed; post-fix it's 0.0004.
+
+The class-2 invariants for new / touched codegen passes:
+
+1. **A pass that "rewrites a block" must walk both `kernel.body` and every entry in `kernel.blocks`.** Anything that only iterates `kernel.blocks` is broken by construction — `kernel.body` is the entry block, not part of the map.
+2. **A pass that consumes a `Const` must be reachable after the pass that produces it.** When in doubt, run `make inspect-stats KERNEL=<name>` before and after the change and confirm the op-count delta matches your mental model.
+3. **A pass that removes a loop body must also remove the loop header.** If your DCE / fusion / unroll / vectorize leaves an `Op::Loop` whose body is empty, that's a bug — emit a no-op for the whole loop instead, or leave both intact.
+
+**Detection — works for both classes, run from either repo:**
+
+```sh
+# Regenerate kernels, then scan the entire emitted-MSL surface for empty
+# for-loop bodies and empty kernel function bodies. Either one is a bug.
+make regenerate-kernels    # FFAI side; or `make emit-all OUT=/tmp/mt-smoke` on metaltile
+
+awk '
+    /for \(.*\) \{$/                  { in_for=1; fname=FILENAME; lno=FNR; next }
+    in_for && /^[[:space:]]*\}$/      { print fname":"lno": empty for-loop body"; in_for=0; next }
+    in_for                            { in_for=0 }
+    /^kernel void [A-Za-z_0-9]+\(/    { in_kfn=1; fname=FILENAME; lno=FNR; next }
+    in_kfn && /^\{$/                  { next }
+    in_kfn && /^\}$/                  { print fname":"lno": empty kernel body"; in_kfn=0; next }
+    in_kfn                            { in_kfn=0 }
+' Sources/MetalTileSwift/Resources/kernels/*.metal
+```
+
+Empty output = clean. Any hit = ship-stopper; bisect with `make inspect-ir KERNEL=<name>` and `make inspect-stats KERNEL=<name>` to find which pass dropped the body.
+
+The **only** way a kernel survives both classes through review is a GPU correctness test under `crates/metaltile-std/tests/` that compares against a naive CPU oracle and a kernel-level round-trip test on the FFAI side (see `Tests/FFAITests/AURACodecRoundTripTests.swift` for the pattern). Both classes pass MSL-snapshot drift checks (snapshots pin the wrong-but-stable output), pass `xcrun metal` compilation, and pass any FFAI integration test whose coherence checker tolerates noise. They only fail when actual GPU output is compared to expected.
 
 ### Porting kernels from our `ekryski/mlx` fork
 
@@ -191,7 +239,7 @@ Three layers, no overlap:
 
 - **Rust DSL coverage target: 100%.** `make test` (in metaltile) exercises every codegen pass, body-parser arm, IR variant, and emit path. New DSL primitives ship with a regression test in `crates/metaltile-codegen/src/msl/mod.rs`. Use `make coverage` to run the `cargo-llvm-cov` workflow.
 - **Compile-fail tests via `trybuild`** assert that the proc-macro rejects malformed kernels with a useful error message. Live under `crates/metaltile/tests/error/` and `crates/metaltile/tests/compile_fail.rs`. New error paths in `metaltile-macros` ship with a trybuild fixture in the same commit.
-- **Codegen smoke via `make emit-all OUT=/tmp/mt-smoke`** — every registered kernel must produce MSL that `xcrun metal` accepts. The proc-macro errors on inner `macro_rules!` so silent-empty bodies can't recur (the regression from PR #19).
+- **Codegen smoke via `make emit-all OUT=/tmp/mt-smoke`** — every registered kernel must produce MSL that `xcrun metal` accepts. **Not sufficient on its own**: empty kernel bodies and empty for-loop bodies both compile cleanly (see "Empty-body MSL — a recurring hazard" above for the two known root causes, the class-2 `const_fold` fix in metaltile `2971403`, and the awk detector that catches both). Pair every macro-composed kernel *and* every kernel with a fold-able trip-count constant with a GPU correctness test under `crates/metaltile-std/tests/`.
 - **Per-pass IR sanity via `make inspect-stats KERNEL=<name>`** — useful when a kernel regresses to confirm which pass changed op-counts.
 
 **metaltile layer (1.5) — Golden MSL snapshots via `insta`:**
@@ -256,6 +304,13 @@ fn <kernel>_perf_bench_f32() {
 ```
 
 When porting a new kernel, the integration test lands in the **same commit** as the kernel. The naive CPU reference is the contract — if the kernel and reference disagree, decide which is wrong before merging. The `#[ignore]`'d perf bench is the per-kernel signal for regressions and the source of the GB/s numbers in commit messages / PR bodies.
+
+**Sniff-test perf curves before publishing.** Latencies that look "too flat to be physical" across input sizes that should scale linearly usually mean the harness is contaminating the measurement, not that the kernel is exceptional. PR #50 had a sliding-window SDPA "flat ~215 µs across n_kv" claim that turned out to be Q/K/V upload overhead drowning out kernel cost — switching to `Context::upload_resident()` for the static buffers dropped the floor to ~98 µs and exposed the real `n_kv / (window + sinks)` curve. Two harness fixes belong in every perf bench:
+
+- **Use `Context::upload_resident()` for inputs that don't change between iterations.** Anything reused across warmup + measure passes should live on the GPU once, bound by name via `DispatchSpec::resident`.
+- **Dummy-dispatch once at the start to pin the GPU clock.** Cold DVFS gives the first-printed shape a ~2× bandwidth deficit; `GpuRunner::new()` does this in `tile bench`, `tests/sdpa_decode_swa_gpu.rs` does it inline. Without it, the first row of any table is systematically wrong.
+
+Sibling lesson to the dispatch-shape post-mortem: when a harness is fast enough to hide overhead, it's also fast enough to hide the kernel.
 
 **Kernel speed + side-by-side MLX correctness via `make bench` (or `make bench-vv` for GPU timing)** — orthogonal to the per-kernel tests above; runs only for kernels with non-empty `shapes` + a real `BenchDispatch`. The runner dispatches both the metaltile kernel and the MLX reference on identical buffers and compares via `check_equiv`. Perf regressions show in `make tile diff` against the saved baseline; the JSON output carries a kernel-correctness summary.
 
