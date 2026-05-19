@@ -23,8 +23,22 @@ public protocol LanguageModel: Module {
     /// `[any LayerCacheProtocol]`.
     func makeLayerCaches(maxSeq: Int?, device: Device) -> [any LayerCacheProtocol]
 
-    /// Single-token forward pass. Returns logits [vocab].
-    func forward(tokenId: Int, position: Int, caches: [any LayerCacheProtocol], device: Device) -> Tensor
+    /// Queue a single-token forward pass onto an existing command
+    /// buffer. **Does not commit.** Returns the logits Tensor whose
+    /// contents become valid after `cmd` is committed and completes.
+    ///
+    /// This is the primitive every higher-level entry point composes:
+    /// `forward(...)` creates its own cmdbuf around this, `forwardSample`
+    /// queues the argmax on the same cmdbuf, `forwardSampleCategorical`
+    /// queues the categorical sampler on the same cmdbuf. Family files
+    /// implement this once and everything else gets the 1-cmdbuf
+    /// behaviour automatically — historically Llama and Qwen3 had to
+    /// hand-roll fused forwardSampleCategorical overrides to avoid the
+    /// 2-cmdbuf default path; with this protocol method, the default
+    /// is fast and overrides are unnecessary.
+    func forward(tokenId: Int, position: Int,
+                 caches: [any LayerCacheProtocol],
+                 on cmd: MTLCommandBuffer, device: Device) -> Tensor
 
     /// Forward + GPU argmax in one command buffer. Returns just the
     /// chosen token id (4-byte readback) — no full logits transfer.
@@ -37,12 +51,32 @@ public extension LanguageModel {
         makeLayerCaches(maxSeq: maxSeq, device: device)
     }
 
-    func forward(tokenId: Int, position: Int, caches: [any LayerCacheProtocol]) -> Tensor {
-        forward(tokenId: tokenId, position: position, caches: caches, device: .shared)
+    /// Default `forward(...)`: wraps `forward(...on cmd:)` in a fresh
+    /// command buffer, commits, waits. Returns logits.
+    func forward(tokenId: Int, position: Int,
+                 caches: [any LayerCacheProtocol], device: Device = .shared) -> Tensor {
+        let cmd = device.makeCommandBuffer()
+        let logits = forward(tokenId: tokenId, position: position,
+                             caches: caches, on: cmd, device: device)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return logits
     }
 
-    func forwardSample(tokenId: Int, position: Int, caches: [any LayerCacheProtocol]) -> Int {
-        forwardSample(tokenId: tokenId, position: position, caches: caches, device: .shared)
+    /// Default `forwardSample(...)`: queues forward + argmax on the
+    /// same command buffer; returns the chosen token id.
+    func forwardSample(tokenId: Int, position: Int,
+                       caches: [any LayerCacheProtocol],
+                       device: Device = .shared) -> Int {
+        let cmd = device.makeCommandBuffer()
+        let logits = forward(tokenId: tokenId, position: position,
+                             caches: caches, on: cmd, device: device)
+        let outBuf = device.makeBuffer(length: 4)
+        let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
+        Ops.argmax(logits, into: outT, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return Int(outBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
     }
 
     /// Forward + GPU softmax-categorical-sample for the pure-temperature
@@ -50,17 +84,22 @@ public extension LanguageModel {
     /// Logits never cross to CPU; only the chosen token id (4 bytes)
     /// flows back.
     ///
-    /// Default impl runs forward() then queues
-    /// `Ops.softmaxCategoricalSample` on a separate command buffer.
-    /// Family files can override to fuse into a single cmdbuf (TODO
-    /// follow-up for Llama / Qwen 3).
+    /// Queues forward + sampler on the SAME command buffer for a
+    /// 1-commit-per-token decode step. Mamba 2 (and any future model
+    /// family) gets this fused path automatically by implementing only
+    /// the primitive `forward(...on cmd:)`. Previously this default
+    /// used 2 cmdbufs (forward inside its own commit, then a separate
+    /// commit for the sampler); Llama and Qwen3 worked around it with
+    /// hand-rolled overrides which are now redundant.
     func forwardSampleCategorical(
         tokenId: Int, position: Int, caches: [any LayerCacheProtocol],
         temperature: Float, uniformDraw: Float,
         device: Device = .shared
     ) -> Int {
+        let cmd = device.makeCommandBuffer()
         let logits = forward(tokenId: tokenId, position: position,
-                             caches: caches, device: device)
+                             caches: caches, on: cmd, device: device)
+
         let tBuf = device.makeBuffer(length: 4)
         var tVal = temperature
         memcpy(tBuf.contents(), &tVal, 4)
@@ -73,11 +112,10 @@ public extension LanguageModel {
 
         let outBuf = device.makeBuffer(length: 4)
         let outT = Tensor(buffer: outBuf, offset: 0, shape: [1], dtype: .u32)
-
-        let cmd = device.makeCommandBuffer()
         Ops.softmaxCategoricalSample(logits, into: outT,
                                      temperature: temperatureT,
                                      uniform: uniformT, on: cmd)
+
         cmd.commit()
         cmd.waitUntilCompleted()
         return Int(outBuf.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
