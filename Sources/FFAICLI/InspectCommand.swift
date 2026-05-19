@@ -63,6 +63,14 @@ struct InspectCommand: AsyncParsableCommand {
             help: "Profiling level: 0 (off), 1 (wallclock breakdown), 2 (level 1 + os_signpost).")
     var profiling: Int = 0
 
+    @Flag(name: .long,
+          help: "Print per-layer intermediate-value stats (min/max/nan/inf + first 4 values) at every layer boundary during prefill. Slow — first-light debugging only. Sets FFAI_INSPECT_TAP=1.")
+    var layerTrace: Bool = false
+
+    @Option(name: .long,
+            help: "Comma-separated layer indices to trace. Only meaningful with --layer-trace. Example: --trace-layers 0,1,5,15")
+    var traceLayers: String?
+
     func run() async throws {
         if debug { Debug.enableAll() }
         guard let lvl = ProfileLevel(rawValue: profiling) else {
@@ -70,6 +78,16 @@ struct InspectCommand: AsyncParsableCommand {
         }
         Profile.shared.level = lvl
         Profile.shared.resetPhases()
+
+        // --layer-trace is a passthrough for FFAI_INSPECT_TAP — set
+        // the env var so every model.forward() the inspect command
+        // triggers picks it up from `InspectTap.fromEnvironment`.
+        if layerTrace {
+            setenv("FFAI_INSPECT_TAP", "1", 1)
+            if let layers = traceLayers {
+                setenv("FFAI_INSPECT_TAP_LAYERS", layers, 1)
+            }
+        }
 
         print("ffai \(FFAI.version) — inspecting \(model)")
 
@@ -147,6 +165,57 @@ struct InspectCommand: AsyncParsableCommand {
         print("│ roundtrip          \"\(roundtrip)\"")
         print("└────────────────────────────────────────────────────────")
 
+        // ─── Special tokens ────────────────────────────────────────
+        // Parsed from tokenizer_config.json + categorized so chat-
+        // template / tool-calling / multi-turn debugging starts here
+        // instead of with `cat tokenizer_config.json | jq`.
+        let tokInfo = inspectTokenizer(
+            modelDirectory: m.modelDirectory, config: m.config
+        )
+        print("")
+        print("┌─ Special Tokens ───────────────────────────────────────")
+        // BOS — union of config.bos_token_id + heuristically-detected
+        // BOS tokens (multiple shouldn't normally exist, but we union
+        // for symmetry).
+        let bosIds: [Int] = {
+            var s = Set<Int>()
+            if let b = tokInfo.bosTokenId { s.insert(b) }
+            for t in tokInfo.tokens(in: .bos) { s.insert(t.id) }
+            return s.sorted()
+        }()
+        printIdLine("BOS", ids: bosIds, model: m)
+        // EOS — union of config.eos_token_id (often [<|end_of_text|>])
+        // + every heuristic-matched end-of-turn token (Llama 3 declares
+        // <|eot_id|> and <|eom_id|> as added_tokens but only the base
+        // <|end_of_text|> in eos_token_id; the chat template uses the
+        // others to signal end of message / end of turn).
+        let eosIds: [Int] = {
+            var s = Set(tokInfo.eosTokenIds)
+            for t in tokInfo.tokens(in: .eos) { s.insert(t.id) }
+            return s.sorted()
+        }()
+        printIdLine("EOS / end-of-turn", ids: eosIds, model: m)
+        for category in SpecialTokenCategory.allCases where category != .bos && category != .eos {
+            let toks = tokInfo.tokens(in: category)
+            guard !toks.isEmpty else { continue }
+            let label = category.rawValue.padding(toLength: 17, withPad: " ", startingAt: 0)
+            let rendered = toks.prefix(6)
+                .map { "\($0.id) \"\($0.content)\"" }
+                .joined(separator: ", ")
+            let tail = toks.count > 6 ? " … (+\(toks.count - 6) more)" : ""
+            print("│ \(label) \(rendered)\(tail)")
+        }
+        if tokInfo.hasChatTemplate {
+            let markers = tokInfo.chatTemplateMarkers
+            let markersStr = markers.isEmpty
+                ? "(no recognized markers)"
+                : markers.joined(separator: ", ")
+            print("│ chat_template     present — mentions: \(markersStr)")
+        } else {
+            print("│ chat_template     (not present — caller must compose chat input manually)")
+        }
+        print("└────────────────────────────────────────────────────────")
+
         // ─── KV Cache layout ─────────────────────────────────────
         let caches = m.engine.makeLayerCaches()
         let bytesAllocated = caches.reduce(0) { $0 + $1.bytesAllocated }
@@ -201,6 +270,22 @@ struct InspectCommand: AsyncParsableCommand {
             print("")
             print(Profile.shared.phases.formatted())
         }
+    }
+
+    /// One row of the Special Tokens table for BOS / EOS — IDs
+    /// resolved to content strings via the tokenizer's
+    /// decode-with-specials path.
+    private func printIdLine(_ label: String, ids: [Int], model m: Model) {
+        let padded = label.padding(toLength: 17, withPad: " ", startingAt: 0)
+        if ids.isEmpty {
+            print("│ \(padded) (not declared)")
+            return
+        }
+        let parts: [String] = ids.map { id in
+            let decoded = m.tokenizer.decode(tokens: [id], skipSpecialTokens: false)
+            return "\(id) \"\(decoded)\""
+        }
+        print("│ \(padded) \(parts.joined(separator: ", "))")
     }
 
     // Pretty-print "1.34 GB" / "12.6 MB" / "2.3 kB" / "512 B".

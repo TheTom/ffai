@@ -63,7 +63,22 @@ in five sections:
    model-vs-tokenizer mismatch) at a glance.
 4. **KV cache** — bytes allocated, per-layer stride, eviction policy.
    For Gemma 3 / GPT-OSS, per-layer eviction shows up here.
-5. **Top-K next-token logits** — runs prefill and prints the K
+5. **Special tokens** — BOS / EOS / chat-turn / reasoning / tool-
+   calling / multimodal / utility tokens parsed from
+   `tokenizer_config.json` and bucketed by role. Shows the
+   `chat_template` markers when present. This is the first thing
+   to look at when a chat-template / tool-calling / multi-turn
+   loop is misbehaving:
+
+   ```
+   │ EOS / end-of-turn 128001 "<|end_of_text|>", 128008 "<|eom_id|>", 128009 "<|eot_id|>"
+   │ Chat turn         128006 "<|start_header_id|>", 128007 "<|end_header_id|>"
+   │ Reasoning         151667 "<think>", 151668 "</think>"
+   │ Tool calling      151657 "<tool_call>", 151658 "</tool_call>", …
+   │ chat_template     present — mentions: <|im_start|>, <|im_end|>, <think>, <tool_call>
+   ```
+
+6. **Top-K next-token logits** — runs prefill and prints the K
    most-likely continuations of the probe prompt. NaN logits get
    flagged with a debug-checklist hint; values are model-comparable
    (e.g. for `Once upon a time, in a quiet` you want to see `" village"`,
@@ -76,6 +91,29 @@ ffai inspect -m mlx-community/gemma-3-1b-it-bf16 -p "Once upon a time, in a quie
 
 Pair with `--debug` (per-subsystem trace dump) and `--profiling 1`
 (wallclock breakdown) for full visibility into where a problem hides.
+
+#### `--layer-trace` — per-layer intermediate-value dumps
+
+For deeper triage when the top-K logits come back NaN / corrupted,
+add `--layer-trace` and (optionally) `--trace-layers N,M,...` to
+print min/max/nan/inf/first-4 statistics at every layer boundary
+during prefill. Each model's `forward(...)` calls `InspectTap`
+(`Sources/FFAI/Inspect/InspectTap.swift`) at the layer-out
+boundary, so the trace is uniform across families:
+
+```bash
+ffai inspect -m <broken-model> --layer-trace --trace-layers 0,1,5,15
+# [L0 layer_out] n=1152 min=-1.52 max=+1.55 nan=0 inf=0 first=[...]
+# [L1 layer_out] n=1152 min=— max=— nan=1152 inf=0 first=[nan, nan, …]
+# ↑ Layer 1's output is all NaN — the bug is in layer 1's forward.
+```
+
+This is the diagnostic that found the Gemma 3 bf16 GELU NaN in two
+runs (one to localise the failing layer, one to confirm the fix).
+The taps are zero-cost when the flag isn't set — they're a single
+`if active` compare on the hot path. To wire them into a new model
+family, see [`developing/adding-a-model.md` § Inspect
+hooks](developing/adding-a-model.md#step-7--inspect-hooks).
 
 Common cross-cutting flags (`--stats`, `--debug`, `--profiling`) are
 documented in [observability.md](observability.md).

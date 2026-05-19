@@ -227,7 +227,88 @@ and dumps:
 
 Commit the fixtures with the model code.
 
-## Step 7 — add tests
+## Step 7 — wire inspect hooks
+
+`ffai inspect` is the first command every dev reaches for when a
+new model produces broken output. Every family file calls the
+shared `InspectTap` utility (`Sources/FFAI/Inspect/InspectTap.swift`)
+at layer boundaries inside `<Family>Model.forward(...)` so the
+`--layer-trace` diagnostic surface works uniformly across families.
+
+The pattern, lifted from `LlamaModel.forward` (the canonical
+reference — `Sources/FFAI/Models/Llama.swift`):
+
+```swift
+public func forward(tokenId: Int, position: Int,
+                    caches: [any LayerCacheProtocol],
+                    on cmd: MTLCommandBuffer, device: Device) -> Tensor {
+    // 1. Pick up the env-driven tap state. No-op when
+    //    FFAI_INSPECT_TAP isn't set — single bool compare per
+    //    boundary, no overhead on the production hot path.
+    let tap = InspectTap.fromEnvironment
+
+    // 2. When taps are active, route work onto a *private* cmdbuf
+    //    so per-op commit+wait sync points don't double-commit
+    //    the caller's cmd. `makeWorkCmd` returns the caller's
+    //    cmd unchanged in production mode.
+    var workCmd = tap.makeWorkCmd(from: cmd, device: device)
+
+    // 3. Embed lookup — tap fires at the residual stream that
+    //    feeds layer 0.
+    var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
+    tap.dumpLayerBoundary(h, label: "embed", layer: -1,
+                          cmd: &workCmd, device: device)
+
+    // 4. Per-layer forward — tap at the OUTPUT of each layer.
+    //    The first layer's input is the embed dump above; every
+    //    subsequent layer's input is the prior layer's output,
+    //    so one dump per boundary is enough.
+    for (i, layer) in layers.enumerated() {
+        h = layer.forward(h, position: position,
+                          cache: caches[i] as! any KVCacheProtocol,
+                          cmd: workCmd, device: device)
+        tap.dumpLayerBoundary(h, label: "layer_out", layer: i,
+                              cmd: &workCmd, device: device)
+    }
+
+    // 5. Final norm + lm head — tap both.
+    let normed = finalNorm(h, on: workCmd)
+    tap.dumpLayerBoundary(normed, label: "final_norm", layer: -1,
+                          cmd: &workCmd, device: device)
+    let logits = lmHead(normed, on: workCmd)
+    tap.dumpLayerBoundary(logits, label: "logits", layer: -1,
+                          cmd: &workCmd, device: device)
+
+    // 6. When taps are active, flush the private cmdbuf — the
+    //    caller's cmd has no work queued so their commit() is a
+    //    fast no-op. In production mode this branch is skipped.
+    if tap.active {
+        workCmd.commit()
+        workCmd.waitUntilCompleted()
+    }
+    return logits
+}
+```
+
+The `<Family>Layer.forward(...)` stays clean — no taps inside the
+layer's hot path. That's deliberate: layer-boundary taps localise
+*which* layer is failing in two `ffai inspect --layer-trace` runs.
+For inside-layer triage (which op in layer N produced the NaN),
+drop temporary fine-grained `tap.dumpLayerBoundary(...)` calls
+between ops as you debug, then remove them before merging. See
+`papers/gemma3-coherence-investigation-2026-05-19.md` for the
+canonical example — a single GELU NaN inside layer 1's MLP that
+the standardized boundary tap localised in seconds once `ffai
+inspect --layer-trace --trace-layers 0,1,2,3,4` was the first
+thing the dev ran.
+
+**Required:** every new family file MUST follow this pattern. The
+`InspectSmokeTests` integration test (Tests/ModelTests/) asserts
+the inspect path runs end-to-end against a representative model
+from each family; that test will fail loudly if a family file
+forgets to wire `InspectTap` calls.
+
+## Step 8 — add tests
 
 `Tests/ModelTests/<Family>/` gets at minimum:
 
@@ -244,7 +325,7 @@ run on the same machine. Floating-point drift is fine within the
 forward-pass tolerance; greedy decode must be bit-exact (the same
 argmax produces the same token).
 
-## Step 8 — wire into CI
+## Step 9 — wire into CI
 
 `make test` will pick up new tests automatically. Update
 [`documentation/models.md`](../models.md) with the new family + the
