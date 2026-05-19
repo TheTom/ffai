@@ -50,6 +50,27 @@ struct OpsTests {
         }
     }
 
+    @Test("gelu f32 — out[i] = 0.5 * x * (1 + tanh(...))")
+    func geluF32() {
+        autoreleasepool {
+            let x = Tensor.empty(shape: [4], dtype: .f32)
+            x.copyIn(from: [Float(0), 1, -1, 2])
+            var out: Tensor!
+            runAndWait { cb in out = Ops.gelu(x, on: cb) }
+            let result = out.toArray(as: Float.self)
+            // tanh-approx GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+            func ref(_ v: Float) -> Float {
+                let c: Float = Float((2.0 / Double.pi).squareRoot())
+                let inner = c * (v + 0.044715 * v * v * v)
+                return 0.5 * v * (1 + tanh(inner))
+            }
+            #expect(abs(result[0] - ref(0)) < 1e-3)
+            #expect(abs(result[1] - ref(1)) < 1e-3)
+            #expect(abs(result[2] - ref(-1)) < 1e-3)
+            #expect(abs(result[3] - ref(2)) < 1e-3)
+        }
+    }
+
     @Test("gather f32 — picks the right rows")
     func gatherF32() {
         autoreleasepool {
