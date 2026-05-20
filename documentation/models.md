@@ -26,6 +26,7 @@ For porting a new architecture, see
 | **NemotronH** | [`Models/NemotronH.swift`](../Sources/FFAI/Models/NemotronH.swift) | `nemotron_h` | `NemotronHForCausalLM` | `NemotronHHybrid` |
 | **GraniteMoeHybrid** | [`Models/GraniteMoeHybrid.swift`](../Sources/FFAI/Models/GraniteMoeHybrid.swift) | `granitemoehybrid` | `GraniteMoeHybridForCausalLM` | `GraniteMoeHybridHybrid` |
 | **Jamba** | [`Models/Jamba.swift`](../Sources/FFAI/Models/Jamba.swift) | `jamba` | `JambaForCausalLM` | `JambaHybrid` |
+| **Qwen 3.5** | [`Models/Qwen35.swift`](../Sources/FFAI/Models/Qwen35.swift) | `qwen3_5`, `qwen3_5_moe` | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` | `Qwen35Hybrid` |
 
 **FalconH1** is FFAI's first *hybrid* family: every decoder layer runs
 BOTH a Mamba 2 selective-SSM mixer AND a grouped-query attention path
@@ -100,6 +101,34 @@ the command buffer mid-`decode`, so `JambaModel.forward` refreshes the
 command buffer after each such layer — the same contract
 GraniteMoeHybrid's MoE layers use. The MoE feed-forward reuses the
 shared `MoELayer` (`.topKThenSoftmax` gating).
+
+**Qwen 3.5** is a *stack-interleaved* hybrid like Jamba — an explicit
+`layer_types` schedule (with a `(i + 1) % full_attention_interval`
+fallback) assigns each decoder layer one mixer kind (`linear_attention`
+or `full_attention`), and every layer carries a feed-forward half: a
+dense SwiGLU MLP (`num_experts == 0`) or a block-sparse **MoE** block
+with a *sigmoid-gated always-on shared expert*. Each layer is two
+pre-norm + residual blocks (`input_layernorm` → mixer,
+`post_attention_layernorm` → FFN). The structural deltas vs every other
+FFAI hybrid: the recurrent mixer is a **Gated Delta Net** (GDN, not
+Mamba) — the first FFAI consumer of the `gated_delta_step` kernel and
+`GDNStateCache`; attention is **gated** (`attn_output_gate` makes
+`q_proj` emit `2 × heads`, the second half a `sigmoid` gate on the SDPA
+output) with **partial RoPE** (`partial_rotary_factor` rotates only the
+first quarter of each head — `Ops.ropePartial`). The GDN block runs the
+*standard* (non-fused) kernel, so it pre-computes the per-head q/k
+RMSNorm + scale and the per-value-head gates `g = exp(-exp(A_log) ·
+softplus(a + dt_bias))` / `beta = sigmoid(b)` host-side; the gated
+mixer RMSNorm also runs host-side (the kernel emits fp32 and there is
+no GPU cast). Because the GDN host prep and any MoE FFN both commit the
+command buffer mid-`decode`, `Qwen35Model.forward` runs every layer on
+internal work buffers and queues only the final `norm` + `lm_head`
+onto the caller's pristine command buffer — the Jamba contract. Each
+GDN layer's cache is a composite `Qwen35GDNLayerCache` bundling a
+`ConvStateCache` and a double-buffered `GDNStateCache`. The MoE
+feed-forward reuses the shared `MoELayer` (`.softmaxThenTopK` gating)
+for the routed experts and applies the sigmoid-gated shared expert
+separately.
 
 Both Llama / Qwen 3 variants share the same Llama-shaped core: GQA
 attention with RoPE, RMSNorm, SwiGLU MLP. Qwen 3 adds per-head q_norm / k_norm

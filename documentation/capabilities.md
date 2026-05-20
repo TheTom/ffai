@@ -47,6 +47,7 @@ Capability.textWithTools  // [.textIn, .textOut, .toolCalling]
 | `NemotronH.NemotronHHybrid` | `[.textIn, .textOut]` |
 | `GraniteMoeHybrid.GraniteMoeHybridHybrid` | `[.textIn, .textOut]` |
 | `Jamba.JambaHybrid` | `[.textIn, .textOut]` |
+| `Qwen35.Qwen35Hybrid` | `[.textIn, .textOut]` |
 
 When a family adds a capability (e.g. `Qwen35VL` adds `.visionIn`),
 the family file declares it and the loader allocates the
