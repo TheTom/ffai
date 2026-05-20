@@ -804,53 +804,48 @@ and `Models/Mamba2.swift` ships the end-to-end dense path.
   loads `mlx-community/mamba2-130m`, verifies shapes match config,
   runs greedy decode to completion (~130 tok/s on M-series).
 
-**Still planned for 5e (SSM / GDN hybrid foundations):**
+**Still planned for 5e — forward / decode path only.** The
+execution plan (scope, dependency graph, ordering, delegation) lives
+in [`planning/phase-5e-plan.md`](phase-5e-plan.md). Summary:
 
-- **GDN kernels** (port from
-  `mlx-swift/Source/Cmlx/mlx-generated/metal/{gated_delta,gated_delta_replay}.metal`):
-  - `gated_delta_step_{Dk}_{Dv}_{Hk}_{Hv}` — recurrence
-    `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`, state in
-    fp32 throughout.
-  - `gated_delta_step_record_*` — same forward + tape per-step
-    delta for speculative-decoding rollback.
-  - `state_replay_*` — re-fold the delta-log tape on partial accept.
-- **SSM kernels** (extend the shipped `ssm_step`):
-  - `ssm_step_record_*` — Mamba 2 forward + tape.
-  - `ssm_replay_*` — Mamba 2 re-fold for partial accept.
-  - Chunked-prefill parallel-scan variant of `ssm_step` (today's
-    kernel is decode-only — usable but slow for long prompts).
-  - `conv1d_causal_prefill_*` — non-streaming 1D depthwise (today
-    only the decode-step variant ships).
-  - Generalise `ssm_step` to support `n_groups > 1` (grouped B / C
-    tensors).
-- **`StateReplayCache` protocol** — parent of `SSMStateCache` +
-  `GDNStateCache`. Caches declare `canStateReplay = true` without
-  bolting on no-op KV methods. Lands in
-  `Sources/FFAI/StateReplayCache.swift`.
-- **`GDNStateCache`** — `Sources/FFAI/GDNStateCache.swift`. Per-layer
-  GDN recurrent state with `record(...)` + `rollback(acceptedPrefix:)`
-  hooks; mirrors the shipped `SSMStateCache` pattern.
-- **Family files**:
-  - `Sources/FFAI/Models/Qwen35.swift` — `Qwen35Dense`, `Qwen35MoE`,
-    `Qwen35GDN` variants. Layer-type alternation between GDN and
-    full attention every `fullAttentionInterval` layers. MoE routing
-    uses sparse top-K (fused gating kernel reuses the existing
-    `dequant_gather` family for expert weights).
-  - `Sources/FFAI/Models/NemotronH.swift` — layer-type string
-    parsing (`M` Mamba, `*` attention, `E` MoE, `-` MLP); per-layer
-    mixer protocol.
-  - `Sources/FFAI/Models/Jamba.swift` — Mamba 2 + attention / MoE
-    alternation. Handle Jamba's 2D `A_log` shape (kernel-side
-    generalisation OR Swift-side reformulation; pick whichever is
-    cheaper after the GDN kernels land).
-  - `Sources/FFAI/Models/GraniteMoeHybrid.swift` — Mamba 2 + MoE +
-    attention.
-  - `Sources/FFAI/Models/FalconH1.swift` — Mamba 2 + attention / MLP
-    with per-layer multipliers (chunk-size tuning).
+- **GDN forward kernel** — `gated_delta_step_{Dk}_{Dv}_{Hk}_{Hv}`,
+  recurrence `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`,
+  fp32 state throughout. Port from `ekryski/mlx@alpha`
+  `gated_delta.metal`. Paired GPU correctness test, same commit.
+- **`GDNStateCache`** (`Sources/FFAI/GDNStateCache.swift`) —
+  per-layer GDN recurrent state, **forward-only**, mirrors the
+  shipped `SSMStateCache`.
+- **MoE inference infrastructure** — top-K expert router +
+  per-expert FFN dispatch. No MoE support exists in FFAI today;
+  shared by the MoE-bearing families below. Start with a dense
+  masked loop over experts; optimise to a sparse gather later.
+- **Per-layer mixer scaffolding** — a layer-type-driven mixer
+  abstraction so a family interleaves Mamba 2 / attention / MoE /
+  MLP layers. Extends `makeLayerCaches`'s `[any LayerCacheProtocol]`.
+- **Family files** (one integration test each, mlx-community
+  download + coherent-output assertion):
+  - `Models/FalconH1.swift` — Mamba 2 + attention / MLP, per-layer
+    multipliers. No MoE, no GDN — the first family end-to-end.
+  - `Models/NemotronH.swift` — layer-type string parsing (`M`
+    Mamba, `*` attention, `E` MoE, `-` MLP).
+  - `Models/GraniteMoeHybrid.swift` — Mamba 2 + MoE + attention.
+  - `Models/Jamba.swift` — Mamba 2 + attention / MoE; handle the
+    2D `A_log` shape.
+  - `Models/Qwen35.swift` — `Qwen35Dense`, `Qwen35MoE`, `Qwen35GDN`
+    variants; GDN ↔ full-attention alternation every
+    `fullAttentionInterval` layers. Headline; most-coupled; last.
 
-Each new family ships with one `Tests/ModelTests/<Family>IntegrationTests.swift`
-that downloads from mlx-community and runs a coherent-output assertion;
-each new kernel + cache gets a unit test.
+**Deferred out of 5e:**
+
+- **→ Phase 8 (speculative decoding):** the partial-accept rollback
+  infra — `gated_delta_step_record`, `state_replay`,
+  `ssm_step_record`, `ssm_replay` kernels; the `StateReplayCache`
+  protocol; `GDNStateCache.record()` / `.rollback(acceptedPrefix:)`.
+- **→ a perf pass:** chunked-prefill parallel-scan `ssm_step`;
+  `conv1d_causal_prefill` (the shipped decode-step variants cover
+  prefill, just slower).
+- **Conditional:** generalise `ssm_step` to `n_groups > 1` (grouped
+  B / C) only if a target checkpoint's `config.json` needs it.
 
 ### Phase 5f — Attention sinks + sliding window + GPT-OSS-20B
 
