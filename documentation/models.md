@@ -23,6 +23,7 @@ For porting a new architecture, see
 | **Qwen 3** | [`Models/Qwen3.swift`](../Sources/FFAI/Models/Qwen3.swift) | `qwen3` | `Qwen3ForCausalLM` | `Qwen3Dense` |
 | **Mamba 2** | [`Models/Mamba2.swift`](../Sources/FFAI/Models/Mamba2.swift) | `mamba2` | `Mamba2ForCausalLM` | `Mamba2Dense` |
 | **FalconH1** | [`Models/FalconH1.swift`](../Sources/FFAI/Models/FalconH1.swift) | `falcon_h1` | `FalconH1ForCausalLM` | `FalconH1Hybrid` |
+| **NemotronH** | [`Models/NemotronH.swift`](../Sources/FFAI/Models/NemotronH.swift) | `nemotron_h` | `NemotronHForCausalLM` | `NemotronHHybrid` |
 
 **FalconH1** is FFAI's first *hybrid* family: every decoder layer runs
 BOTH a Mamba 2 selective-SSM mixer AND a grouped-query attention path
@@ -36,8 +37,27 @@ KV cache. FalconH1 reuses the shipped Mamba 2 SSM kernels (`ssm_step`,
 `conv1d_causal_step`) and the `sdpaDecode` attention path — no new
 kernels were needed.
 
-Both variants share the same Llama-shaped core: GQA attention with
-RoPE, RMSNorm, SwiGLU MLP. Qwen 3 adds per-head q_norm / k_norm
+**NemotronH** is FFAI's first *stack-interleaved* hybrid: a
+`hybrid_override_pattern` string assigns each decoder layer exactly one
+mixer kind — `M` = Mamba 2 selective-SSM mixer, `*` = multi-head
+attention, `-` = dense squared-ReLU MLP — and the kinds genuinely vary
+down the stack (NemotronH-4B is 24 Mamba / 4 attention / 24 dense MLP).
+Every layer shares one pre-mixer RMSNorm + one residual add; there is
+no separate pre-FF norm. The layer array is therefore *heterogeneous*:
+the engine holds `[any DecoderLayer]` and walks it in lockstep with a
+per-index cache array (`Mamba2LayerCache` for `M`, `KVCache` for `*`,
+`StatelessLayerCache` for `-`). Two structural deltas vs other
+families: NemotronH attention uses **no positional embedding** (no
+RoPE — the Mamba layers carry sequence order), and its Mamba layers run
+**`n_groups = 8` grouped B/C** plus a **gated mixer RMSNorm**. The
+grouped SSM reuses the shipped scalar `ssm_step` kernel by dispatching
+it once per group over a contiguous head sub-slab — no new kernel. The
+`E` (mixture-of-experts) layer kind is recognised but rejected at load:
+NemotronH's MoE diverges from the shipped SwiGLU `MoELayer`, and no
+small published checkpoint exercises it.
+
+Both Llama / Qwen 3 variants share the same Llama-shaped core: GQA
+attention with RoPE, RMSNorm, SwiGLU MLP. Qwen 3 adds per-head q_norm / k_norm
 RMSNorms applied to queries/keys *before* RoPE — the only structural
 difference vs Llama. No new kernels were needed for Qwen 3; just an
 extra RMSNorm site.
@@ -111,6 +131,30 @@ published FalconH1 checkpoint — so the hybrid decode path (dual
 Mamba+attention mixers, `FalconH1LayerCache`, the `DecoderLayer`
 protocol stack) is exercised at minimal download cost. The architecture
 is identical in shape across 0.5B / 1.5B / 3B / 7B.
+
+### NemotronH
+
+| Repo | Size | Quant | Notes |
+|---|---|---|---|
+| `nvidia/Nemotron-H-4B-Base-8K` | 4B | bf16 | Integration-test baseline. |
+| `nvidia/Nemotron-H-4B-Instruct-128K` | 4B | bf16 | Same shape, instruction-tuned. |
+| `nvidia/Nemotron-H-8B-Base-8K` | 8B | bf16 | |
+
+The integration suite uses Nemotron-H-4B-Base-8K — the smallest
+published NemotronH checkpoint whose config the shipped FFAI path can
+run end-to-end. It exercises the heterogeneous `[any DecoderLayer]`
+decode loop, the per-index cache array, the grouped-B/C Mamba path,
+the gated mixer RMSNorm, and no-RoPE attention.
+
+**Known gaps.** Only raw bf16 / f16 NemotronH checkpoints are supported
+— quantized variants are rejected with a clear error. The `E`
+(mixture-of-experts) layer kind — used by the Nemotron-Cascade-2 /
+Nemotron-3 MoE checkpoints — is rejected at load: NemotronH MoE uses
+squared-ReLU experts with sigmoid group-expert-select routing, both of
+which diverge from the shipped SwiGLU `MoELayer`. A NemotronH Mamba
+layer whose per-group RMSNorm row size (`d_inner / n_groups`) is not a
+multiple of 128 (e.g. Nemotron-3-Nano-4B's 960) is also rejected — the
+`rmsNormRows` kernel requires a 128-aligned row.
 
 **Known gaps.** Only raw bf16 / f16 FalconH1 checkpoints are supported
 today — quantized (`-4bit` / `-8bit`) variants are rejected with a

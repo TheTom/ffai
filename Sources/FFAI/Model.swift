@@ -125,6 +125,17 @@ public enum ModelRegistry {
             return try loadFalconH1(config: config, weights: weights,
                                     options: options, device: device)
         }
+        // NemotronH — a Phase 5e stack-interleaved hybrid (Mamba 2 /
+        // attention / dense-MLP layers selected per-layer by a
+        // hybrid_override_pattern). Routes through its own family file.
+        if let arch = config.architecture, NemotronH.architectures.contains(arch) {
+            return try loadNemotronH(config: config, weights: weights,
+                                     options: options, device: device)
+        }
+        if let mt = config.modelType, NemotronH.modelTypes.contains(mt) {
+            return try loadNemotronH(config: config, weights: weights,
+                                     options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -207,6 +218,19 @@ public enum ModelRegistry {
         return Loaded(engine: engine,
                       defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+    public static func loadNemotronH(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try NemotronH.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
 }
 
 /// High-level loaded model with tokenizer attached. The public API users
@@ -236,6 +260,9 @@ public final class Model: @unchecked Sendable {
 
     /// Convenience accessor for the FalconH1 hybrid engine.
     public var falconH1: FalconH1Model? { engine as? FalconH1Model }
+
+    /// Convenience accessor for the NemotronH hybrid engine.
+    public var nemotronH: NemotronHModel? { engine as? NemotronHModel }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
