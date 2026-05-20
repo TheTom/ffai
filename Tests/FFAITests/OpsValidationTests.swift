@@ -333,9 +333,21 @@ struct OpsValidationTests {
 
     // ─── gatedDeltaStep ────────────────────────────────────────────
 
-    @Test("validateGatedDeltaStep accepts every emitted config")
-    func gatedDeltaStepAcceptsEmittedConfigs() {
-        for config in OpsValidation.supportedGatedDeltaConfigs {
+    @Test("validateGatedDeltaStep accepts representative model configs")
+    func gatedDeltaStepAcceptsValidConfigs() {
+        // `mt_gated_delta_step` takes (Dk, Dv, Hv, Hk) as runtime
+        // constexprs — any config satisfying the geometry invariants
+        // is dispatchable. These cover the shipped Qwen3.5 GDN variants.
+        let configs: [[Int]] = [
+            [192, 128, 4, 4],    // Qwen3.5-A3B
+            [128, 128, 8, 8],
+            [128, 128, 16, 16],  // Qwen3.5 dense 0.8B-9B
+            [128, 128, 16, 32],  // Qwen3.5-35B
+            [128, 128, 16, 48],  // Qwen3.5 dense 27B
+            [64, 64, 8, 8],      // Qwen3.5 small
+            [96, 96, 8, 8],      // arbitrary 32-multiple — runtime-parametric
+        ]
+        for config in configs {
             #expect(OpsValidation.validateGatedDeltaStep(
                 keyHeadDim: config[0], valueHeadDim: config[1],
                 numKeyHeads: config[2], numValueHeads: config[3]) == nil,
@@ -343,14 +355,14 @@ struct OpsValidationTests {
         }
     }
 
-    @Test("validateGatedDeltaStep rejects non-emitted config")
-    func gatedDeltaStepRejectsUnknownConfig() {
-        // (96, 96, 8, 8): valid divisibility but no emitted kernel.
+    @Test("validateGatedDeltaStep rejects keyHeadDim over the state cap")
+    func gatedDeltaStepRejectsOversizedKeyHeadDim() {
+        // Dk/32 > 8 exceeds the kernel's per-lane state register array.
         let msg = OpsValidation.validateGatedDeltaStep(
-            keyHeadDim: 96, valueHeadDim: 96,
+            keyHeadDim: 288, valueHeadDim: 128,
             numKeyHeads: 8, numValueHeads: 8)
         #expect(msg != nil)
-        #expect(msg?.contains("96") == true)
+        #expect(msg?.contains("288") == true)
     }
 
     @Test("validateGatedDeltaStep rejects keyHeadDim not multiple of 32")

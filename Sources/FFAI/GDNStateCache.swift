@@ -11,11 +11,15 @@
 // steps; bf16's 7-bit mantissa drifts fast. The metaltile kernel runs
 // `S` in fp32 regardless of the activation dtype, so the cache matches.
 //
-// Double-buffered. The `gated_delta_step` kernel reads `state_in` and
-// writes a distinct `state_out` (it is NOT an in-place update like
+// Double-buffered. The `mt_gated_delta_step` kernel reads `state_in`
+// and writes a distinct `state_out` (it is NOT an in-place update like
 // `ssm_step`). The cache holds both buffers and `swap()` ping-pongs
 // them after each decode step so the freshly-written state becomes the
 // input for the next step.
+//
+// State layout is `[Hv, Dv, Dk]` fp32 — matches the kernel's
+// `state_base = n·Dv·Dk + dv_idx·Dk + s_idx` indexing (n = batch·Hv +
+// hv; decode is single-batch so n = hv).
 //
 // Forward-only. This is Phase 5e.C scope: there are deliberately NO
 // `record()` / `rollback()` hooks. Partial-accept replay (rewinding

@@ -240,9 +240,10 @@ public struct Qwen35Hybrid: Qwen35Variant {
         // convDim covers q | k | v: keyDim·2 + valueDim.
         let convDim = keyDim * 2 + valueDim
 
-        // The GDN kernel only has emitted specializations for a fixed
-        // set of (Dk, Dv, Hk, Hv) tuples — reject anything else with a
-        // clear pointer to the kernel source rather than a freeze.
+        // The GDN kernel takes (Dk, Dv, Hk, Hv) as runtime constexprs,
+        // but still carries reduction-mode geometry invariants (Dk a
+        // multiple of 32 and ≤ 256, Hv divisible by Hk) — reject any
+        // violating config with a clear message rather than a freeze.
         if let reason = OpsValidation.validateGatedDeltaStep(
             keyHeadDim: linearKeyHeadDim, valueHeadDim: linearValueHeadDim,
             numKeyHeads: linearNumKeyHeads, numValueHeads: linearNumValueHeads

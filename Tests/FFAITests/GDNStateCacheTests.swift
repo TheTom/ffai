@@ -155,42 +155,58 @@ struct GDNStateCacheTests {
         return y
     }
 
-    /// Run `tSteps` of the GDN recurrence on the GPU in a single
-    /// dispatch. Returns (finalState, y).
+    /// Run `tSteps` of the GDN recurrence on the GPU by looping the
+    /// single-step `mt_gated_delta_step` kernel once per token —
+    /// `mt_gated_delta_step` performs exactly one recurrence step, so
+    /// multi-step prefill is a per-token loop, double-buffering state
+    /// via `GDNStateCache.swap()`. Returns (finalState, y).
     private func gpuRun(
         q: [Float], k: [Float], v: [Float], g: [Float], beta: [Float],
         initialState: [Float], tSteps: Int
     ) -> (state: [Float], y: [Float]) {
         let dk = Self.dk, dv = Self.dv, hk = Self.hk, hv = Self.hv
 
-        let qT = Tensor.empty(shape: [tSteps, hk, dk], dtype: .f32)
-        qT.copyIn(from: q)
-        let kT = Tensor.empty(shape: [tSteps, hk, dk], dtype: .f32)
-        kT.copyIn(from: k)
-        let vT = Tensor.empty(shape: [tSteps, hv, dv], dtype: .f32)
-        vT.copyIn(from: v)
-        let gT = Tensor.empty(shape: [tSteps, hv], dtype: .f32)
-        gT.copyIn(from: g)
-        let betaT = Tensor.empty(shape: [tSteps, hv], dtype: .f32)
-        betaT.copyIn(from: beta)
-
         let cache = GDNStateCache(numValueHeads: hv, valueHeadDim: dv,
                                   keyHeadDim: dk)
         cache.current.copyIn(from: initialState)
 
-        let yT = Tensor.empty(shape: [tSteps, hv, dv], dtype: .f32)
-        yT.zero()
+        var y = [Float](repeating: 0, count: tSteps * hv * dv)
 
-        runAndWait { cb in
-            Ops.gatedDeltaStep(
-                q: qT, k: kT, v: vT, g: gT, beta: betaT,
-                stateIn: cache.current, into: yT, stateOut: cache.next,
-                numKeyHeads: hk, numValueHeads: hv,
-                keyHeadDim: dk, valueHeadDim: dv,
-                tSteps: tSteps, on: cb)
+        for t in 0..<tSteps {
+            // Per-token slices — q/k are [Hk, Dk], v is [Hv, Dv],
+            // g/beta are [Hv].
+            let qkLen = hk * dk
+            let vLen = hv * dv
+            let qT = Tensor.empty(shape: [hk, dk], dtype: .f32)
+            qT.copyIn(from: Array(q[(t * qkLen)..<((t + 1) * qkLen)]))
+            let kT = Tensor.empty(shape: [hk, dk], dtype: .f32)
+            kT.copyIn(from: Array(k[(t * qkLen)..<((t + 1) * qkLen)]))
+            let vT = Tensor.empty(shape: [hv, dv], dtype: .f32)
+            vT.copyIn(from: Array(v[(t * vLen)..<((t + 1) * vLen)]))
+            let gT = Tensor.empty(shape: [hv], dtype: .f32)
+            gT.copyIn(from: Array(g[(t * hv)..<((t + 1) * hv)]))
+            let betaT = Tensor.empty(shape: [hv], dtype: .f32)
+            betaT.copyIn(from: Array(beta[(t * hv)..<((t + 1) * hv)]))
+
+            let yT = Tensor.empty(shape: [hv, dv], dtype: .f32)
+            yT.zero()
+
+            runAndWait { cb in
+                Ops.gatedDeltaStep(
+                    q: qT, k: kT, v: vT, g: gT, beta: betaT,
+                    stateIn: cache.current, into: yT, stateOut: cache.next,
+                    numKeyHeads: hk, numValueHeads: hv,
+                    keyHeadDim: dk, valueHeadDim: dv, on: cb)
+            }
+            // The kernel wrote the updated state into `next`; swap so
+            // the next token reads it via `current`.
+            cache.swap()
+
+            let yStep = yT.toArray(as: Float.self)
+            for i in 0..<vLen { y[t * vLen + i] = yStep[i] }
         }
-        // The kernel wrote the updated state into `next`.
-        return (cache.next.toArray(as: Float.self), yT.toArray(as: Float.self))
+        // After the final swap, the freshly-written state is `current`.
+        return (cache.current.toArray(as: Float.self), y)
     }
 
     @Test("gated_delta_step matches CPU reference on a single step")
