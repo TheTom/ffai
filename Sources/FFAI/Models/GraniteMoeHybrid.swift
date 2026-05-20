@@ -57,9 +57,12 @@
 // `MoELayer.decode` commits the command buffer it is handed (the router
 // needs the gate logits on the CPU). A GraniteMoeHybrid layer whose FFN
 // is an `MoELayer` therefore commits mid-layer. `GraniteMoeHybridModel.
-// forward` detects this via the layer's `commitsCommandBuffer` flag and
-// allocates a FRESH command buffer immediately after such a layer — see
-// the decode loop and the MoELayer file header.
+// forward` keeps ALL per-layer work on internal self-managed command
+// buffers — never the caller's `cmd` — so a committing layer can never
+// double-commit the caller's buffer. It refreshes the internal `workCmd`
+// after each committing layer (`commitsCommandBuffer` flag) and queues
+// only the final norm + lm_head onto the caller's pristine `cmd`. See
+// the `forward` doc comment and the MoELayer file header.
 
 import Foundation
 import Metal
@@ -851,8 +854,9 @@ public final class GraniteMoeHybridModel: LanguageModel {
 
     /// Layer kinds, index-aligned with `layers` — drives `makeLayerCaches`.
     let layerKinds: [GraniteMoeHybridLayerKind]
-    /// True when this model has any MoE-bearing layer (drives the
-    /// command-buffer-refresh path in `forward`).
+    /// True when this model has any MoE-bearing layer. Purely
+    /// informational — `forward` uses the uniform internal-`workCmd`
+    /// discipline regardless of whether any layer commits.
     public let hasMoE: Bool
 
     init(embedTokens: AnyEmbedding, layers: [any DecoderLayer],
@@ -916,22 +920,30 @@ public final class GraniteMoeHybridModel: LanguageModel {
         }
     }
 
-    /// Queue a single-token forward pass. Walks the heterogeneous
-    /// `[any DecoderLayer]` in lockstep with the per-layer caches.
+    /// Queue a single-token forward pass onto `cmd`. **Does not commit
+    /// `cmd`** — the protocol contract holds, so the default
+    /// `forwardSample` / `forwardSampleCategorical` extensions compose
+    /// their output kernels onto `cmd` and commit once, exactly like
+    /// every other family.
     ///
-    /// CRITICAL — MoE command-buffer contract. When a layer's FFN is an
+    /// CRITICAL — command-buffer contract. When a layer's FFN is an
     /// `MoELayer` its `decode` commits the command buffer it is handed
-    /// (the router reads the gate logits back on the CPU). After any
-    /// such layer this loop allocates a FRESH command buffer so the next
-    /// layer — and the final norm + lm_head — queue onto a live buffer
-    /// rather than a committed-and-dead one. See the MoELayer file
-    /// header and the GraniteMoeHybrid header.
+    /// (the router reads the gate logits back on the CPU). So the
+    /// caller's `cmd` must NEVER be handed to a layer — if it were, the
+    /// first MoE-bearing layer would commit it and the caller's later
+    /// commit would double-commit. Instead the embedding + every layer
+    /// run on internal `workCmd` buffers (committed by the layers
+    /// themselves / refreshed after each committing layer), and ONLY the
+    /// final `norm` + `lm_head` + logits_scaling queue onto the caller's
+    /// pristine `cmd`.
     ///
-    /// When the model has no MoE layer (dense Granite-4 "-H" checkpoints
-    /// such as H-350M / H-1B) the whole forward queues onto the caller's
-    /// `cmd` exactly like FalconH1 / NemotronH — `workCmd` is never
-    /// swapped and the caller's commit composes cleanly with the output
-    /// kernels (`forwardSample`'s argmax, the categorical sampler).
+    /// This discipline is uniform across the dense and MoE checkpoints:
+    /// dense Granite-4 "-H" stacks (H-350M / H-1B, `num_local_experts =
+    /// 0`) have no committing layer, so the loop commits `workCmd` once
+    /// after the stack to make `h` resident before the caller's `cmd`
+    /// reads it; MoE stacks (H-Tiny / H-Small) have `workCmd` committed +
+    /// refreshed by each MoE layer. Either way the caller's single
+    /// commit of `cmd` produces correct final logits.
     public func forward(tokenId: Int, position: Int,
                         caches: [any LayerCacheProtocol],
                         on cmd: MTLCommandBuffer, device: Device) -> Tensor {
@@ -940,33 +952,44 @@ public final class GraniteMoeHybridModel: LanguageModel {
         memcpy(tokenBuf.contents(), &tid, 4)
         let tokenTensor = Tensor(buffer: tokenBuf, offset: 0, shape: [1], dtype: .u32)
 
-        var workCmd = cmd
+        // The embedding + layers run on internal buffers — never `cmd`.
+        var workCmd = device.makeCommandBuffer()
         var h = embedTokens(tokenTensor, on: workCmd).reshaped(to: [hidden])
 
         for (i, layer) in layers.enumerated() {
             h = layer.decode(h, position: position, cache: caches[i],
                              cmd: workCmd, device: device)
             // If the layer committed `workCmd` (MoE FFN), swap in a
-            // fresh buffer for the next layer / the output kernels.
+            // fresh buffer for the next layer.
             if let g = layer as? GraniteMoeHybridLayer, g.commitsCommandBuffer {
                 workCmd = device.makeCommandBuffer()
             }
         }
 
-        let normed = finalNorm(h, on: workCmd)
-        let logits = lmHead(normed, on: workCmd)
+        // After a committing layer `workCmd` is a fresh, empty buffer and
+        // `h` is already resident. After a non-committing layer (the
+        // dense path, or an MoE stack ending on a dense layer) `workCmd`
+        // still carries that layer's uncommitted work — commit it so `h`
+        // is resident before the caller's `cmd` reads it.
+        let lastCommitted = (layers.last as? GraniteMoeHybridLayer)?
+            .commitsCommandBuffer ?? false
+        if !lastCommitted {
+            workCmd.commit()
+            workCmd.waitUntilCompleted()
+        }
 
-        // Apply logits_scaling (logits = logits / logits_scaling). When
-        // the model has MoE layers the caller's `cmd` was already
-        // committed mid-forward; `workCmd` is the live buffer the caller
-        // will commit (`forwardSample` queues its argmax onto it). The
-        // scale divide queues onto `workCmd` too, so the caller's commit
-        // still produces correct final logits.
+        // Final norm + lm_head queue onto the caller's pristine `cmd`.
+        let normed = finalNorm(h, on: cmd)
+        let logits = lmHead(normed, on: cmd)
+
+        // Apply logits_scaling (logits = logits / logits_scaling). The
+        // scale divide queues onto the caller's `cmd` too, so the
+        // caller's single commit produces correct final logits.
         if logitsScaling != 1.0 {
             let invScale = Tensor.filled(
                 1.0 / logitsScaling, shape: logits.shape,
                 dtype: logits.dtype, device: device)
-            return Ops.mul(logits, invScale, on: workCmd)
+            return Ops.mul(logits, invScale, on: cmd)
         }
         return logits
     }
