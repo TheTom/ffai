@@ -207,4 +207,173 @@ public enum OpsValidation {
         }
         return nil
     }
+
+    // ─── quantizeKV / bulkDequantKV (int4 / int8) ──────────────────
+    //
+    // Affine KV-cache quant/dequant (`crates/metaltile-std/src/ffai/kv_cache.rs`).
+    // Grid3D mode — one thread per group (quantize) or per output
+    // element (bulk dequant), so no GPU-pin risk. The footguns are
+    // silent miscompute from integer-truncating divisions baked into
+    // the kernel's offset arithmetic:
+    //
+    //   1. `groups_per_head = head_dim / group_size`. If `head_dim`
+    //      isn't a multiple of `group_size` the trailing partial group
+    //      is silently dropped — its head_dim slots never get written.
+    //   2. `head_dim / vals_per_pack` is the per-row packed stride
+    //      (`vals_per_pack = 32/bits` = 8 for int4, 4 for int8). A
+    //      non-multiple `head_dim` truncates the stride → packed words
+    //      for the tail are written/read at the wrong offset.
+    //   3. `group_size / vals_per_pack` is the per-group pack count.
+    //      A non-multiple `group_size` drops the group's tail packs.
+    //
+    // Only int4/int8 are emitted (`bits` switch in the wrapper).
+
+    public static func validateQuantizeKV(
+        nKVHeads: Int, headDim: Int, groupSize: Int, bits: Int
+    ) -> String? {
+        if bits != 4 && bits != 8 {
+            return "bits=\(bits) unsupported — KV quant emits only int4/int8 variants"
+        }
+        if nKVHeads <= 0 {
+            return "nKVHeads must be positive (got \(nKVHeads))"
+        }
+        if headDim <= 0 {
+            return "headDim must be positive (got \(headDim))"
+        }
+        if groupSize <= 0 {
+            return "groupSize must be positive (got \(groupSize))"
+        }
+        // Footgun 1: partial trailing group.
+        if !headDim.isMultiple(of: groupSize) {
+            return "headDim=\(headDim) must be a multiple of groupSize=\(groupSize) — partial trailing group would be silently dropped"
+        }
+        // Footguns 2 + 3: pack alignment. vals_per_pack = 32/bits.
+        let valsPerPack = 32 / bits  // 8 for int4, 4 for int8
+        if !headDim.isMultiple(of: valsPerPack) {
+            return "headDim=\(headDim) must be a multiple of \(valsPerPack) for bits=\(bits) (pack-strided kernel — unaligned tail packed at the wrong offset)"
+        }
+        if !groupSize.isMultiple(of: valsPerPack) {
+            return "groupSize=\(groupSize) must be a multiple of \(valsPerPack) for bits=\(bits) (packs_per_group must be exact)"
+        }
+        return nil
+    }
+
+    // ─── dequantGather ─────────────────────────────────────────────
+    //
+    // Affine-dequantizing embedding gather (`ffai/dequant_gather.rs`).
+    // Grid3D mode — one thread per output element, no GPU-pin risk.
+    // The silent-miscompute footgun:
+    //
+    //   * `groups_per_row = hidden / group_size`. A non-multiple
+    //     `hidden` truncates the group count, so the trailing partial
+    //     group's scale/bias is read from the wrong index.
+    //
+    // Unlike `dequantGemv` there is no pack-alignment constraint — the
+    // kernel walks the bit-stream per individual element (`bit_off =
+    // d * bits`), so any `hidden` is bit-addressable. Supported bit
+    // widths mirror the wrapper's switch: {3, 4, 5, 6, 8}.
+
+    public static func validateDequantGather(
+        hidden: Int, bits: Int, groupSize: Int
+    ) -> String? {
+        if !(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8) {
+            return "bits=\(bits) unsupported — must be one of 3, 4, 5, 6, or 8"
+        }
+        if hidden <= 0 {
+            return "hidden must be positive (got \(hidden))"
+        }
+        if groupSize <= 0 {
+            return "groupSize must be positive (got \(groupSize))"
+        }
+        if !hidden.isMultiple(of: groupSize) {
+            return "hidden=\(hidden) must be a multiple of groupSize=\(groupSize) — partial trailing group would read scale/bias at the wrong index"
+        }
+        return nil
+    }
+
+    // ─── auraDequantRotated ────────────────────────────────────────
+    //
+    // AURA bulk dequant (`ffai/aura_dequant_rotated.rs`). Grid3D mode
+    // — one thread per packed word, no GPU-pin risk. Two contracts:
+    //
+    //   1. `cacheStride >= tokens`. The kernel's `tokens` constexpr
+    //      doubles as the per-head row stride of the packed/norms/out
+    //      buffers. For a `[nKVHeads, maxSeq, …]` buffer the wrapper
+    //      must pass `cacheStride = maxSeq`; passing the fill count
+    //      makes heads 1…n address the wrong rows — the AURA "coherent
+    //      then collapse" bug.
+    //   2. `packedWidth` must cover every dim: `packedWidth >=
+    //      ceil(dim / dims_per_word)` where `dims_per_word = 32/bits`
+    //      (clean path) or `ceil(32/bits)` (odd-width spill path).
+    //      Too small → trailing dims never written (zeros).
+    //
+    // Bit widths {2, 3, 4, 8} are emitted by the encode kernel; the
+    // dequant kernel additionally has {3, 5, 6} odd-width arms, but the
+    // wrapper's switch only routes {2, 3, 4, 8}.
+
+    public static func validateAuraDequantRotated(
+        dim: Int, packedWidth: Int, tokens: Int, bits: Int,
+        cacheStride: Int
+    ) -> String? {
+        if bits != 2 && bits != 3 && bits != 4 && bits != 8 {
+            return "bits=\(bits) unsupported — auraDequantRotated routes only int2/int3/int4/int8"
+        }
+        if dim <= 0 {
+            return "dim must be positive (got \(dim))"
+        }
+        if tokens <= 0 {
+            return "tokens must be positive (got \(tokens))"
+        }
+        if packedWidth <= 0 {
+            return "packedWidth must be positive (got \(packedWidth))"
+        }
+        // Contract 1: per-head row stride.
+        if cacheStride < tokens {
+            return "cacheStride (\(cacheStride)) must be >= tokens (\(tokens)) — smaller stride makes heads 1…n read/write the wrong rows (AURA coherent-then-collapse bug)"
+        }
+        // Contract 2: packedWidth must cover every dim. The clean path
+        // packs `32/bits` dims per word; the odd-width path packs
+        // `ceil(32/bits)`. Both need `packedWidth * dims_per_word >= dim`;
+        // the clean (smaller) `dims_per_word` is the binding lower bound.
+        let dimsPerWord = 32 / bits  // floor; clean path. ≥ odd-path stride.
+        let minPackedWidth = (dim + dimsPerWord - 1) / dimsPerWord
+        if packedWidth < minPackedWidth {
+            return "packedWidth=\(packedWidth) too small for dim=\(dim) at bits=\(bits) — need >= ceil(dim / \(dimsPerWord)) = \(minPackedWidth); trailing dims would be left as zeros"
+        }
+        return nil
+    }
+
+    // ─── auraRotatePerHead ─────────────────────────────────────────
+    //
+    // Per-head SRHT rotation (`Ops.auraRotatePerHead`). Not a kernel
+    // wrapper itself — fans out one `Ops.gemv` per head — so there is
+    // no dispatch-shape hazard. The preconditions are pure shape /
+    // dtype contracts the gemv fan-out relies on:
+    //
+    //   1. `x` is a flat `[nHeads * headDim]` tensor.
+    //   2. `rotation` is a square `[headDim, headDim]` matrix.
+    //   3. `rotation.dtype == x.dtype` — gemv requires matched dtypes.
+
+    public static func validateAuraRotatePerHead(
+        xElementCount: Int, rotationShape: [Int],
+        rotationDtypeMatchesX: Bool,
+        nHeads: Int, headDim: Int
+    ) -> String? {
+        if nHeads <= 0 {
+            return "nHeads must be positive (got \(nHeads))"
+        }
+        if headDim <= 0 {
+            return "headDim must be positive (got \(headDim))"
+        }
+        if xElementCount != nHeads * headDim {
+            return "x has \(xElementCount) elements, expected nHeads*headDim=\(nHeads * headDim)"
+        }
+        if rotationShape != [headDim, headDim] {
+            return "rotation shape \(rotationShape) must be [\(headDim), \(headDim)]"
+        }
+        if !rotationDtypeMatchesX {
+            return "rotation dtype must match x dtype (gemv requires matched dtypes)"
+        }
+        return nil
+    }
 }

@@ -469,8 +469,14 @@ public enum Ops {
         precondition(weight.dtype == .u32, "dequantGather: weight must be u32 packed")
         precondition(tokenIds.dtype == .u32, "dequantGather: tokenIds must be u32")
         precondition(scales.dtype == biases.dtype, "dequantGather: scales/biases dtype mismatch")
-        precondition(bits == 3 || bits == 4 || bits == 5 || bits == 6 || bits == 8,
-                     "dequantGather: bits must be one of 3, 4, 5, 6, or 8")
+        // Kernel-invariant validation (bit-width + silent-miscompute
+        // footgun: partial trailing group). See
+        // OpsValidation.validateDequantGather.
+        if let reason = OpsValidation.validateDequantGather(
+            hidden: hidden, bits: bits, groupSize: groupSize
+        ) {
+            preconditionFailure("Ops.dequantGather: \(reason)")
+        }
         let n = tokenIds.elementCount
         let result = out ?? Tensor.empty(shape: [n, hidden], dtype: scales.dtype)
         let totalThreads = n * hidden
@@ -1085,6 +1091,14 @@ public enum Ops {
         precondition(weights.dtype == .u32, "quantizeKVInt4: weights must be u32")
         precondition(scales.dtype == src.dtype && biases.dtype == src.dtype,
                      "quantizeKVInt4: scales/biases dtype must match src")
+        // Kernel-invariant validation (silent-miscompute footguns:
+        // partial trailing group, unaligned pack stride). See
+        // OpsValidation.validateQuantizeKV.
+        if let reason = OpsValidation.validateQuantizeKV(
+            nKVHeads: nKVHeads, headDim: headDim, groupSize: groupSize, bits: 4
+        ) {
+            preconditionFailure("Ops.quantizeKVInt4: \(reason)")
+        }
         let groupsPerHead = headDim / groupSize
         let grid = MTLSize(width: nKVHeads * groupsPerHead, height: 1, depth: 1)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
@@ -1133,6 +1147,14 @@ public enum Ops {
         precondition(weights.dtype == .u32, "bulkDequantKVInt4: weights must be u32")
         precondition(scales.dtype == out.dtype && biases.dtype == out.dtype,
                      "bulkDequantKVInt4: scales/biases dtype must match output")
+        // Kernel-invariant validation — shares the int4 group/pack
+        // alignment contract with quantizeKVInt4. See
+        // OpsValidation.validateQuantizeKV.
+        if let reason = OpsValidation.validateQuantizeKV(
+            nKVHeads: nKVHeads, headDim: headDim, groupSize: groupSize, bits: 4
+        ) {
+            preconditionFailure("Ops.bulkDequantKVInt4: \(reason)")
+        }
         let total = nKVHeads * nPositions * headDim
         let grid = MTLSize(width: total, height: 1, depth: 1)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
@@ -1183,6 +1205,14 @@ public enum Ops {
         precondition(weights.dtype == .u32, "quantizeKVInt8: weights must be u32")
         precondition(scales.dtype == src.dtype && biases.dtype == src.dtype,
                      "quantizeKVInt8: scales/biases dtype must match src")
+        // Kernel-invariant validation (silent-miscompute footguns:
+        // partial trailing group, unaligned pack stride). See
+        // OpsValidation.validateQuantizeKV.
+        if let reason = OpsValidation.validateQuantizeKV(
+            nKVHeads: nKVHeads, headDim: headDim, groupSize: groupSize, bits: 8
+        ) {
+            preconditionFailure("Ops.quantizeKVInt8: \(reason)")
+        }
         let groupsPerHead = headDim / groupSize
         let grid = MTLSize(width: nKVHeads * groupsPerHead, height: 1, depth: 1)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
@@ -1233,6 +1263,14 @@ public enum Ops {
         precondition(weights.dtype == .u32, "bulkDequantKVInt8: weights must be u32")
         precondition(scales.dtype == out.dtype && biases.dtype == out.dtype,
                      "bulkDequantKVInt8: scales/biases dtype must match output")
+        // Kernel-invariant validation — shares the int8 group/pack
+        // alignment contract with quantizeKVInt8. See
+        // OpsValidation.validateQuantizeKV.
+        if let reason = OpsValidation.validateQuantizeKV(
+            nKVHeads: nKVHeads, headDim: headDim, groupSize: groupSize, bits: 8
+        ) {
+            preconditionFailure("Ops.bulkDequantKVInt8: \(reason)")
+        }
         let total = nKVHeads * nPositions * headDim
         let grid = MTLSize(width: total, height: 1, depth: 1)
         let tg = MTLSize(width: 1, height: 1, depth: 1)
@@ -1597,8 +1635,15 @@ public enum Ops {
         precondition(norms.dtype == .f32 && codebook.dtype == .f32,
                      "Ops.auraDequantRotated: norms/codebook must be f32")
         let stride = cacheStride ?? tokens
-        precondition(stride >= tokens,
-                     "Ops.auraDequantRotated: cacheStride (\(stride)) must be >= tokens (\(tokens))")
+        // Kernel-invariant validation (cacheStride row-stride contract,
+        // packedWidth dim coverage, bit-width). See
+        // OpsValidation.validateAuraDequantRotated.
+        if let reason = OpsValidation.validateAuraDequantRotated(
+            dim: dim, packedWidth: packedWidth, tokens: tokens, bits: bits,
+            cacheStride: stride
+        ) {
+            preconditionFailure("Ops.auraDequantRotated: \(reason)")
+        }
         // Grid height = rows to process (`tokens`); the kernel's `tokens`
         // constexpr carries the per-head buffer stride (`stride`).
         let grid = MTLSize(width: packedWidth, height: tokens, depth: nKVHeads)
@@ -1730,12 +1775,15 @@ public enum Ops {
         nHeads: Int, headDim: Int,
         on cmd: MTLCommandBuffer
     ) -> Tensor {
-        precondition(x.elementCount == nHeads * headDim,
-                     "Ops.auraRotatePerHead: x has \(x.elementCount) elements, expected nHeads*headDim=\(nHeads * headDim)")
-        precondition(rotation.shape == [headDim, headDim],
-                     "Ops.auraRotatePerHead: rotation shape \(rotation.shape) must be [\(headDim), \(headDim)]")
-        precondition(rotation.dtype == x.dtype,
-                     "Ops.auraRotatePerHead: rotation dtype \(rotation.dtype) must match x dtype \(x.dtype) (gemv requires matched dtypes)")
+        // Pure shape / dtype contract validation — see
+        // OpsValidation.validateAuraRotatePerHead.
+        if let reason = OpsValidation.validateAuraRotatePerHead(
+            xElementCount: x.elementCount, rotationShape: rotation.shape,
+            rotationDtypeMatchesX: rotation.dtype == x.dtype,
+            nHeads: nHeads, headDim: headDim
+        ) {
+            preconditionFailure("Ops.auraRotatePerHead: \(reason)")
+        }
 
         let result = Tensor.empty(shape: [nHeads * headDim], dtype: x.dtype)
         let bytesPerHead = headDim * x.dtype.byteSize
