@@ -527,4 +527,134 @@ struct QuantizedOpsTests {
             }
         }
     }
+
+    // MARK: - dequantGather (MLX-format dequantizing embedding lookup)
+
+    /// Direct test of `Ops.dequantGatherInt4`. Builds a tiny quantized
+    /// embedding table, gathers a couple of token rows, and checks each
+    /// dequantized element against the CPU `q * scale + bias` formula.
+    ///
+    /// Layout (see metaltile `ffai/dequant_gather.rs`):
+    ///   weight  [vocab, hidden*bits/32] u32
+    ///   scales  [vocab, hidden/groupSize] T
+    ///   biases  [vocab, hidden/groupSize] T
+    ///   indices [nTokens] u32  →  out [nTokens, hidden]
+    @Test("dequantGatherInt4 — gather + dequant matches CPU q*scale+bias")
+    func dequantGatherInt4MatchesCPU() {
+        autoreleasepool {
+            let vocab = 5
+            let hidden = 16
+            let gs = 8                       // 2 groups per row
+            let nGroups = hidden / gs
+
+            // Deterministic 4-bit values per vocab row.
+            var q = [[UInt32]](repeating: [], count: vocab)
+            for r in 0..<vocab {
+                q[r] = (0..<hidden).map { UInt32(($0 + r * 3) % 16) }
+            }
+            let scales: [Float] = (0..<(vocab * nGroups)).map { Float($0 + 1) * 0.02 }
+            let biases: [Float] = (0..<(vocab * nGroups)).map { Float($0) * -0.01 }
+
+            // Pack 8 nibbles per uint32 → hidden/8 = 2 words per row.
+            var packed: [UInt32] = []
+            for r in 0..<vocab {
+                for i in stride(from: 0, to: hidden, by: 8) {
+                    packed.append(Self.pack8(Array(q[r][i..<i+8])))
+                }
+            }
+
+            let tokens: [UInt32] = [3, 0, 4]   // arbitrary lookup order
+            let nTokens = tokens.count
+
+            let weight = Tensor.empty(shape: [vocab, hidden / 8], dtype: .u32)
+            weight.copyIn(from: packed)
+            let scalesT = Tensor.empty(shape: [vocab, nGroups], dtype: .f32)
+            scalesT.copyIn(from: scales)
+            let biasesT = Tensor.empty(shape: [vocab, nGroups], dtype: .f32)
+            biasesT.copyIn(from: biases)
+            let idsT = Tensor.empty(shape: [nTokens], dtype: .u32)
+            idsT.copyIn(from: tokens)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.dequantGatherInt4(
+                    weight: weight, scales: scalesT, biases: biasesT,
+                    tokenIds: idsT, hidden: hidden, groupSize: gs, on: cb
+                )
+            }
+
+            let got = out.toArray(as: Float.self)
+            for t in 0..<nTokens {
+                let row = Int(tokens[t])
+                for d in 0..<hidden {
+                    let g = d / gs
+                    let s = scales[row * nGroups + g]
+                    let b = biases[row * nGroups + g]
+                    let expected = Float(q[row][d]) * s + b
+                    #expect(abs(got[t * hidden + d] - expected) < 1e-3,
+                            "token \(t) (row \(row)) d=\(d): got \(got[t * hidden + d]) expected \(expected)")
+                }
+            }
+        }
+    }
+
+    /// Direct test of the 8-bit path through `Ops.dequantGather`.
+    @Test("dequantGather(bits=8) — gather + dequant matches CPU q*scale+bias")
+    func dequantGatherInt8MatchesCPU() {
+        autoreleasepool {
+            let vocab = 4
+            let hidden = 16
+            let gs = 8
+            let nGroups = hidden / gs
+
+            // Deterministic 8-bit values per vocab row.
+            var q = [[UInt32]](repeating: [], count: vocab)
+            for r in 0..<vocab {
+                q[r] = (0..<hidden).map { UInt32(($0 * 5 + r * 17) & 0xFF) }
+            }
+            let scales: [Float] = (0..<(vocab * nGroups)).map { Float($0 + 1) * 0.003 }
+            let biases: [Float] = (0..<(vocab * nGroups)).map { Float($0) * -0.05 }
+
+            // Pack 4 bytes per uint32 → hidden/4 = 4 words per row.
+            var packed: [UInt32] = []
+            for r in 0..<vocab {
+                for i in stride(from: 0, to: hidden, by: 4) {
+                    packed.append(Self.pack4Bytes(Array(q[r][i..<i+4])))
+                }
+            }
+
+            let tokens: [UInt32] = [1, 3]
+            let nTokens = tokens.count
+
+            let weight = Tensor.empty(shape: [vocab, hidden / 4], dtype: .u32)
+            weight.copyIn(from: packed)
+            let scalesT = Tensor.empty(shape: [vocab, nGroups], dtype: .f32)
+            scalesT.copyIn(from: scales)
+            let biasesT = Tensor.empty(shape: [vocab, nGroups], dtype: .f32)
+            biasesT.copyIn(from: biases)
+            let idsT = Tensor.empty(shape: [nTokens], dtype: .u32)
+            idsT.copyIn(from: tokens)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.dequantGather(
+                    weight: weight, scales: scalesT, biases: biasesT,
+                    tokenIds: idsT, hidden: hidden, bits: 8, groupSize: gs, on: cb
+                )
+            }
+
+            let got = out.toArray(as: Float.self)
+            for t in 0..<nTokens {
+                let row = Int(tokens[t])
+                for d in 0..<hidden {
+                    let g = d / gs
+                    let s = scales[row * nGroups + g]
+                    let b = biases[row * nGroups + g]
+                    let expected = Float(q[row][d]) * s + b
+                    #expect(abs(got[t * hidden + d] - expected) < 1e-3,
+                            "token \(t) (row \(row)) d=\(d): got \(got[t * hidden + d]) expected \(expected)")
+                }
+            }
+        }
+    }
 }

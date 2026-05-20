@@ -455,4 +455,135 @@ struct OpsTests {
             #expect(runGPUSample(logits: bf16, temperature: 1.0, uniform: 0.5) == 2)
         }
     }
+
+    // MARK: - argmax (GPU reduction kernel)
+
+    /// Direct test of `Ops.argmax`. The GPU reduction kernel must return
+    /// the index of the largest logit. Uses a vocab-realistic length so
+    /// the 256-thread reduction spans many elements per thread.
+    @Test("argmax f32 — GPU reduction returns index of the largest logit")
+    func argmaxF32() {
+        autoreleasepool {
+            // Production-realistic logits length (covers the per-thread
+            // strided scan in the 256-thread reduction).
+            let n = 4096
+            var logits = [Float](repeating: 0, count: n)
+            for i in 0..<n { logits[i] = Float((i * 31) % 997) * 0.001 }
+            let peak = 2718
+            logits[peak] = 99.0   // unambiguous maximum
+            let cpuArgmax = logits.indices.max(by: { logits[$0] < logits[$1] })!
+
+            let logitsT = Tensor.empty(shape: [n], dtype: .f32)
+            logitsT.copyIn(from: logits)
+            let out = Tensor.empty(shape: [1], dtype: .u32)
+            runAndWait { cb in Ops.argmax(logitsT, into: out, on: cb) }
+            #expect(Int(out.toArray(as: UInt32.self)[0]) == cpuArgmax)
+            #expect(Int(out.toArray(as: UInt32.self)[0]) == peak)
+        }
+    }
+
+    /// argmax over f16/bf16 logits — exercises the half-precision kernel
+    /// variants. The peak is large enough to survive bf16's 8-bit mantissa.
+    @Test("argmax f16/bf16 — half-precision reduction returns the peak index")
+    func argmaxHalfPrecision() {
+        autoreleasepool {
+            let n = 512
+
+            let f16 = Tensor.empty(shape: [n], dtype: .f16)
+            // Ramp of small values, one clear peak at index 300.
+            var f16Data = (0..<n).map { Float16(Float($0 % 7) * 0.5) }
+            f16Data[300] = 64.0
+            f16.copyIn(from: f16Data)
+            let outF16 = Tensor.empty(shape: [1], dtype: .u32)
+            runAndWait { cb in Ops.argmax(f16, into: outF16, on: cb) }
+            #expect(Int(outF16.toArray(as: UInt32.self)[0]) == 300)
+
+            let bf16 = Tensor.empty(shape: [n], dtype: .bf16)
+            // bf16 bits: ramp of small values, one peak (0x4280 = bf16(64.0)).
+            var bf16Bits = [UInt16](repeating: 0x3F00, count: n)   // bf16(0.5)
+            bf16Bits[123] = 0x4280                                  // bf16(64.0)
+            bf16.copyIn(from: bf16Bits)
+            let outBf16 = Tensor.empty(shape: [1], dtype: .u32)
+            runAndWait { cb in Ops.argmax(bf16, into: outBf16, on: cb) }
+            #expect(Int(outBf16.toArray(as: UInt32.self)[0]) == 123)
+        }
+    }
+
+    // MARK: - softplus
+
+    /// Direct test of `Ops.softplus`: out[i] = log(1 + exp(x[i])).
+    @Test("softplus f32 — out[i] = log(1 + exp(x[i]))")
+    func softplusF32() {
+        autoreleasepool {
+            let xs: [Float] = [0, 1, -1, 2, -5, 8, -20]
+            let x = Tensor.empty(shape: [xs.count], dtype: .f32)
+            x.copyIn(from: xs)
+            var out: Tensor!
+            runAndWait { cb in out = Ops.softplus(x, on: cb) }
+            let r = out.toArray(as: Float.self)
+            for i in 0..<xs.count {
+                // Numerically-stable CPU reference: softplus(x) =
+                // max(x,0) + log1p(exp(-|x|)).
+                let v = xs[i]
+                let expected = max(v, 0) + Float(log1p(Double(exp(-abs(v)))))
+                #expect(abs(r[i] - expected) < 1e-3,
+                        "i=\(i) x=\(v) got \(r[i]) expected \(expected)")
+            }
+        }
+    }
+
+    // MARK: - rmsNormRows (multi-row RMSNorm reduction kernel)
+
+    /// Direct test of `Ops.rmsNormRows`. Each of `nRows` rows is
+    /// independently normalized: y = x / rms(x) * weight. The kernel is
+    /// reduction-mode — rowSize must satisfy the rms_norm dispatch
+    /// invariant (multiple of 128; one threadgroup per row).
+    @Test("rmsNormRows f32 — each row independently normalized")
+    func rmsNormRowsF32() {
+        autoreleasepool {
+            // rowSize=128 is the smallest legal size (32-lane simdgroup ×
+            // 4 elements/thread → TPG = rowSize/4 = 32). See Ops.rmsNorm /
+            // mlx/rms_norm.rs DISPATCH INVARIANTS.
+            let nRows = 3
+            let rowSize = 128
+            let eps: Float = 1e-6
+
+            // Distinct data per row so a row-offset bug would surface.
+            var xData = [Float](repeating: 0, count: nRows * rowSize)
+            for row in 0..<nRows {
+                for d in 0..<rowSize {
+                    xData[row * rowSize + d] = Float(d + 1) * Float(row + 1) * 0.1
+                }
+            }
+            // Non-uniform weight so the weight multiply is exercised.
+            let wData: [Float] = (0..<rowSize).map { 1.0 + Float($0 % 5) * 0.1 }
+
+            let x = Tensor.empty(shape: [nRows, rowSize], dtype: .f32)
+            x.copyIn(from: xData)
+            let w = Tensor.empty(shape: [rowSize], dtype: .f32)
+            w.copyIn(from: wData)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.rmsNormRows(x, weight: w, eps: eps,
+                                      nRows: nRows, rowSize: rowSize, on: cb)
+            }
+            let r = out.toArray(as: Float.self)
+
+            for row in 0..<nRows {
+                var ssq: Float = 0
+                for d in 0..<rowSize {
+                    let v = xData[row * rowSize + d]
+                    ssq += v * v
+                }
+                let rms = (ssq / Float(rowSize) + eps).squareRoot()
+                for d in 0..<rowSize {
+                    let expected = xData[row * rowSize + d] / rms * wData[d]
+                    let got = r[row * rowSize + d]
+                    #expect(abs(got - expected) < 1e-2,
+                            "row=\(row) d=\(d) got \(got) expected \(expected)")
+                }
+            }
+        }
+    }
 }
