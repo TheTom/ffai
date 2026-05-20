@@ -119,4 +119,25 @@ public struct KVEvictionState {
     public mutating func reset() {
         absoluteCount = 0
     }
+
+    /// Roll the cache state back to `length` appended tokens, discarding
+    /// the tail. Used by speculative decoding to drop rejected draft
+    /// tokens after a verify pass. The physical buffer slots are left
+    /// untouched — the next `reserveNextSlot()` simply overwrites them.
+    ///
+    /// `length` must be in `0...self.length`. For `.window` policies the
+    /// rollback must stay within the pre-rotation region
+    /// (`absoluteCount ≤ maxSize`) so slot indices remain identity-mapped
+    /// with their absolute positions; rolling back a rotated ring buffer
+    /// is rejected.
+    public mutating func truncate(toLength length: Int) {
+        precondition(length >= 0 && length <= self.length,
+                     "KVEvictionState.truncate: length \(length) out of range 0...\(self.length)")
+        if case .window(let maxSize, _) = policy {
+            precondition(absoluteCount <= maxSize,
+                         "KVEvictionState.truncate: unsupported after window rotation "
+                         + "(absoluteCount \(absoluteCount) > maxSize \(maxSize))")
+        }
+        absoluteCount = length
+    }
 }

@@ -141,6 +141,44 @@ public enum OpsValidation {
         return nil
     }
 
+    // ─── sdpa_multi ────────────────────────────────────────────────
+    //
+    // `ffai_sdpa_multi` is a reduction kernel — same machine-freeze
+    // hazard as `sdpa_decode` (TPG below 32 → infinite GPU loop). The
+    // wrapper hard-fixes TPG = 1024 so the geometry can't reach the
+    // freeze condition; what this validates is the shape contract the
+    // kernel indexes against. head_dim is 128-only: each lane owns
+    // 128/32 = 4 consecutive elements, indexed unconditionally.
+
+    public static func validateSdpaMulti(
+        headDim: Int, nQHeads: Int, nKVHeads: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int
+    ) -> String? {
+        if headDim != 128 {
+            return "head_dim must be 128 (got \(headDim)); ffai_sdpa_multi is head_dim-128 only"
+        }
+        if nQHeads <= 0 {
+            return "nQHeads must be positive (got \(nQHeads))"
+        }
+        if nKVHeads <= 0 {
+            return "nKVHeads must be positive (got \(nKVHeads))"
+        }
+        if !nQHeads.isMultiple(of: nKVHeads) {
+            return "nQHeads (\(nQHeads)) must be a multiple of nKVHeads (\(nKVHeads))"
+        }
+        if nQuery < 1 {
+            return "nQuery must be ≥ 1 (got \(nQuery))"
+        }
+        if baseKV < 0 {
+            return "baseKV must be non-negative (got \(baseKV))"
+        }
+        if baseKV + nQuery > kvStride {
+            return "baseKV+nQuery (\(baseKV + nQuery)) must not exceed kvStride "
+                + "(\(kvStride)) — kernel would read past cache"
+        }
+        return nil
+    }
+
     // ─── gemv ──────────────────────────────────────────────────────
     //
     // `mt_gemv` (MLX-derived). Adaptive `lsize` reduction → no GPU-pin
@@ -154,6 +192,31 @@ public enum OpsValidation {
         }
         if inDim <= 0 {
             return "inDim must be positive (got \(inDim))"
+        }
+        return nil
+    }
+
+    // ─── gemm (multi-row) ──────────────────────────────────────────
+    //
+    // `ffai_gemm` — tiled `out[r,:] = weight · input[r,:]` over a block
+    // of rows. Reduction-mode (threadgroup tiles + barriers), TPG hard-
+    // fixed at 1024 by the wrapper. The one shape contract the kernel
+    // can't check: `inDim % 16 == 0` — the K loop strides by the
+    // 16-wide tile with no remainder handling, so an unaligned inDim
+    // silently drops the trailing partial tile.
+
+    public static func validateGemm(inDim: Int, outDim: Int, nRows: Int) -> String? {
+        if inDim <= 0 {
+            return "inDim must be positive (got \(inDim))"
+        }
+        if outDim <= 0 {
+            return "outDim must be positive (got \(outDim))"
+        }
+        if nRows <= 0 {
+            return "nRows must be positive (got \(nRows))"
+        }
+        if !inDim.isMultiple(of: 16) {
+            return "inDim (\(inDim)) must be a multiple of 16 — the K tile width"
         }
         return nil
     }

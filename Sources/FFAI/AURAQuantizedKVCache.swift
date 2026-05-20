@@ -206,6 +206,10 @@ public final class AURAQuantizedKVCache: KVCacheProtocol, @unchecked Sendable {
 
     public func reset() { lengthLock.withLock { _evictionState.reset() } }
 
+    public func truncate(toLength length: Int) {
+        lengthLock.withLock { _evictionState.truncate(toLength: length) }
+    }
+
     /// Encode the current step's K + V into the compressed storage.
     /// `kFlat` and `vFlat` come in as [nKVHeads, headDim] in the model's
     /// dtype (bf16/f16/f32) — the encode kernel is dtype-generic, so no

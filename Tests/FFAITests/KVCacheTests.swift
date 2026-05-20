@@ -504,4 +504,59 @@ struct KVCacheTests {
                     "expected \(workers * iterations) appends, got \(c.length)")
         }
     }
+
+    // MARK: - truncate (speculative-decoding rollback)
+
+    @Test("truncate rolls KVCache length back; re-append overwrites the tail")
+    func truncateRollsBackAndReappends() {
+        autoreleasepool {
+            let c = KVCache(nKVHeads: 1, headDim: 2, maxSeq: 16, dtype: .f32)
+            let device = Device.shared
+            let buf = device.makeBuffer(length: 8)
+            func appendStamp(_ value: Float) {
+                buf.contents().assumingMemoryBound(to: Float.self)[0] = value
+                buf.contents().assumingMemoryBound(to: Float.self)[1] = value
+                let t = Tensor(buffer: buf, offset: 0, shape: [1, 2], dtype: .f32)
+                c.append(kFlat: t, vFlat: t)
+            }
+            for i in 0..<8 { appendStamp(Float(i) + 1) }
+            #expect(c.length == 8)
+
+            // Reject the last 5 draft tokens, keep a 3-token prefix.
+            c.truncate(toLength: 3)
+            #expect(c.length == 3)
+            #expect(c.absolutePosition == 3)
+
+            // Re-append: the new token lands in physical slot 3,
+            // overwriting the discarded value.
+            appendStamp(99)
+            #expect(c.length == 4)
+            let kPtr = c.kBuffer.buffer.contents()
+                .advanced(by: c.kBuffer.offset)
+                .assumingMemoryBound(to: Float.self)
+            #expect(kPtr[3 * 2] == 99.0)
+        }
+    }
+
+    @Test("truncate works on AffineQuantizedKVCache")
+    func truncateAffineQuantized() {
+        autoreleasepool {
+            let maxSeq = 16, nKVHeads = 1, headDim = 8
+            let wk = Tensor.empty(shape: [nKVHeads, maxSeq, headDim], dtype: .f32)
+            let wv = Tensor.empty(shape: [nKVHeads, maxSeq, headDim], dtype: .f32)
+            let c = AffineQuantizedKVCache(
+                nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq, dtype: .f32,
+                bits: 8, groupSize: 8, sharedWorkingK: wk, sharedWorkingV: wv)
+            let cmd = Device.shared.makeCommandBuffer()
+            let kFlat = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            let vFlat = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+            kFlat.copyIn(from: [Float](repeating: 1, count: headDim))
+            vFlat.copyIn(from: [Float](repeating: 1, count: headDim))
+            for _ in 0..<6 { c.appendOnGPU(kFlat: kFlat, vFlat: vFlat, on: cmd) }
+            cmd.commit(); cmd.waitUntilCompleted()
+            #expect(c.length == 6)
+            c.truncate(toLength: 2)
+            #expect(c.length == 2)
+        }
+    }
 }

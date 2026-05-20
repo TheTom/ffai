@@ -64,6 +64,15 @@ public struct LoadOptions: Sendable {
     /// Has no effect when `idOrPath` resolves to a local directory.
     public var cacheDirectory: URL?
 
+    /// Maximum context length the KV cache is sized for. `nil` (the
+    /// default) lets the model family pick a sane default — useful for
+    /// checkpoints that advertise an extreme context (e.g. a YaRN
+    /// 262144 window), where allocating the full depth would need tens
+    /// of GB. Set this to size the cache for a specific context: pass
+    /// the checkpoint's full `max_position_embeddings` to use the
+    /// entire advertised window, or a smaller value to bound memory.
+    public var maxContextLength: Int?
+
     public init(
         capabilities: Set<Capability> = Capability.textOnly,
         kvCache: KVCacheKind = .raw,
@@ -72,7 +81,8 @@ public struct LoadOptions: Sendable {
         prewarm: Bool = true,
         lazyCapabilities: Bool = true,
         revision: String = "main",
-        cacheDirectory: URL? = nil
+        cacheDirectory: URL? = nil,
+        maxContextLength: Int? = nil
     ) {
         self.capabilities = capabilities.union(Capability.textOnly)
         self.kvCache = kvCache
@@ -82,5 +92,6 @@ public struct LoadOptions: Sendable {
         self.lazyCapabilities = lazyCapabilities
         self.revision = revision
         self.cacheDirectory = cacheDirectory
+        self.maxContextLength = maxContextLength
     }
 }

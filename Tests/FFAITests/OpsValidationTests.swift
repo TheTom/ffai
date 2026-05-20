@@ -181,6 +181,97 @@ struct OpsValidationTests {
             nKV: 64, kvStride: 256, sinkEnd: -1, windowStart: 4) != nil)
     }
 
+    // ─── sdpaMulti ─────────────────────────────────────────────────
+
+    @Test("sdpaMulti accepts production block-forward shapes")
+    func sdpaMultiAcceptsLegal() {
+        // Nemotron-Labs-Diffusion 3B: 32 q-heads / 8 kv-heads, head_dim
+        // 128, a 32-token block on top of a cached prefix.
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 32, nKVHeads: 8,
+            baseKV: 64, nQuery: 32, kvStride: 96) == nil)
+        // No prefix (first block).
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 32, nKVHeads: 8,
+            baseKV: 0, nQuery: 32, kvStride: 32) == nil)
+        // MHA (no GQA fan-out).
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 4, nKVHeads: 4,
+            baseKV: 8, nQuery: 8, kvStride: 4096) == nil)
+    }
+
+    @Test("sdpaMulti rejects head_dim != 128")
+    func sdpaMultiRejectsBadHeadDim() {
+        // The kernel hardcodes 4 elements/lane (128/32); other head
+        // dims OOB-read.
+        for hd in [32, 64, 96, 256] {
+            #expect(OpsValidation.validateSdpaMulti(
+                headDim: hd, nQHeads: 8, nKVHeads: 8,
+                baseKV: 0, nQuery: 8, kvStride: 8) != nil,
+                "head_dim \(hd) should be rejected")
+        }
+    }
+
+    @Test("sdpaMulti rejects non-integer GQA fan-out")
+    func sdpaMultiRejectsBadGQA() {
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 7, nKVHeads: 4,
+            baseKV: 0, nQuery: 8, kvStride: 8) != nil)
+    }
+
+    @Test("sdpaMulti rejects empty block and out-of-range baseKV")
+    func sdpaMultiRejectsBadBlock() {
+        // nQuery must be ≥ 1.
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 8, nKVHeads: 8,
+            baseKV: 0, nQuery: 0, kvStride: 8) != nil)
+        // Negative prefix.
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 8, nKVHeads: 8,
+            baseKV: -1, nQuery: 8, kvStride: 8) != nil)
+    }
+
+    @Test("sdpaMulti rejects baseKV + nQuery > kvStride")
+    func sdpaMultiRejectsOverflowingCache() {
+        // The block's K/V would land past the allocated cache depth.
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 8, nKVHeads: 8,
+            baseKV: 80, nQuery: 32, kvStride: 96) != nil)
+        // Exactly full is fine.
+        #expect(OpsValidation.validateSdpaMulti(
+            headDim: 128, nQHeads: 8, nKVHeads: 8,
+            baseKV: 64, nQuery: 32, kvStride: 96) == nil)
+    }
+
+    // ─── gemm (multi-row) ──────────────────────────────────────────
+
+    @Test("gemm accepts production projection shapes")
+    func gemmAcceptsLegal() {
+        // Nemotron-Labs-Diffusion projections — every inDim is a
+        // multiple of 16.
+        #expect(OpsValidation.validateGemm(inDim: 3072, outDim: 4096, nRows: 32) == nil)
+        #expect(OpsValidation.validateGemm(inDim: 4096, outDim: 3072, nRows: 32) == nil)
+        #expect(OpsValidation.validateGemm(inDim: 9216, outDim: 3072, nRows: 8) == nil)
+        // Edge row/col counts (not multiples of 32) are fine — handled
+        // in-kernel.
+        #expect(OpsValidation.validateGemm(inDim: 48, outDim: 100, nRows: 20) == nil)
+    }
+
+    @Test("gemm rejects inDim not a multiple of 16")
+    func gemmRejectsUnalignedInDim() {
+        // The K loop strides by the 16-wide tile with no remainder
+        // handling — an unaligned inDim drops the trailing elements.
+        #expect(OpsValidation.validateGemm(inDim: 3000, outDim: 64, nRows: 32) != nil)
+        #expect(OpsValidation.validateGemm(inDim: 17, outDim: 64, nRows: 32) != nil)
+    }
+
+    @Test("gemm rejects non-positive dimensions")
+    func gemmRejectsNonPositive() {
+        #expect(OpsValidation.validateGemm(inDim: 0, outDim: 64, nRows: 32) != nil)
+        #expect(OpsValidation.validateGemm(inDim: 64, outDim: 0, nRows: 32) != nil)
+        #expect(OpsValidation.validateGemm(inDim: 64, outDim: 64, nRows: 0) != nil)
+    }
+
     // ─── auraEncode ────────────────────────────────────────────────
 
     @Test("auraEncode accepts production shapes")

@@ -70,6 +70,17 @@ struct GenerateCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Number of initial positions kept across FIFO eviction (attention sinks). Default 0. Only meaningful when --kv-window-size is set.")
     var kvWindowKeep: Int?
 
+    // ─── Nemotron-Labs-Diffusion tri-mode decoding ───────────────────
+
+    @Option(name: .long, help: "Decoding mode: \"ar\" (autoregressive, default), \"diffusion\" (block-wise parallel), or \"self-spec\" (diffusion draft + AR verify). diffusion / self-spec require a Nemotron-Labs-Diffusion model.")
+    var mode: String = "ar"
+
+    @Option(name: .long, help: "Block length for diffusion / self-spec decoding. Default 32.")
+    var blockLength: Int = 32
+
+    @Option(name: .long, help: "Confidence threshold for diffusion-mode denoising (0..1). Unset uses an even per-step transfer budget.")
+    var confidenceThreshold: Float?
+
     func run() async throws {
         // Apply --debug + --profiling before any FFAI work so the
         // model-load path is captured.
@@ -143,6 +154,47 @@ struct GenerateCommand: AsyncParsableCommand {
                     print("  \(id) (\(String(format: "%.4f", v)))  \"\(s)\"")
                 }
             }
+            return
+        }
+
+        // Non-autoregressive modes — block-wise diffusion or linear
+        // self-speculation (Nemotron-Labs-Diffusion only).
+        let genMode = mode.lowercased()
+        if genMode != "ar" {
+            guard genMode == "diffusion" || genMode == "self-spec" || genMode == "selfspec"
+            else {
+                throw ValidationError("Unknown --mode \"\(mode)\". Use ar, diffusion, or self-spec.")
+            }
+            guard m.nemotronLabsDiffusion != nil else {
+                throw ValidationError("--mode \(mode) requires a Nemotron-Labs-Diffusion model "
+                    + "(\(model) does not support it).")
+            }
+            let isDiffusion = genMode == "diffusion"
+            // Diffusion requires maxNewTokens to be a multiple of the
+            // block length; round down (min one block).
+            let requested = maxTokens ?? 128
+            let maxNew = isDiffusion
+                ? max(blockLength, (requested / blockLength) * blockLength)
+                : requested
+            let diffParams = DiffusionParameters(
+                maxNewTokens: maxNew, blockLength: blockLength,
+                confidenceThreshold: isDiffusion ? confidenceThreshold : nil)
+
+            print("---")
+            print(prompt)
+            let start = Date()
+            let result = isDiffusion
+                ? m.generateDiffusion(prompt: prompt, parameters: diffParams)
+                : m.generateSelfSpeculative(prompt: prompt, parameters: diffParams)
+            let elapsed = Date().timeIntervalSince(start)
+            print(result.text)
+            print("---")
+            let tps = Double(result.generatedTokens.count) / max(elapsed, 1e-9)
+            print("generated: \(result.generatedTokens.count) tokens in "
+                  + "\(String(format: "%.2f", elapsed))s "
+                  + "(\(String(format: "%.2f", tps)) tok/s, "
+                  + "\(result.forwardPasses) forward passes, "
+                  + "\(String(format: "%.2f", Double(result.generatedTokens.count) / Double(result.forwardPasses))) tokens/forward)")
             return
         }
 

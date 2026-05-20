@@ -77,6 +77,15 @@ public protocol KVCacheProtocol: LayerCacheProtocol {
     /// `[nKVHeads, maxSeq, headDim]` — SDPA's `kvStride = maxSeq`,
     /// `nKV = length`.
     func prepareForAttention(on cmd: MTLCommandBuffer) -> (k: Tensor, v: Tensor)
+
+    /// Roll the cache back to `length` filled positions, discarding the
+    /// tail. Physical K/V storage is left intact — the next append
+    /// overwrites the discarded slots. Used by speculative decoding to
+    /// drop rejected draft tokens after an AR verify pass (e.g.
+    /// Nemotron-Labs-Diffusion self-speculation). `.unbounded` caches
+    /// only; `.window` rejects once the ring buffer has rotated — see
+    /// `KVEvictionState.truncate(toLength:)`.
+    func truncate(toLength length: Int)
 }
 
 public extension KVCacheProtocol {
@@ -211,6 +220,54 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
 
     public func reset() { lengthLock.withLock { _evictionState.reset() } }
 
+    public func truncate(toLength length: Int) {
+        lengthLock.withLock { _evictionState.truncate(toLength: length) }
+    }
+
+    /// Append `kRows`/`vRows` (each `[nKVHeads, headDim]`) as consecutive
+    /// timesteps in one call, bumping `length` by `kRows.count`. Used by
+    /// multi-token forwards (diffusion-block commit, multi-token
+    /// prefill) — equivalent to N back-to-back `appendOnGPU` calls but
+    /// takes the length lock once.
+    public func appendRangeOnGPU(kRows: [Tensor], vRows: [Tensor],
+                                 on cmd: MTLCommandBuffer) {
+        precondition(kRows.count == vRows.count,
+                     "KVCache.appendRangeOnGPU: kRows (\(kRows.count)) / vRows "
+                     + "(\(vRows.count)) count mismatch")
+        lengthLock.withLock {
+            for (kFlat, vFlat) in zip(kRows, vRows) {
+                precondition(kFlat.dtype == dtype && vFlat.dtype == dtype,
+                             "KVCache.appendRangeOnGPU: dtype mismatch")
+                let pos = _evictionState.reserveNextSlot()
+                Ops.kvCacheUpdate(src: kFlat, into: kBuffer,
+                                  nKVHeads: nKVHeads, headDim: headDim,
+                                  maxSeq: maxSeq, position: pos, on: cmd)
+                Ops.kvCacheUpdate(src: vFlat, into: vBuffer,
+                                  nKVHeads: nKVHeads, headDim: headDim,
+                                  maxSeq: maxSeq, position: pos, on: cmd)
+            }
+        }
+    }
+
+    /// Write one timestep's K/V at an explicit physical slot **without**
+    /// touching `length`. Diffusion-block forwards stage their scratch
+    /// K/V in the buffer's free region `[length, maxSeq)` across denoise
+    /// iterations before a final commit. Caller guarantees the slot is
+    /// free. No lock — `length` is unchanged, so no shared state moves.
+    public func writeTimestepOnGPU(kFlat: Tensor, vFlat: Tensor,
+                                   atSlot slot: Int, on cmd: MTLCommandBuffer) {
+        precondition(kFlat.dtype == dtype && vFlat.dtype == dtype,
+                     "KVCache.writeTimestepOnGPU: dtype mismatch")
+        precondition(slot >= 0 && slot < maxSeq,
+                     "KVCache.writeTimestepOnGPU: slot \(slot) out of range 0..<\(maxSeq)")
+        Ops.kvCacheUpdate(src: kFlat, into: kBuffer,
+                          nKVHeads: nKVHeads, headDim: headDim,
+                          maxSeq: maxSeq, position: slot, on: cmd)
+        Ops.kvCacheUpdate(src: vFlat, into: vBuffer,
+                          nKVHeads: nKVHeads, headDim: headDim,
+                          maxSeq: maxSeq, position: slot, on: cmd)
+    }
+
     /// Raw cache exposes its storage buffers directly; no per-step
     /// work is needed before SDPA.
     public func prepareForAttention(on cmd: MTLCommandBuffer) -> (k: Tensor, v: Tensor) {
@@ -343,6 +400,10 @@ public final class AffineQuantizedKVCache: KVCacheProtocol, @unchecked Sendable 
     }
 
     public func reset() { lengthLock.withLock { _evictionState.reset() } }
+
+    public func truncate(toLength length: Int) {
+        lengthLock.withLock { _evictionState.truncate(toLength: length) }
+    }
 
     public func appendOnGPU(kFlat: Tensor, vFlat: Tensor,
                             on cmd: MTLCommandBuffer) {

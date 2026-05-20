@@ -763,4 +763,179 @@ struct OpsTests {
             }
         }
     }
+
+    @Test("sdpaMulti — uniform K gives uniform attention (output = mean V)")
+    func sdpaMultiUniformKMeansV() {
+        autoreleasepool {
+            // With every K row identical, all scores tie → softmax is
+            // uniform → each query's output is the plain mean of the
+            // attended V rows. A reference that needs no SDPA oracle.
+            let headDim = 128, nQHeads = 2, nKVHeads = 1
+            let baseKV = 0, nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0..<nQuery * nQHeads * headDim).map { Float($0 % 7) * 0.1 })
+
+            // K: every row the same constant vector.
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+
+            // V: row t holds the constant value `t` so the mean is easy.
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0..<kvStride {
+                for d in 0..<headDim { vData[t * headDim + d] = Float(t) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+
+            let cmd = Device.shared.makeCommandBuffer()
+            // Full (non-causal) mode → every query attends all 4 V rows,
+            // so each output element is mean(0,1,2,3) = 1.5.
+            let out = Ops.sdpaMulti(q: q, k: k, v: v,
+                                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                                    causal: false, scale: scale, on: cmd)
+            cmd.commit(); cmd.waitUntilCompleted()
+
+            let result = out.toArray(as: Float.self)
+            #expect(result.count == nQuery * nQHeads * headDim)
+            for value in result {
+                #expect(abs(value - 1.5) < 1e-3, "expected mean V = 1.5, got \(value)")
+            }
+        }
+    }
+
+    @Test("sdpaMulti — causal mode: query r attends V rows 0...r")
+    func sdpaMultiCausalPrefixMeans() {
+        autoreleasepool {
+            let headDim = 128, nQHeads = 1, nKVHeads = 1
+            let baseKV = 0, nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: [Float](repeating: 0.3, count: nQuery * nQHeads * headDim))
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0..<kvStride {
+                for d in 0..<headDim { vData[t * headDim + d] = Float(t) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+
+            let cmd = Device.shared.makeCommandBuffer()
+            let out = Ops.sdpaMulti(q: q, k: k, v: v,
+                                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                                    causal: true, scale: scale, on: cmd)
+            cmd.commit(); cmd.waitUntilCompleted()
+
+            // Causal: query r attends rows 0...r → output = mean(0...r).
+            let result = out.toArray(as: Float.self)
+            for r in 0..<nQuery {
+                let expected = Float(r) / 2.0   // mean(0,1,...,r)
+                for d in 0..<headDim {
+                    let got = result[r * headDim + d]
+                    #expect(abs(got - expected) < 1e-3,
+                            "query \(r) d=\(d): expected \(expected), got \(got)")
+                }
+            }
+        }
+    }
+
+    @Test("ropeYaRN — factor=1 collapses to plain RoPE")
+    func ropeYaRNFactorOneIsPlainRope() {
+        autoreleasepool {
+            // factor=1 → interpolation == extrapolation → the YaRN ramp
+            // is a no-op and the kernel reduces to plain RoPE. `.plain`
+            // also has attn_factor 1, so it must match Ops.rope exactly.
+            let headDim = 128, nHeads = 2
+            let qk = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            qk.copyIn(from: (0..<nHeads * headDim).map { Float($0 % 13) * 0.1 - 0.5 })
+
+            let cmd = Device.shared.makeCommandBuffer()
+            let plain = Ops.rope(qk, position: 64, headDim: headDim,
+                                 thetaBase: 1_000_000, scaling: .none, on: cmd)
+            let yarn = Ops.ropeYaRN(qk, position: 64, headDim: headDim,
+                                    thetaBase: 1_000_000, yarn: .plain, on: cmd)
+            cmd.commit(); cmd.waitUntilCompleted()
+
+            let p = plain.toArray(as: Float.self)
+            let y = yarn.toArray(as: Float.self)
+            for i in 0..<p.count {
+                #expect(abs(p[i] - y[i]) < 1e-5, "i=\(i): plain \(p[i]) vs yarn \(y[i])")
+            }
+        }
+    }
+
+    @Test("ropeYaRN — position 0 is identity")
+    func ropeYaRNIdentityAtPositionZero() {
+        autoreleasepool {
+            // position 0 → theta 0 → cos 1 / sin 0; attn_factor 1 → the
+            // rotation is the identity regardless of the YaRN band.
+            let headDim = 128, nHeads = 2
+            let input = (0..<nHeads * headDim).map { Float($0 % 7) * 0.1 }
+            let qk = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            qk.copyIn(from: input)
+
+            let yarn = Ops.RoPEYaRN.from(headDim: headDim, thetaBase: 1_000_000,
+                                         factor: 16, betaFast: 32, betaSlow: 1,
+                                         originalMaxPosition: 16384)
+            let cmd = Device.shared.makeCommandBuffer()
+            let out = Ops.ropeYaRN(qk, position: 0, headDim: headDim,
+                                   thetaBase: 1_000_000, yarn: yarn, on: cmd)
+            cmd.commit(); cmd.waitUntilCompleted()
+
+            let o = out.toArray(as: Float.self)
+            for i in 0..<o.count {
+                #expect(abs(o[i] - input[i]) < 1e-5, "i=\(i): expected \(input[i]), got \(o[i])")
+            }
+        }
+    }
+
+    @Test("RoPEYaRN.from derives a sane correction band")
+    func ropeYaRNFromCorrectionBand() {
+        // Nemotron-Labs-Diffusion params — the band must land inside
+        // [0, headDim) with high > low.
+        let y = Ops.RoPEYaRN.from(headDim: 128, thetaBase: 1_000_000,
+                                  factor: 16, betaFast: 32, betaSlow: 1,
+                                  originalMaxPosition: 16384)
+        #expect(y.factor == 16)
+        #expect(y.low >= 0 && y.low < y.high)
+        #expect(y.high <= 127)
+        #expect(y.attnFactor == 1)   // mscale == mscale_all_dim default
+    }
+
+    @Test("gemm — multi-row matmul matches a CPU reference")
+    func gemmMatchesCPU() {
+        autoreleasepool {
+            // out[r,o] = Σ_k weight[o,k]·input[r,k]. nRows / outDim are
+            // not multiples of the 32×32 tile — exercises the edge path.
+            let nRows = 5, inDim = 48, outDim = 7
+            let wData = (0..<outDim * inDim).map { Float($0 % 11) * 0.1 - 0.4 }
+            let xData = (0..<nRows * inDim).map { Float($0 % 9) * 0.1 - 0.2 }
+            let weight = Tensor.empty(shape: [outDim, inDim], dtype: .f32)
+            let input = Tensor.empty(shape: [nRows, inDim], dtype: .f32)
+            weight.copyIn(from: wData)
+            input.copyIn(from: xData)
+
+            let cmd = Device.shared.makeCommandBuffer()
+            let out = Ops.gemm(weight: weight, input: input, nRows: nRows, on: cmd)
+            cmd.commit(); cmd.waitUntilCompleted()
+
+            let got = out.toArray(as: Float.self)
+            #expect(got.count == nRows * outDim)
+            for r in 0..<nRows {
+                for o in 0..<outDim {
+                    var acc: Float = 0
+                    for k in 0..<inDim { acc += wData[o * inDim + k] * xData[r * inDim + k] }
+                    #expect(abs(got[r * outDim + o] - acc) < 1e-4,
+                            "r=\(r) o=\(o): expected \(acc), got \(got[r * outDim + o])")
+                }
+            }
+        }
+    }
 }

@@ -98,6 +98,40 @@ struct KVEvictionStateTests {
             #expect(s.reserveNextSlot() == i)
         }
     }
+
+    @Test("truncate rolls unbounded state back and resumes from that slot")
+    func truncateUnboundedRollsBack() {
+        var s = KVEvictionState(policy: .unbounded, bufferCapacity: 16)
+        for _ in 0..<10 { _ = s.reserveNextSlot() }
+        #expect(s.length == 10)
+        s.truncate(toLength: 6)
+        #expect(s.length == 6)
+        #expect(s.absolutePosition == 6)
+        // Next append continues from slot 6, overwriting the discarded tail.
+        #expect(s.reserveNextSlot() == 6)
+        #expect(s.reserveNextSlot() == 7)
+    }
+
+    @Test("truncate to current length and to zero are both valid")
+    func truncateBoundaries() {
+        var s = KVEvictionState(policy: .unbounded, bufferCapacity: 8)
+        for _ in 0..<5 { _ = s.reserveNextSlot() }
+        s.truncate(toLength: 5)        // no-op
+        #expect(s.length == 5)
+        s.truncate(toLength: 0)        // full rollback
+        #expect(s.length == 0)
+        #expect(s.reserveNextSlot() == 0)
+    }
+
+    @Test("truncate on a window cache before rotation is allowed")
+    func truncateWindowPreRotation() {
+        var s = KVEvictionState(policy: .window(maxSize: 8, keep: 0),
+                                bufferCapacity: 8)
+        for _ in 0..<5 { _ = s.reserveNextSlot() }   // absoluteCount 5 ≤ maxSize 8
+        s.truncate(toLength: 3)
+        #expect(s.length == 3)
+        #expect(s.reserveNextSlot() == 3)
+    }
 }
 
 @Suite("KVEviction — KVCache (raw) integration")

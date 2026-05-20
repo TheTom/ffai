@@ -24,6 +24,7 @@ For porting a new architecture, see
 | **Mamba 2** | [`Models/Mamba2.swift`](../Sources/FFAI/Models/Mamba2.swift) | `mamba2` | `Mamba2ForCausalLM` | `Mamba2Dense` |
 | **FalconH1** | [`Models/FalconH1.swift`](../Sources/FFAI/Models/FalconH1.swift) | `falcon_h1` | `FalconH1ForCausalLM` | `FalconH1Hybrid` |
 | **NemotronH** | [`Models/NemotronH.swift`](../Sources/FFAI/Models/NemotronH.swift) | `nemotron_h` | `NemotronHForCausalLM` | `NemotronHHybrid` |
+| **Nemotron-Labs-Diffusion** | [`Models/NemotronLabsDiffusion.swift`](../Sources/FFAI/Models/NemotronLabsDiffusion.swift) | `nemotron_labs_diffusion` | `NemotronLabsDiffusionModel` | `NemotronLabsDiffusionDense` |
 | **GraniteMoeHybrid** | [`Models/GraniteMoeHybrid.swift`](../Sources/FFAI/Models/GraniteMoeHybrid.swift) | `granitemoehybrid` | `GraniteMoeHybridForCausalLM` | `GraniteMoeHybridHybrid` |
 | **Jamba** | [`Models/Jamba.swift`](../Sources/FFAI/Models/Jamba.swift) | `jamba` | `JambaForCausalLM` | `JambaHybrid` |
 | **Qwen 3.5** | [`Models/Qwen35.swift`](../Sources/FFAI/Models/Qwen35.swift) | `qwen3_5`, `qwen3_5_moe` | `Qwen3_5ForConditionalGeneration`, `Qwen3_5MoeForConditionalGeneration` | `Qwen35Hybrid` |
@@ -160,6 +161,32 @@ attention with RoPE, RMSNorm, SwiGLU MLP. Qwen 3 adds per-head q_norm / k_norm
 RMSNorms applied to queries/keys *before* RoPE — the only structural
 difference vs Llama. No new kernels were needed for Qwen 3; just an
 extra RMSNorm site.
+
+Nemotron-Labs-Diffusion is NVIDIA's "tri-mode" model: the same dense
+Ministral/Llama-shaped weights decode as **autoregressive**, **block-wise
+diffusion**, or **linear self-speculation** (diffusion draft + AR
+verify). AR runs through the standard decode loop; the two
+non-autoregressive modes run through
+[`generateDiffusion` / `generateSelfSpeculative`](../Sources/FFAI/GenerateDiffusion.swift)
+or `ffai generate --mode diffusion|self-spec`. The diffusion /
+self-speculation modes require a raw KV cache (`LoadOptions.kvCache =
+.raw`, the default). RoPE uses the checkpoint's YaRN scaling via the
+`ffai_rope_yarn` kernel; the block forward uses the multi-query
+`ffai_sdpa_multi` attention kernel and the tiled `ffai_gemm` kernel for
+its projections (weight reused across the block's rows). The
+`linear_spec_lora` adapter auto-attaches
+for the self-speculation drafter and can be hot-swapped at runtime
+(`Model.loadLoRA` / `unloadLoRA`).
+
+The KV cache defaults to an 8192-token window — the checkpoint's YaRN
+context is 262144; set `LoadOptions.maxContextLength` to size the cache
+for a longer (or shorter) context.
+
+Not implemented: the trained diffusion sampler (its weights are not in
+the public checkpoint), quadratic self-speculation (paper-only; not in
+the released inference code), and the VLM variant (needs a vision
+encoder stack). Distinct from the `NemotronH` stack-interleaved hybrid
+family above.
 
 ## Sizes exercised
 
@@ -315,6 +342,20 @@ the shipped 90M / 0.5B / 1.5B all use `mamba_rms_norm=false` +
 scalar multipliers are already folded into the saved weights); the
 loader detects this via a conv1d-weight-shape probe and skips
 re-folding to avoid double-applying the multipliers.
+
+### Nemotron-Labs-Diffusion
+
+| Repo | Size | Quant | Notes |
+|---|---|---|---|
+| `nvidia/Nemotron-Labs-Diffusion-3B` | 3B | bf16 | Integration-test baseline — all three modes. |
+| `nvidia/Nemotron-Labs-Diffusion-8B` | 8B | bf16 | |
+| `nvidia/Nemotron-Labs-Diffusion-14B` | 14B | bf16 | |
+
+The integration test exercises autoregressive, block-wise diffusion,
+and linear self-speculation on the 3B checkpoint. The `-Base` repos and
+the `-VLM-8B` vision variant are untested. Self-speculation reports a
+forward-pass count (NFE) on `DiffusionResult` — the diffusion
+efficiency metric.
 
 ## Quantization
 

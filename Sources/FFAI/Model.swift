@@ -183,6 +183,18 @@ public enum ModelRegistry {
             return try loadQwen35(config: config, weights: weights,
                                   options: options, device: device)
         }
+
+        // Nemotron-Labs-Diffusion — tri-mode (AR / diffusion /
+        // self-speculation) dense transformer. Distinct from the
+        // NemotronH stack-interleaved hybrid family above.
+        if let arch = config.architecture, NemotronLabsDiffusion.architectures.contains(arch) {
+            return try loadNemotronLabsDiffusion(config: config, weights: weights,
+                                                 options: options, device: device)
+        }
+        if let mt = config.modelType, NemotronLabsDiffusion.modelTypes.contains(mt) {
+            return try loadNemotronLabsDiffusion(config: config, weights: weights,
+                                                 options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -330,6 +342,19 @@ public enum ModelRegistry {
         return Loaded(engine: engine,
                       defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+    public static func loadNemotronLabsDiffusion(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try NemotronLabsDiffusion.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
 }
 
 /// High-level loaded model with tokenizer attached. The public API users
@@ -373,6 +398,11 @@ public final class Model: @unchecked Sendable {
 
     /// Convenience accessor for the Qwen3.5 hybrid engine.
     public var qwen35: Qwen35Model? { engine as? Qwen35Model }
+
+    /// Convenience accessor for the Nemotron-Labs-Diffusion engine.
+    public var nemotronLabsDiffusion: NemotronLabsDiffusionModel? {
+        engine as? NemotronLabsDiffusionModel
+    }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
@@ -449,6 +479,13 @@ public final class Model: @unchecked Sendable {
                 let loaded = try ModelRegistry.dispatchAndLoad(
                     config: config, weights: bundle, options: options, device: device
                 )
+                // Nemotron-Labs-Diffusion ships an optional
+                // `linear_spec_lora` adapter that sharpens the
+                // self-speculation diffusion drafter — attach it if the
+                // checkpoint included the subfolder.
+                if let nd = loaded.engine as? NemotronLabsDiffusionModel {
+                    nd.attachLoRA(from: dir, device: device)
+                }
                 let tokenizer = try await TokenizerLoader().load(from: dir)
                 return Model(
                     engine: loaded.engine, tokenizer: tokenizer, config: config,
@@ -482,4 +519,28 @@ public final class Model: @unchecked Sendable {
         let cache = engine.makeLayerCaches()
         _ = engine.forward(tokenId: 0, position: 0, caches: cache)
     }
+}
+
+// ─── Hot LoRA adapter management ─────────────────────────────────────
+
+public extension Model {
+    /// Whether a LoRA adapter is currently attached. Always `false` for
+    /// families that don't support adapters (only Nemotron-Labs-
+    /// Diffusion does today).
+    var hasLoRA: Bool { nemotronLabsDiffusion?.hasLoRA ?? false }
+
+    /// Hot-load a LoRA adapter at runtime. `directory` may be the model
+    /// directory (the adapter is resolved under `linear_spec_lora/`) or
+    /// a directory holding `adapter_model.safetensors` directly — so the
+    /// same call swaps in the bundled adapter or an external one. Any
+    /// currently-attached adapter is replaced. No-op on families that
+    /// don't support adapters. Do not call during an active generate.
+    func loadLoRA(from directory: URL, device: Device = .shared) {
+        guard let nd = nemotronLabsDiffusion else { return }
+        nd.detachLoRA()
+        nd.attachLoRA(from: directory, device: device)
+    }
+
+    /// Hot-unload the current LoRA adapter. No-op when none is attached.
+    func unloadLoRA() { nemotronLabsDiffusion?.detachLoRA() }
 }

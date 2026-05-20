@@ -45,6 +45,7 @@ Capability.textWithTools  // [.textIn, .textOut, .toolCalling]
 | `Mamba2.Mamba2Dense` | `[.textIn, .textOut]` |
 | `FalconH1.FalconH1Hybrid` | `[.textIn, .textOut]` |
 | `NemotronH.NemotronHHybrid` | `[.textIn, .textOut]` |
+| `NemotronLabsDiffusion.NemotronLabsDiffusionDense` | `[.textIn, .textOut]` |
 | `GraniteMoeHybrid.GraniteMoeHybridHybrid` | `[.textIn, .textOut]` |
 | `Jamba.JambaHybrid` | `[.textIn, .textOut]` |
 | `Qwen35.Qwen35Hybrid` | `[.textIn, .textOut]` |

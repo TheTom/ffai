@@ -332,6 +332,64 @@ public enum Ops {
         return result
     }
 
+    /// Multi-row GEMM — `out[r, :] = weight · input[r, :]` for a block
+    /// of `nRows` rows in one dispatch. `weight` is `[outDim, inDim]`,
+    /// `input` is `[nRows, inDim]`, output is `[nRows, outDim]`.
+    ///
+    /// `ffai_gemm` tiles the output 32×32 and stages weight + input
+    /// tiles in threadgroup memory, so the weight is read once and
+    /// reused across the block's rows — the projection-bandwidth win
+    /// the diffusion / self-speculation block forward depends on.
+    /// Reduction-mode kernel; the 1024-thread dispatch is hard.
+    public static func gemm(weight: Tensor, input: Tensor, nRows: Int,
+                            on cmd: MTLCommandBuffer,
+                            into out: Tensor? = nil) -> Tensor {
+        precondition(weight.shape.count == 2, "Ops.gemm: weight must be 2D")
+        let outDim = weight.shape[0]
+        let inDim = weight.shape[1]
+        if let reason = OpsValidation.validateGemm(inDim: inDim, outDim: outDim, nRows: nRows) {
+            preconditionFailure("Ops.gemm: \(reason)")
+        }
+        precondition(input.elementCount == nRows * inDim,
+                     "Ops.gemm: input has \(input.elementCount) elements, expected "
+                     + "nRows*inDim = \(nRows * inDim)")
+        precondition(weight.dtype == input.dtype, "Ops.gemm: weight/input dtype mismatch")
+        let result = out ?? Tensor.empty(shape: [nRows, outDim], dtype: weight.dtype)
+        // 32×32 output tiles, TPG = 1024. 1-D thread grid that Metal
+        // slices into (outDim/32 ceil) × (nRows/32 ceil) threadgroups.
+        let threadsPerGroup = 1024
+        let nTiles = (outDim + 31) / 32
+        let mTiles = (nRows + 31) / 32
+        let grid = MTLSize(width: nTiles * threadsPerGroup, height: mTiles, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        switch weight.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gemm_f32(
+                weight: weight.buffer, weightOffset: weight.offset,
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_dim: UInt32(inDim), out_dim: UInt32(outDim), n_rows: UInt32(nRows),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gemm_f16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_dim: UInt32(inDim), out_dim: UInt32(outDim), n_rows: UInt32(nRows),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gemm_bf16(
+                weight: weight.buffer, weightOffset: weight.offset,
+                input: input.buffer, inputOffset: input.offset,
+                out: result.buffer, outOffset: result.offset,
+                in_dim: UInt32(inDim), out_dim: UInt32(outDim), n_rows: UInt32(nRows),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gemm: unsupported dtype \(weight.dtype)")
+        }
+        return result
+    }
+
     /// RMSNorm. x: [n], weight: [n], eps: scalar.
     /// Internally bound as a 1-element f32 buffer.
     /// Reduction kernel — one threadgroup per row.
@@ -599,6 +657,105 @@ public enum Ops {
         default:
             fatalError("Ops.ropePartial: unsupported dtype \(qk.dtype)")
         }
+    }
+
+    /// YaRN RoPE parameters. `low` / `high` are the correction-range
+    /// bounds — precomputed via `RoPEYaRN.from(...)` since they need a
+    /// `floor`/`ceil`/`ln` computation that is constant across the
+    /// dispatch. `factor == 1` collapses YaRN to plain RoPE.
+    public struct RoPEYaRN: Sendable {
+        public var factor: Float
+        public var low: Float
+        public var high: Float
+        public var attnFactor: Float
+
+        public init(factor: Float, low: Float, high: Float, attnFactor: Float = 1) {
+            self.factor = factor
+            self.low = low
+            self.high = high
+            self.attnFactor = attnFactor
+        }
+
+        /// Plain RoPE — `factor == 1` makes interpolation == extrapolation,
+        /// so the ramp blend is a no-op.
+        public static let plain = RoPEYaRN(factor: 1, low: 0, high: 1, attnFactor: 1)
+
+        /// Build YaRN parameters from a checkpoint's `rope_parameters`
+        /// block. Computes the correction-range bounds (`low` / `high`)
+        /// from `beta_fast` / `beta_slow` and the YaRN mscale attention
+        /// factor from `mscale` / `mscale_all_dim`.
+        public static func from(headDim: Int, thetaBase: Float, factor: Float,
+                                betaFast: Float, betaSlow: Float,
+                                originalMaxPosition: Float,
+                                mscale: Float = 1, mscaleAllDim: Float = 1) -> RoPEYaRN {
+            // find_correction_dim — the dimension index at which a given
+            // number of rotations occurs over the original context.
+            func correctionDim(_ numRotations: Float) -> Float {
+                (Float(headDim) * Foundation.log(originalMaxPosition / (numRotations * 2 * .pi)))
+                    / (2 * Foundation.log(thetaBase))
+            }
+            var low = correctionDim(betaFast).rounded(.down)
+            var high = correctionDim(betaSlow).rounded(.up)
+            low = max(low, 0)
+            high = min(high, Float(headDim - 1))
+            if high <= low { high = low + 0.001 }   // avoid a zero-width ramp
+
+            // YaRN mscale attention factor. When mscale == mscale_all_dim
+            // (the common case) the ratio is exactly 1.
+            func yarnMscale(_ scale: Float, _ m: Float) -> Float {
+                scale <= 1 ? 1 : 0.1 * m * Foundation.log(scale) + 1
+            }
+            let attnFactor = yarnMscale(factor, mscale) / yarnMscale(factor, mscaleAllDim)
+            return RoPEYaRN(factor: factor, low: low, high: high, attnFactor: attnFactor)
+        }
+    }
+
+    /// YaRN RoPE — context-extended rotary embedding. Same Grid3D
+    /// dispatch shape as `rope`: one threadgroup per (head, half-dim
+    /// index). `factor == 1` reproduces plain RoPE bit-for-bit.
+    public static func ropeYaRN(_ qk: Tensor, position: Int, headDim: Int,
+                                thetaBase: Float, yarn: RoPEYaRN,
+                                on cmd: MTLCommandBuffer,
+                                into out: Tensor? = nil) -> Tensor {
+        precondition(qk.elementCount % headDim == 0,
+                     "ropeYaRN: qk size must be a multiple of headDim")
+        let nHeads = qk.elementCount / headDim
+        let halfDim = headDim / 2
+        let result = out ?? Tensor.empty(shape: qk.shape, dtype: qk.dtype)
+        let grid = MTLSize(width: nHeads, height: halfDim, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch qk.dtype {
+        case .f32:
+            MetalTileKernels.ffai_rope_yarn_f32(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
+                position: UInt32(position), theta_base: thetaBase,
+                factor: yarn.factor, low: yarn.low, high: yarn.high,
+                attn_factor: yarn.attnFactor,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_rope_yarn_f16(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
+                position: UInt32(position), theta_base: thetaBase,
+                factor: yarn.factor, low: yarn.low, high: yarn.high,
+                attn_factor: yarn.attnFactor,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_rope_yarn_bf16(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), half_dim: UInt32(halfDim),
+                position: UInt32(position), theta_base: thetaBase,
+                factor: yarn.factor, low: yarn.low, high: yarn.high,
+                attn_factor: yarn.attnFactor,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.ropeYaRN: unsupported dtype \(qk.dtype)")
+        }
+        return result
     }
 
     /// MLX-format dequantizing gather (embedding lookup). bits ∈ {4, 8}.
@@ -1735,6 +1892,78 @@ public enum Ops {
             // OpsValidation rejected anything we don't have a kernel for;
             // an unsupported dtype lands here.
             fatalError("Ops.sdpaDecode: unsupported (head_dim=\(headDim), dtype=\(q.dtype))")
+        }
+        return result
+    }
+
+    /// Multi-query SDPA — attends `nQuery` query rows against a shared
+    /// K/V cache in one dispatch. `q` / output are `[nQuery, nQHeads,
+    /// headDim]`; `k` / `v` are the cache buffers `[nKVHeads, kvStride,
+    /// headDim]`. `causal == false` → every query attends
+    /// `[0, baseKV + nQuery)` (bidirectional); `causal == true` → query
+    /// `r` attends `[0, baseKV + r + 1)`.
+    ///
+    /// `ffai_sdpa_multi` is a reduction kernel — its threadgroup
+    /// geometry is part of the contract. Each invariant below is
+    /// `precondition`-checked, citing `crates/metaltile-std/src/ffai/
+    /// sdpa_multi.rs`. The 1024-thread dispatch is hard: a smaller TPG
+    /// makes the kernel's `n_simd` zero and the K walk an infinite GPU
+    /// loop (the documented machine-freeze hazard).
+    public static func sdpaMulti(q: Tensor, k: Tensor, v: Tensor,
+                                 nQHeads: Int, nKVHeads: Int, headDim: Int,
+                                 baseKV: Int, nQuery: Int, kvStride: Int,
+                                 causal: Bool, scale: Float,
+                                 on cmd: MTLCommandBuffer,
+                                 into out: Tensor? = nil) -> Tensor {
+        // ## DISPATCH INVARIANTS — ffai/sdpa_multi.rs. See
+        // OpsValidation.validateSdpaMulti for the full reasoning +
+        // CI-runnable tests.
+        if let reason = OpsValidation.validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaMulti: \(reason)")
+        }
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        // TPG = 1024 (32 simdgroups × 32 lanes), one threadgroup per
+        // (query, q_head). Lay out a 1D thread grid so Metal slices it
+        // into nQHeads*nQuery threadgroups of 1024 — NEVER fewer than
+        // 32 threads per group (the freeze condition).
+        let threadsPerGroup = 1024
+        let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let causalFlag = UInt32(causal ? 1 : 0)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_multi_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_multi_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_multi_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaMulti: unsupported dtype \(q.dtype)")
         }
         return result
     }
