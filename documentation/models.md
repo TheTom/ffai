@@ -24,6 +24,7 @@ For porting a new architecture, see
 | **Mamba 2** | [`Models/Mamba2.swift`](../Sources/FFAI/Models/Mamba2.swift) | `mamba2` | `Mamba2ForCausalLM` | `Mamba2Dense` |
 | **FalconH1** | [`Models/FalconH1.swift`](../Sources/FFAI/Models/FalconH1.swift) | `falcon_h1` | `FalconH1ForCausalLM` | `FalconH1Hybrid` |
 | **NemotronH** | [`Models/NemotronH.swift`](../Sources/FFAI/Models/NemotronH.swift) | `nemotron_h` | `NemotronHForCausalLM` | `NemotronHHybrid` |
+| **GraniteMoeHybrid** | [`Models/GraniteMoeHybrid.swift`](../Sources/FFAI/Models/GraniteMoeHybrid.swift) | `granitemoehybrid` | `GraniteMoeHybridForCausalLM` | `GraniteMoeHybridHybrid` |
 
 **FalconH1** is FFAI's first *hybrid* family: every decoder layer runs
 BOTH a Mamba 2 selective-SSM mixer AND a grouped-query attention path
@@ -55,6 +56,26 @@ it once per group over a contiguous head sub-slab — no new kernel. The
 `E` (mixture-of-experts) layer kind is recognised but rejected at load:
 NemotronH's MoE diverges from the shipped SwiGLU `MoELayer`, and no
 small published checkpoint exercises it.
+
+**GraniteMoeHybrid** is a *stack-interleaved* hybrid like NemotronH — a
+`layer_types` array assigns each decoder layer one mixer kind (`mamba`
+or `attention`) — but the feed-forward half of every layer is uniform:
+either a block-sparse **MoE** (top-K SwiGLU experts plus an always-on
+shared SwiGLU expert) when `num_local_experts > 0`, or a dense SwiGLU
+MLP when it is `0`. Each layer is two pre-norm + residual blocks
+(`input_layernorm` → mixer, `post_attention_layernorm` → FFN), unlike
+NemotronH's single norm/residual. Attention uses **no positional
+embedding** (`position_embedding_type: "nope"`) like NemotronH; the
+Mamba mixer runs a single full-width gated RMSNorm over `d_inner`.
+Granite's four scalar multipliers are handled without double-folding:
+`embedding_multiplier` folds into a dedicated scaled embedding copy,
+`residual_multiplier` folds into every mixer/FFN output projection,
+`attention_multiplier` is the SDPA scale, and `logits_scaling` divides
+the final logits. The MoE feed-forward reuses the shared `MoELayer`
+(`.topKThenSoftmax` gating). It is the first family to exercise the
+MoE command-buffer contract end-to-end: `MoELayer.decode` commits the
+command buffer, so `GraniteMoeHybridModel.forward` allocates a fresh
+buffer after every MoE-bearing layer.
 
 Both Llama / Qwen 3 variants share the same Llama-shaped core: GQA
 attention with RoPE, RMSNorm, SwiGLU MLP. Qwen 3 adds per-head q_norm / k_norm
@@ -155,6 +176,31 @@ which diverge from the shipped SwiGLU `MoELayer`. A NemotronH Mamba
 layer whose per-group RMSNorm row size (`d_inner / n_groups`) is not a
 multiple of 128 (e.g. Nemotron-3-Nano-4B's 960) is also rejected — the
 `rmsNormRows` kernel requires a 128-aligned row.
+
+### GraniteMoeHybrid
+
+| Repo | Size | Quant | Notes |
+|---|---|---|---|
+| `mlx-community/granite-4.0-h-350m-bf16` | 350M | bf16 | Integration-test baseline (dense FFN). |
+| `mlx-community/granite-4.0-h-1b-bf16` | 1B | bf16 | Dense FFN, same hybrid shape. |
+| `ibm-granite/granite-4.0-h-tiny` | 7B | bf16 | 64-expert MoE FFN + shared expert. |
+
+The integration suite uses granite-4.0-h-350m — the smallest published
+GraniteMoeHybrid checkpoint (32 layers, 28 Mamba + 4 attention,
+`num_local_experts = 0` → dense SwiGLU FFN). It exercises the
+heterogeneous `[any DecoderLayer]` decode loop, the per-index cache
+array, no-RoPE attention, the gated mixer RMSNorm, and the four Granite
+scalar multipliers.
+
+**Known gaps.** Only raw bf16 / f16 GraniteMoeHybrid checkpoints are
+supported — quantized variants are rejected with a clear error. The MoE
+feed-forward path (block-sparse experts + shared expert) is implemented
+and unit-covered via `MoELayerTests`, but the published MoE checkpoints
+(H-Tiny / H-Small, 7B+) ship only quantized on mlx-community, so the
+integration suite cannot exercise the MoE path on a small raw
+checkpoint. A Mamba layer whose `d_inner` is not a multiple of 128 or
+exceeds 4096 is rejected — the gated mixer RMSNorm uses the single-row
+`rmsNorm` reduction kernel.
 
 **Known gaps.** Only raw bf16 / f16 FalconH1 checkpoints are supported
 today — quantized (`-4bit` / `-8bit`) variants are rejected with a
