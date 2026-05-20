@@ -118,6 +118,37 @@ public enum Ops {
         return result
     }
 
+    /// Sigmoid: out[i] = 1 / (1 + exp(-x[i])). Wraps metaltile's
+    /// `mt_sigmoid_*` element-wise kernel. Qwen3.5's gated attention
+    /// output (`attn_output_gate`) multiplies the SDPA result by
+    /// `sigmoid(gate)` before `o_proj`.
+    public static func sigmoid(_ x: Tensor, on cmd: MTLCommandBuffer,
+                               into out: Tensor? = nil) -> Tensor {
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+        let n = x.elementCount
+        let (grid, tg) = elementwiseGrid(n)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.mt_sigmoid_f32(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_sigmoid_f16(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_sigmoid_bf16(
+                a: x.buffer, aOffset: x.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoid: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     /// ReLU: out[i] = max(x[i], 0). Wraps metaltile's `mt_relu_*`
     /// element-wise kernel. NemotronH's MLP / MoE feed-forward blocks
     /// use squared-ReLU (`relu(x)^2`) as their activation; the squaring
@@ -489,6 +520,85 @@ public enum Ops {
             fatalError("Ops.rope: unsupported dtype \(qk.dtype)")
         }
         return result
+    }
+
+    /// Partial-rotary RoPE. Rotates only the first `rotaryDim` elements
+    /// of each `headDim`-strided head, leaving the remaining
+    /// `headDim - rotaryDim` elements untouched. Qwen3.5 sets
+    /// `partial_rotary_factor = 0.25` so a 256-dim head rotates only its
+    /// first 64 dims.
+    ///
+    /// The `ffai_rope_llama_*` kernel takes the per-head stride
+    /// (`head_dim`) and the rotate-half pairing offset / grid height
+    /// (`half_dim`) as independent constants. Driving it with
+    /// `head_dim = headDim` (true stride) but `half_dim = rotaryDim / 2`
+    /// rotates the pairs `(i, i + rotaryDim/2)` for `i ∈ [0, rotaryDim/2)`
+    /// inside each head — exactly the partial-rotary subset. Dims
+    /// `[rotaryDim, headDim)` are never written, so this MUST run
+    /// in-place (`out` aliasing `qk`) — the caller's buffer already holds
+    /// the correct pass-through values for the unrotated tail.
+    ///
+    /// `rotaryDim` must be even and ≤ `headDim`; `qk` must be a flat
+    /// `[nHeads * headDim]` tensor.
+    public static func ropePartial(_ qk: Tensor, position: Int,
+                                   headDim: Int, rotaryDim: Int,
+                                   thetaBase: Float,
+                                   scaling: RoPEScaling = .none,
+                                   on cmd: MTLCommandBuffer) {
+        precondition(qk.elementCount % headDim == 0,
+                     "ropePartial: qk size must be a multiple of headDim")
+        precondition(rotaryDim > 0 && rotaryDim <= headDim,
+                     "ropePartial: rotaryDim (\(rotaryDim)) must be in 1...headDim (\(headDim))")
+        precondition(rotaryDim % 2 == 0,
+                     "ropePartial: rotaryDim (\(rotaryDim)) must be even (rotate-half pairs)")
+        let nHeads = qk.elementCount / headDim
+        let halfRotary = rotaryDim / 2
+        // Grid: one thread per (head, rotary-pair). Writes in-place.
+        let grid = MTLSize(width: nHeads, height: halfRotary, depth: 1)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        switch qk.dtype {
+        case .f32:
+            MetalTileKernels.ffai_rope_llama_f32(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: qk.buffer, outOffset: qk.offset,
+                head_dim: UInt32(headDim),
+                half_dim: UInt32(halfRotary),
+                position: UInt32(position),
+                theta_base: thetaBase,
+                scale_factor: scaling.scaleFactor,
+                low_freq_factor: scaling.lowFreqFactor,
+                high_freq_factor: scaling.highFreqFactor,
+                original_max_position: scaling.originalMaxPosition,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_rope_llama_f16(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: qk.buffer, outOffset: qk.offset,
+                head_dim: UInt32(headDim),
+                half_dim: UInt32(halfRotary),
+                position: UInt32(position),
+                theta_base: thetaBase,
+                scale_factor: scaling.scaleFactor,
+                low_freq_factor: scaling.lowFreqFactor,
+                high_freq_factor: scaling.highFreqFactor,
+                original_max_position: scaling.originalMaxPosition,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_rope_llama_bf16(
+                qk: qk.buffer, qkOffset: qk.offset,
+                out: qk.buffer, outOffset: qk.offset,
+                head_dim: UInt32(headDim),
+                half_dim: UInt32(halfRotary),
+                position: UInt32(position),
+                theta_base: thetaBase,
+                scale_factor: scaling.scaleFactor,
+                low_freq_factor: scaling.lowFreqFactor,
+                high_freq_factor: scaling.highFreqFactor,
+                original_max_position: scaling.originalMaxPosition,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.ropePartial: unsupported dtype \(qk.dtype)")
+        }
     }
 
     /// MLX-format dequantizing gather (embedding lookup). bits ∈ {4, 8}.

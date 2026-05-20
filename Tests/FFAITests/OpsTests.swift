@@ -50,6 +50,73 @@ struct OpsTests {
         }
     }
 
+    @Test("sigmoid f32 — out[i] = 1 / (1 + exp(-x))")
+    func sigmoidF32() {
+        autoreleasepool {
+            let x = Tensor.empty(shape: [4], dtype: .f32)
+            x.copyIn(from: [Float(0), 1, -1, 2])
+            var out: Tensor!
+            runAndWait { cb in out = Ops.sigmoid(x, on: cb) }
+            let r = out.toArray(as: Float.self)
+            // sigmoid(0) = 0.5
+            #expect(abs(r[0] - 0.5) < 1e-5)
+            // sigmoid(1) ≈ 0.7311
+            #expect(abs(r[1] - Float(1.0 / (1.0 + exp(-1.0)))) < 1e-3)
+            // sigmoid(-1) ≈ 0.2689
+            #expect(abs(r[2] - Float(1.0 / (1.0 + exp(1.0)))) < 1e-3)
+            // sigmoid(2) ≈ 0.8808
+            #expect(abs(r[3] - Float(1.0 / (1.0 + exp(-2.0)))) < 1e-3)
+        }
+    }
+
+    @Test("ropePartial f32 — rotates only the first rotaryDim of each head")
+    func ropePartialRotatesSubset() {
+        autoreleasepool {
+            // headDim=4, rotaryDim=2: a single head, rotate dims [0,1),
+            // pass through dims [2,4). Position 1, theta_base=10000.
+            let qk = Tensor.empty(shape: [4], dtype: .f32)
+            qk.copyIn(from: [Float(1), 0, 7, 9])
+            runAndWait { cb in
+                Ops.ropePartial(qk, position: 1, headDim: 4, rotaryDim: 2,
+                                thetaBase: 10000, on: cb)
+            }
+            let r = qk.toArray(as: Float.self)
+            // rotaryDim=2 → one rotate-half pair (0, 1). inv_freq=1,
+            // theta=1, cos≈0.5403, sin≈0.8415.
+            //   r[0] = x[0]*cos - x[1]*sin = 1*0.5403 - 0*0.8415 = 0.5403
+            //   r[1] = x[0]*sin + x[1]*cos = 1*0.8415 + 0*0.5403 = 0.8415
+            #expect(abs(r[0] - 0.5403) < 1e-3)
+            #expect(abs(r[1] - 0.8415) < 1e-3)
+            // Dims [2,4) are outside rotaryDim → untouched pass-through.
+            #expect(abs(r[2] - 7) < 1e-5)
+            #expect(abs(r[3] - 9) < 1e-5)
+        }
+    }
+
+    @Test("ropePartial f32 — rotaryDim == headDim matches full rope")
+    func ropePartialFullEqualsRope() {
+        autoreleasepool {
+            let a = Tensor.empty(shape: [4], dtype: .f32)
+            a.copyIn(from: [Float(1), 0, 0, 1])
+            let b = Tensor.empty(shape: [4], dtype: .f32)
+            b.copyIn(from: [Float(1), 0, 0, 1])
+            var full: Tensor!
+            runAndWait { cb in
+                full = Ops.rope(a, position: 1, headDim: 4,
+                                thetaBase: 10000, on: cb)
+            }
+            runAndWait { cb in
+                Ops.ropePartial(b, position: 1, headDim: 4, rotaryDim: 4,
+                                thetaBase: 10000, on: cb)
+            }
+            let rf = full.toArray(as: Float.self)
+            let rp = b.toArray(as: Float.self)
+            for i in 0..<4 {
+                #expect(abs(rf[i] - rp[i]) < 1e-4, "i=\(i): \(rf[i]) vs \(rp[i])")
+            }
+        }
+    }
+
     @Test("relu f32 — out[i] = max(x[i], 0)")
     func reluF32() {
         autoreleasepool {
