@@ -99,6 +99,18 @@ public enum ModelRegistry {
             return try loadGemma3(config: config, weights: weights,
                                   options: options, device: device)
         }
+        // Gemma 4 — dense / PLE (E2B, E4B) / MoE (26B-A4B). All three
+        // ship under the `gemma4` model_type; the family file picks the
+        // variant from config. Checked before Qwen3 so the `gemma4`
+        // model_type isn't shadowed.
+        if let arch = config.architecture, Gemma4.architectures.contains(arch) {
+            return try loadGemma4(config: config, weights: weights,
+                                  options: options, device: device)
+        }
+        if let mt = config.modelType, Gemma4.modelTypes.contains(mt) {
+            return try loadGemma4(config: config, weights: weights,
+                                  options: options, device: device)
+        }
         if let arch = config.architecture, Qwen3.architectures.contains(arch) {
             return try loadQwen3(config: config, weights: weights,
                                  options: options, device: device)
@@ -220,6 +232,19 @@ public enum ModelRegistry {
         options: LoadOptions, device: Device
     ) throws -> Loaded {
         let variant = try Gemma3.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
+
+    public static func loadGemma4(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Gemma4.variant(for: config)
         let engine = try variant.loadModel(
             config: config, weights: weights,
             options: options, device: device
