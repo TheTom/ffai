@@ -246,6 +246,166 @@ struct KVCacheTests {
         }
     }
 
+    @Test("AffineQuantizedKVCache(int4): multi-position round-trip at integration config")
+    func affineInt4MultiPositionIntegrationConfig() {
+        autoreleasepool {
+            // Mirror the Qwen3-1.7B integration config exactly:
+            // headDim=128, groupSize=64, nKVHeads=8, ~24 appended positions.
+            // This is the blind spot that hid the int4 bug — the existing
+            // int4 round-trip test is single-position headDim=64 gs=32.
+            let nKVHeads = 8
+            let headDim = 128
+            let maxSeq = 64
+            let groupSize = 64
+            let nPositions = 24
+            let (sk, sv) = makeSharedWorking(nKVHeads: nKVHeads, maxSeq: maxSeq,
+                                             headDim: headDim, dtype: .f32)
+            let cache = AffineQuantizedKVCache(
+                nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+                dtype: .f32, bits: 4, groupSize: groupSize,
+                sharedWorkingK: sk, sharedWorkingV: sv
+            )
+
+            // Realistic K/V structure: mostly small values in [-1, 1],
+            // plus one per-group outlier so the affine range is wide.
+            // Deterministic LCG so the test is reproducible.
+            var rng: UInt64 = 0x9E3779B97F4A7C15
+            func next() -> Float {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                let u = Double(rng >> 11) / Double(1 << 53)
+                return Float(u * 2.0 - 1.0)   // [-1, 1)
+            }
+
+            // Store every appended row so we can check each position.
+            var allK = [[Float]]()
+            var allV = [[Float]]()
+            let groupsPerHead = headDim / groupSize
+            for _ in 0..<nPositions {
+                var k = [Float](repeating: 0, count: nKVHeads * headDim)
+                var v = [Float](repeating: 0, count: nKVHeads * headDim)
+                for h in 0..<nKVHeads {
+                    for d in 0..<headDim {
+                        k[h * headDim + d] = next() * 0.5
+                        v[h * headDim + d] = next() * 0.5
+                    }
+                    // Inject one outlier per group (mimics real K/V).
+                    for g in 0..<groupsPerHead {
+                        let outIdx = h * headDim + g * groupSize + (g % groupSize)
+                        k[outIdx] = 6.0
+                        v[outIdx] = -6.0
+                    }
+                }
+                allK.append(k); allV.append(v)
+                let kT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+                let vT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+                kT.copyIn(from: k); vT.copyIn(from: v)
+                runAndWait { cb in cache.appendOnGPU(kFlat: kT, vFlat: vT, on: cb) }
+            }
+            #expect(cache.length == nPositions)
+
+            var dqK: Tensor!, dqV: Tensor!
+            runAndWait { cb in
+                let pair = cache.prepareForAttention(on: cb)
+                dqK = pair.k; dqV = pair.v
+            }
+            let kOut = dqK.toArray(as: Float.self)
+            let vOut = dqV.toArray(as: Float.self)
+
+            // int4 affine tolerance: range/15 per group. With a 6.0
+            // outlier and small values, per-group range ~6.5 → step
+            // ~0.43 → max error ~0.22. Allow generous slack.
+            let tol: Float = 0.5
+            var worst: Float = 0
+            var worstPos = -1
+            for pos in 0..<nPositions {
+                for h in 0..<nKVHeads {
+                    for d in 0..<headDim {
+                        // Buffer layout [nKVHeads, maxSeq, headDim].
+                        let outIdx = (h * maxSeq + pos) * headDim + d
+                        let expK = allK[pos][h * headDim + d]
+                        let expV = allV[pos][h * headDim + d]
+                        let ek = abs(kOut[outIdx] - expK)
+                        let ev = abs(vOut[outIdx] - expV)
+                        if ek > worst { worst = ek; worstPos = pos }
+                        if ev > worst { worst = ev; worstPos = pos }
+                    }
+                }
+            }
+            #expect(worst < tol,
+                    "int4 multi-position round-trip: worst error \(worst) at pos \(worstPos) exceeds tol \(tol)")
+        }
+    }
+
+    @Test("AffineQuantizedKVCache(int4): reconstruction error shrinks with group size")
+    func affineInt4GroupSizeErrorCurve() {
+        // Hypothesis-B measurement: affine min-max int4 over wide groups
+        // collapses non-outlier dims onto 1-2 of the 16 levels. Measure
+        // mean-abs reconstruction error for groupSize ∈ {64, 32, 16} on
+        // outlier-containing input. A smaller group should tighten the
+        // per-group range and lower the error materially.
+        autoreleasepool {
+            let nKVHeads = 8
+            let headDim = 128
+            let maxSeq = 8
+            let nPositions = 1
+
+            // Same outlier-containing distribution for every group size.
+            var rng: UInt64 = 0xDEADBEEFCAFEF00D
+            func next() -> Float {
+                rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                let u = Double(rng >> 11) / Double(1 << 53)
+                return Float(u * 2.0 - 1.0)
+            }
+            // Sparse outliers: one large channel per head (a "massive
+            // activation"). With headDim=128, gs64 → 1 outlier shared
+            // across 64 dims; gs16 → 1 outlier confined to 16 dims, the
+            // other 7 groups stay tight. This is the realistic K/V shape.
+            var base = [Float](repeating: 0, count: nKVHeads * headDim)
+            for h in 0..<nKVHeads {
+                for d in 0..<headDim { base[h * headDim + d] = next() * 0.5 }
+                base[h * headDim + (h * 13) % headDim] = 8.0   // one outlier/head
+            }
+
+            func meanAbsError(groupSize: Int, bits: Int) -> Float {
+                let (sk, sv) = makeSharedWorking(nKVHeads: nKVHeads, maxSeq: maxSeq,
+                                                 headDim: headDim, dtype: .f32)
+                let cache = AffineQuantizedKVCache(
+                    nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+                    dtype: .f32, bits: bits, groupSize: groupSize,
+                    sharedWorkingK: sk, sharedWorkingV: sv
+                )
+                let kT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+                let vT = Tensor.empty(shape: [nKVHeads, headDim], dtype: .f32)
+                kT.copyIn(from: base); vT.copyIn(from: base)
+                for _ in 0..<nPositions {
+                    runAndWait { cb in cache.appendOnGPU(kFlat: kT, vFlat: vT, on: cb) }
+                }
+                var dqK: Tensor!
+                runAndWait { cb in dqK = cache.prepareForAttention(on: cb).k }
+                let kOut = dqK.toArray(as: Float.self)
+                var sum: Float = 0
+                var count = 0
+                for h in 0..<nKVHeads {
+                    for d in 0..<headDim {
+                        let outIdx = (h * maxSeq + 0) * headDim + d
+                        sum += abs(kOut[outIdx] - base[h * headDim + d])
+                        count += 1
+                    }
+                }
+                return sum / Float(count)
+            }
+
+            let e64 = meanAbsError(groupSize: 64, bits: 4)
+            let e32 = meanAbsError(groupSize: 32, bits: 4)
+            let e16 = meanAbsError(groupSize: 16, bits: 4)
+            let e8int8 = meanAbsError(groupSize: 64, bits: 8)
+            print("[int4-error] gs64=\(e64) gs32=\(e32) gs16=\(e16) | int8 gs64=\(e8int8)")
+            // Smaller groups must reduce error monotonically.
+            #expect(e32 < e64, "gs32 error \(e32) should be < gs64 \(e64)")
+            #expect(e16 < e32, "gs16 error \(e16) should be < gs32 \(e32)")
+        }
+    }
+
     @Test("AffineQuantizedKVCache(int4): bytesAllocated halves vs int8")
     func affineInt4BytesAccounting() {
         autoreleasepool {

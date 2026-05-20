@@ -12,9 +12,17 @@ public enum KVCacheKind: Sendable, Equatable {
     /// 6 is a follow-up). All layers share a single working buffer
     /// pair (≈ one layer's worth of fp16 K/V) into which the
     /// `bulk_dequant_kv` kernel writes before each SDPA step.
-    /// Net memory vs `.raw`: ~45% less at 8-bit, ~70% less at 4-bit
-    /// (group_size=32) for typical models. CLI: `--kv-cache affine8`
-    /// or `--kv-cache affine4`.
+    /// Net memory vs `.raw`: ~45% less at 8-bit, ~65% less at 4-bit for
+    /// typical models. CLI: `--kv-cache affine8` or `--kv-cache affine4`.
+    ///
+    /// `groupSize` interacts strongly with `bits`. Affine min-max int4
+    /// only has 16 quant levels, so a single per-head outlier channel
+    /// inflates a wide group's range and collapses the rest of the
+    /// group onto 1-2 levels — degenerate decode. The CLI uses
+    /// `groupSize: 16` for `affine4` and `groupSize: 64` for `affine8`;
+    /// when constructing this case directly, pass `groupSize: 16` (or
+    /// smaller) for `bits: 4`. int8's 256 levels tolerate `groupSize:
+    /// 64` fine.
     case affineQuantized(bits: Int = 8, groupSize: Int = 64)
 
     /// AURA-compressed K/V (Phase 5d). Rotated + Lloyd-Max scalar

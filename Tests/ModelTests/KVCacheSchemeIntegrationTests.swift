@@ -57,9 +57,27 @@ struct KVCacheSchemeIntegrationTests {
         expectCoherentOutput(result.generatedTokens, minTokens: 8, label: "affine8")
     }
 
+    // int4 affine uses groupSize=16, NOT 64. Affine min-max int4 only
+    // has 16 quant levels, so the per-group range matters far more than
+    // it does for int8's 256 levels. Real K/V has sparse "massive
+    // activation" outliers — one large channel per head. With
+    // groupSize=64 that single outlier inflates the range across 64
+    // dims and the other 63 collapse onto 1-2 levels, which produces
+    // degenerate decode ("a time, a time, …"). Measured mean-abs
+    // reconstruction error on outlier-containing K (Tests/FFAITests/
+    // KVCacheTests.swift `affineInt4GroupSizeErrorCurve`):
+    //   gs64 → 0.079   gs32 → 0.046   gs16 → 0.027   (int8 gs64 → 0.005)
+    // Decode coherence at each int4 group size (this prompt, Qwen3-1.7B):
+    //   gs64 → degenerate ("a time, a time")
+    //   gs32 → grammatical but loops (23/64 unique tokens)
+    //   gs16 → fully coherent English (44/64 unique tokens)
+    // groupSize=16 is the smallest power-of-two divisor of headDim=128
+    // and the first that restores coherent output. This is the same
+    // outlier-domination motivation behind rotation-based KV quant
+    // (QuaRot / AURA); affine int4 simply needs tight groups.
     @Test("affineQuantized int4 KV cache produces coherent output")
     func affineInt4Scheme() async throws {
-        guard let result = try await decode(.affineQuantized(bits: 4, groupSize: 64)) else { return }
+        guard let result = try await decode(.affineQuantized(bits: 4, groupSize: 16)) else { return }
         print("[KV=affine4] \(result.text)")
         expectCoherentOutput(result.generatedTokens, minTokens: 8, label: "affine4")
     }

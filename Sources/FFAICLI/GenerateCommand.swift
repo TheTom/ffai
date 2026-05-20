@@ -91,12 +91,17 @@ struct GenerateCommand: AsyncParsableCommand {
         case "affine8":
             loadOpts.kvCache = .affineQuantized(bits: 8, groupSize: 64)
         case "affine4":
-            // group_size=32 at 4-bit — finer groups than affine8's 64
-            // to preserve enough precision; without it K/V loses too
-            // much discriminative power and decode degenerates into
-            // loops. TurboQuant-style rotation would let group_size=64
-            // work at 4-bit; that's Phase 5d.
-            loadOpts.kvCache = .affineQuantized(bits: 4, groupSize: 32)
+            // group_size=16 at 4-bit — much finer groups than affine8's
+            // 64. Affine min-max int4 has only 16 quant levels, so a
+            // single per-head outlier channel inflates a wide group's
+            // range and collapses the other dims onto 1-2 levels. At
+            // gs64 decode is fully degenerate ("a time, a time"); gs32
+            // is grammatical but loops; gs16 is the first group size
+            // that decodes coherently (measured on Qwen3-1.7B — see
+            // Tests/ModelTests/KVCacheSchemeIntegrationTests.swift).
+            // TurboQuant-style rotation would let group_size=64 work at
+            // 4-bit; that's Phase 5d (AURA).
+            loadOpts.kvCache = .affineQuantized(bits: 4, groupSize: 16)
         case _ where rawKVKind.hasPrefix("aura"):
             guard let scheme = AURAScheme.parse(rawKVKind) else {
                 throw ValidationError("Unknown AURA recipe \"\(rawKVKind)\". Try \"aura\", \"aura4\", \"aura4v2\", \"aura3\", \"aura8\".")

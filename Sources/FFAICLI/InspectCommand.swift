@@ -100,7 +100,10 @@ struct InspectCommand: AsyncParsableCommand {
         case "affine8":
             opts.kvCache = .affineQuantized(bits: 8, groupSize: 64)
         case "affine4":
-            opts.kvCache = .affineQuantized(bits: 4, groupSize: 32)
+            // group_size=16 — see GenerateCommand for the rationale
+            // (affine int4 needs tight groups to survive per-head
+            // outlier channels; gs64/gs32 decode degenerately).
+            opts.kvCache = .affineQuantized(bits: 4, groupSize: 16)
         case _ where rawKVKind.hasPrefix("aura"):
             guard let scheme = AURAScheme.parse(rawKVKind) else {
                 throw ValidationError("Unknown AURA recipe \"\(rawKVKind)\".")
