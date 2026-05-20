@@ -147,6 +147,17 @@ public enum ModelRegistry {
             return try loadGraniteMoeHybrid(config: config, weights: weights,
                                             options: options, device: device)
         }
+        // Jamba — a Phase 5e stack-interleaved hybrid (Mamba 1 / attention
+        // layers selected by `layers_block_type`) with a dense SwiGLU or
+        // MoE feed-forward. Routes through its own family file.
+        if let arch = config.architecture, Jamba.architectures.contains(arch) {
+            return try loadJamba(config: config, weights: weights,
+                                 options: options, device: device)
+        }
+        if let mt = config.modelType, Jamba.modelTypes.contains(mt) {
+            return try loadJamba(config: config, weights: weights,
+                                 options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -255,6 +266,19 @@ public enum ModelRegistry {
         return Loaded(engine: engine,
                       defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+    public static func loadJamba(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try Jamba.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
 }
 
 /// High-level loaded model with tokenizer attached. The public API users
@@ -292,6 +316,9 @@ public final class Model: @unchecked Sendable {
     public var graniteMoeHybrid: GraniteMoeHybridModel? {
         engine as? GraniteMoeHybridModel
     }
+
+    /// Convenience accessor for the Jamba hybrid engine.
+    public var jamba: JambaModel? { engine as? JambaModel }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
