@@ -115,6 +115,16 @@ public enum ModelRegistry {
             return try loadMamba2(config: config, weights: weights,
                                   options: options, device: device)
         }
+        // FalconH1 — the first Phase 5e hybrid (Mamba 2 + attention in
+        // every layer). Routes through its own family file + engine.
+        if let arch = config.architecture, FalconH1.architectures.contains(arch) {
+            return try loadFalconH1(config: config, weights: weights,
+                                    options: options, device: device)
+        }
+        if let mt = config.modelType, FalconH1.modelTypes.contains(mt) {
+            return try loadFalconH1(config: config, weights: weights,
+                                    options: options, device: device)
+        }
         throw ModelError.unsupportedArchitecture(
             config.architecture ?? config.modelType ?? "<unknown>"
         )
@@ -184,6 +194,19 @@ public enum ModelRegistry {
         return Loaded(engine: engine,
                       defaultGenerationParameters: variant.defaultGenerationParameters)
     }
+
+    public static func loadFalconH1(
+        config: ModelConfig, weights: SafeTensorsBundle,
+        options: LoadOptions, device: Device
+    ) throws -> Loaded {
+        let variant = try FalconH1.variant(for: config)
+        let engine = try variant.loadModel(
+            config: config, weights: weights,
+            options: options, device: device
+        )
+        return Loaded(engine: engine,
+                      defaultGenerationParameters: variant.defaultGenerationParameters)
+    }
 }
 
 /// High-level loaded model with tokenizer attached. The public API users
@@ -210,6 +233,9 @@ public final class Model: @unchecked Sendable {
 
     /// Convenience accessor for the Mamba 2 engine.
     public var mamba2: Mamba2Model? { engine as? Mamba2Model }
+
+    /// Convenience accessor for the FalconH1 hybrid engine.
+    public var falconH1: FalconH1Model? { engine as? FalconH1Model }
 
     private let stateLock = NSLock()
     private var _currentState: ModelLifecycleState = .ready
