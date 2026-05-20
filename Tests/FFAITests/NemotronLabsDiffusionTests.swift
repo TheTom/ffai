@@ -97,4 +97,14 @@ struct NemotronLabsDiffusionTransferTests {
         // The two highest-confidence positions are 0 and 2.
         #expect(Set(transfer) == Set([0, 2]))
     }
+
+    @Test("family registers both the text-only and VLM checkpoints")
+    func familyRegistersTextAndVLM() {
+        // The VLM checkpoint's text backbone shares the `encoder.*`
+        // layout, so both route through this family.
+        #expect(NemotronLabsDiffusion.modelTypes.contains("nemotron_labs_diffusion"))
+        #expect(NemotronLabsDiffusion.modelTypes.contains("nemotron_labs_diffusion_vlm"))
+        #expect(NemotronLabsDiffusion.architectures.contains("NemotronLabsDiffusionModel"))
+        #expect(NemotronLabsDiffusion.architectures.contains("NemotronLabsDiffusionVLMModel"))
+    }
 }

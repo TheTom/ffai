@@ -28,8 +28,18 @@ import Metal
 // ─── Family entry point ──────────────────────────────────────────────
 
 public enum NemotronLabsDiffusion {
-    public static let modelTypes: Set<String> = ["nemotron_labs_diffusion"]
-    public static let architectures: Set<String> = ["NemotronLabsDiffusionModel"]
+    // Both the text-only checkpoint and the VLM checkpoint share this
+    // family — the VLM's text backbone uses the identical `encoder.*` /
+    // `diffusion_head.weight` layout. Loading a VLM checkpoint here
+    // brings up the tri-mode *text* backbone; the `vision_tower.*` /
+    // `multi_modal_projector.*` tensors are left unreferenced until the
+    // vision path lands.
+    public static let modelTypes: Set<String> = [
+        "nemotron_labs_diffusion", "nemotron_labs_diffusion_vlm",
+    ]
+    public static let architectures: Set<String> = [
+        "NemotronLabsDiffusionModel", "NemotronLabsDiffusionVLMModel",
+    ]
 
     public static func variant(
         for config: ModelConfig
