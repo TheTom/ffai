@@ -1841,6 +1841,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
@@ -1852,6 +1853,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
@@ -1863,6 +1865,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
@@ -1874,6 +1877,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
@@ -1885,6 +1889,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
@@ -1896,6 +1901,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .f32):
@@ -1907,6 +1913,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .f16):
@@ -1918,6 +1925,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .bf16):
@@ -1929,6 +1937,7 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
+                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
@@ -2304,5 +2313,510 @@ public enum Ops {
             _ = Ops.gemv(weight: rotation, input: xView, on: cmd, into: outView)
         }
         return result
+    }
+
+    // ─── MoE batched gather GEMM (int4) ──────────────────────────────
+    //
+    // Wraps `mt_moe_gather_qmm_mma_int4_bm16_*` — one kernel launch that
+    // processes `mTotal` rows of activations, each row tagged with the
+    // expert id it routes to via `indices[mTotal]`. Replaces a Python-
+    // style serial-expert loop (`topK` dispatches × 3 projections = 3K
+    // launches) with one batched dispatch per projection.
+    //
+    // Weight layout (mlx affine int4 stacked):
+    //   `weight   [E, N, K/8]` u32 packed, row-major within each expert.
+    //   `scales`, `biases` `[E, N, K/groupSize]` in the activation dtype.
+    // Activation layout:
+    //   `input    [mTotal, K]` contiguous in `input.dtype`.
+    //   `indices  [mTotal]` u32 — expert id per row. ROWS MUST BE SORTED
+    //                            BY EXPERT (the kernel scans forward
+    //                            looking for an expert-id change to find
+    //                            the per-tile sub-range).
+    // Output:
+    //   `out      [mTotal, N]` in `input.dtype` (caller pre-allocates).
+    //
+    // Tile contract: N % 32 == 0, K % 32 == 0 (the kernel pads m_total
+    // internally — BM=16 with boundary masking). Grid =
+    //   [N / 32, ceil(mTotal / 16), 1]
+    // Threadgroup = [64, 1, 1] (2 simdgroups).
+    public static func moeGatherDequantGemmInt4(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        // Shape / dtype invariants. The kernel itself does no validation
+        // so any mismatch silently produces garbage.
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt4: weight must be u32 packed")
+        precondition(indices.dtype == .u32,
+                     "moeGatherDequantGemmInt4: indices must be u32 (\(indices.dtype))")
+        precondition(input.dtype == scales.dtype && scales.dtype == biases.dtype,
+                     "moeGatherDequantGemmInt4: input/scales/biases dtype must match")
+        precondition(out.dtype == input.dtype,
+                     "moeGatherDequantGemmInt4: out dtype must match input")
+        precondition(input.elementCount == mTotal * kIn,
+                     "moeGatherDequantGemmInt4: input has \(input.elementCount) elements, expected \(mTotal * kIn) (mTotal=\(mTotal) * kIn=\(kIn))")
+        precondition(out.elementCount == mTotal * nOut,
+                     "moeGatherDequantGemmInt4: out has \(out.elementCount) elements, expected \(mTotal * nOut)")
+        precondition(indices.elementCount == mTotal,
+                     "moeGatherDequantGemmInt4: indices has \(indices.elementCount) elements, expected mTotal=\(mTotal)")
+        precondition(nOut % 32 == 0,
+                     "moeGatherDequantGemmInt4: nOut (\(nOut)) must be multiple of 32 for bm16 kernel")
+        precondition(kIn % 32 == 0,
+                     "moeGatherDequantGemmInt4: kIn (\(kIn)) must be multiple of 32 for bm16 kernel")
+
+        // BM=16, BN=32. The simdgroup-matrix variant uses 64 threads
+        // (2 SGs); the MPP / NAX cooperative-tensor variant uses 32
+        // threads (1 SG). Canonical metaltile dispatch
+        //   dispatch_with_grid(grid=[N/32, ceil(T/16), 1], tg=[TG_W, 1, 1])
+        // calls `dispatchThreadgroups` (grid counted in TGs); the
+        // generated Swift wrapper calls `dispatchThreads` (grid counted
+        // in TOTAL threads) so total threads = grid × tg per axis.
+        //
+        // FFAI_MOE_BGEMM_MPP=1 opts into the NAX cooperative-tensor
+        // path — macOS 26.2+ on gen-≥17 GPU silicon only (M5 Max yes).
+        let useMpp = ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_MPP"] != nil
+        let tgWidth = useMpp ? 32 : 64
+        let grid = MTLSize(width: (nOut / 32) * tgWidth,
+                           height: (mTotal + 15) / 16,
+                           depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let mTotalU = UInt32(mTotal)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        if useMpp {
+            switch input.dtype {
+            case .f32:
+                MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm16_mpp_f32(
+                    x: input.buffer, xOffset: input.offset,
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    indices: indices.buffer, indicesOffset: indices.offset,
+                    out: out.buffer, outOffset: out.offset,
+                    m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                    group_size: groupSizeU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            case .f16:
+                MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm16_mpp_f16(
+                    x: input.buffer, xOffset: input.offset,
+                    w: weight.buffer, wOffset: weight.offset,
+                    scales: scales.buffer, scalesOffset: scales.offset,
+                    biases: biases.buffer, biasesOffset: biases.offset,
+                    indices: indices.buffer, indicesOffset: indices.offset,
+                    out: out.buffer, outOffset: out.offset,
+                    m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                    group_size: groupSizeU,
+                    gridSize: grid, threadgroupSize: tg, on: cmd)
+            default:
+                fatalError("Ops.moeGatherDequantGemmInt4: MPP variant only emits f32/f16 (got \(input.dtype))")
+            }
+            return
+        }
+
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm16_f32(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm16_f16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm16_bf16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    // MARK: - Batched-T prefill kernels (Qwen3.5 / Qwen3.6 hybrid prefill)
+
+    /// Multi-token Gated Delta Net recurrence over a chunk of `T` tokens.
+    ///
+    /// Wraps `mt_gated_delta_chunk` — same recurrence math as
+    /// `gatedDeltaStep` but runs the per-token loop *inside* the kernel
+    /// with the recurrent state kept in per-lane registers across the
+    /// entire `T` sweep. A single dispatch replaces `T` independent
+    /// `gatedDeltaStep` calls; the state buffer is read once at entry
+    /// and written once at exit.
+    ///
+    /// Layout (matches the MLX-LM `_make_gated_delta_kernel` convention
+    /// the metaltile-ffai kernel implements):
+    ///   * `q, k`  : `[T, Hk, Dk]`   row-major  (B=1)
+    ///   * `v, y`  : `[T, Hv, Dv]`   row-major
+    ///   * `g, beta` : `[T, Hv]`     row-major
+    ///   * `stateIn / stateOut` : `[Hv, Dv, Dk]` (one state per `hv`)
+    ///   * `tLen`  : `[1]` u32 — number of tokens in this chunk (runtime
+    ///                scalar, NOT a constexpr; same PSO works for every
+    ///                chunk length).
+    ///
+    /// All input tensors must share the activation dtype `T` — the
+    /// kernel is emitted in f32 / f16 / bf16 variants. For Qwen3.5 the
+    /// state is f32 (see `GDNStateCache.dtype`); pass q/k/v/g/beta as f32
+    /// tensors as well.
+    ///
+    /// Dispatch: grid `(Dv, Hv)` threadgroups, 32 threads (one simdgroup)
+    /// per group — identical to `mt_gated_delta_step` apart from the
+    /// runtime `tLen`. `Dk % 32 == 0` invariant applies (max Dk = 256, so
+    /// `n_per_t = Dk/32 ≤ 8` register entries per lane).
+    public static func gatedDeltaChunk(
+        q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor,
+        stateIn: Tensor, into y: Tensor, stateOut: Tensor,
+        tLen: Tensor,
+        numKeyHeads: Int, numValueHeads: Int,
+        keyHeadDim: Int, valueHeadDim: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        if let reason = OpsValidation.validateGatedDeltaStep(
+            keyHeadDim: keyHeadDim, valueHeadDim: valueHeadDim,
+            numKeyHeads: numKeyHeads, numValueHeads: numValueHeads
+        ) {
+            preconditionFailure("Ops.gatedDeltaChunk: \(reason)")
+        }
+        precondition(q.dtype == k.dtype && k.dtype == v.dtype
+                     && v.dtype == g.dtype && g.dtype == beta.dtype
+                     && beta.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                     && stateOut.dtype == y.dtype,
+                     "Ops.gatedDeltaChunk: every tensor must share dtype")
+        precondition(tLen.dtype == .u32 && tLen.elementCount == 1,
+                     "Ops.gatedDeltaChunk: tLen must be a [1] u32 scalar buffer")
+
+        let lanesPerGroup = 32
+        let grid = MTLSize(width: valueHeadDim * lanesPerGroup,
+                           height: numValueHeads, depth: 1)
+        let tg = MTLSize(width: lanesPerGroup, height: 1, depth: 1)
+
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.mt_gated_delta_chunk_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: UInt32(keyHeadDim), dv: UInt32(valueHeadDim),
+                hv: UInt32(numValueHeads), hk: UInt32(numKeyHeads),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_gated_delta_chunk_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: UInt32(keyHeadDim), dv: UInt32(valueHeadDim),
+                hv: UInt32(numValueHeads), hk: UInt32(numKeyHeads),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_gated_delta_chunk_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, g: g.buffer, gOffset: g.offset,
+                beta: beta.buffer, betaOffset: beta.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: UInt32(keyHeadDim), dv: UInt32(valueHeadDim),
+                hv: UInt32(numValueHeads), hk: UInt32(numKeyHeads),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaChunk: unsupported dtype \(q.dtype)")
+        }
+    }
+
+    /// Batched-Q causal SDPA prefill via the simdgroup-matrix MMA kernel.
+    /// Replaces `T` independent `sdpaDecode` calls (each O(K) per
+    /// q-head, T separate dispatches) with one dispatch that tiles the
+    /// `T × K` attention matrix 32×16 with simdgroup_matrix MMAs.
+    ///
+    /// Layout (per `mt_sdpa_prefill_mma` in metaltile-ffai):
+    ///   * `q`   : `[n_q_heads, q_len, head_dim]`   row-major (B=1)
+    ///   * `k,v` : `[n_kv_heads, k_len, head_dim]`  row-major
+    ///   * `out` : `[n_q_heads, q_len, head_dim]`
+    ///
+    /// `qLen` must be a multiple of 32 (BQ tile). Caller is responsible
+    /// for padding (or for splitting the prefill into a 32-aligned chunk
+    /// plus a per-token tail that falls back to `sdpaDecode`).
+    /// `kLen ≥ qLen` covers the causal mask; the kernel internally bounds
+    /// each row's K walk to its absolute position (assumes the last
+    /// `qLen` queries correspond to the last `qLen` K rows — i.e. the
+    /// queries are appended at the end of the K cache).
+    ///
+    /// Grid: `(qLen / 32, n_q_heads, 1)` threadgroups, 128 threads per
+    /// group (4 simdgroups). Reduction-mode kernel.
+    public static func sdpaPrefillMma(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        qLen: Int, kLen: Int, scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(qLen > 0 && qLen % 32 == 0,
+                     "Ops.sdpaPrefillMma: qLen \(qLen) must be a positive multiple of 32")
+        precondition(kLen >= qLen,
+                     "Ops.sdpaPrefillMma: kLen \(kLen) must be >= qLen \(qLen)")
+        precondition(nQHeads % nKVHeads == 0,
+                     "Ops.sdpaPrefillMma: nQHeads \(nQHeads) must be a multiple of nKVHeads \(nKVHeads)")
+        precondition(q.dtype == k.dtype && k.dtype == v.dtype,
+                     "Ops.sdpaPrefillMma: q/k/v must share dtype")
+        let result = out ?? Tensor.empty(shape: [nQHeads, qLen, headDim], dtype: q.dtype)
+        // Grid: (qLen/BQ, n_q_heads, 1) threadgroups, 128 threads per
+        // group (4 simdgroups). dispatchThreads counts threads, so width
+        // = (qLen/32) * 128, height = n_q_heads.
+        let threadsPerGroup = 128
+        let bq = 32
+        let grid = MTLSize(width: (qLen / bq) * threadsPerGroup,
+                           height: nQHeads, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        let gqaFactor = nQHeads / nKVHeads
+
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.mt_sdpa_prefill_mma_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                out: result.buffer, outOffset: result.offset,
+                q_len: UInt32(qLen), k_len: UInt32(kLen),
+                gqa_factor: UInt32(gqaFactor),
+                n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_sdpa_prefill_mma_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                out: result.buffer, outOffset: result.offset,
+                q_len: UInt32(qLen), k_len: UInt32(kLen),
+                gqa_factor: UInt32(gqaFactor),
+                n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_sdpa_prefill_mma_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                out: result.buffer, outOffset: result.offset,
+                q_len: UInt32(qLen), k_len: UInt32(kLen),
+                gqa_factor: UInt32(gqaFactor),
+                n_q_heads: UInt32(nQHeads), n_kv_heads: UInt32(nKVHeads),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaPrefillMma: unsupported dtype \(q.dtype)")
+        }
+        return result
+    }
+
+    // ─── MoE gather BGEMM int4 — BM=8 MPP variant ────────────────────
+    //
+    // Half-height counterpart of `moeGatherDequantGemmInt4` tuned for
+    // topK=8 decode where `mTotal = 8`. BM=16 wastes 50% of the tile
+    // rows on the trailing boundary; BM=8 fills the tile exactly.
+    // Uses the MPP destination-only-cooperative path, so the kernel
+    // descriptor (M=8, N=32, K=16) clears the simdgroup-scope
+    // constraint that the all-cooperative `matmul2d` would reject.
+    // Requires macOS 26.2+ / Apple10 GPU (M5 Max).
+    public static func moeGatherDequantGemmInt4Bm8(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32,
+                     "moeGatherDequantGemmInt4Bm8: weight must be u32 packed")
+        precondition(indices.dtype == .u32,
+                     "moeGatherDequantGemmInt4Bm8: indices must be u32")
+        precondition(input.dtype == scales.dtype && scales.dtype == biases.dtype,
+                     "moeGatherDequantGemmInt4Bm8: input/scales/biases dtype must match")
+        precondition(out.dtype == input.dtype,
+                     "moeGatherDequantGemmInt4Bm8: out dtype must match input")
+        precondition(input.elementCount == mTotal * kIn,
+                     "moeGatherDequantGemmInt4Bm8: input elements \(input.elementCount) != mTotal*kIn \(mTotal*kIn)")
+        precondition(out.elementCount == mTotal * nOut,
+                     "moeGatherDequantGemmInt4Bm8: out elements \(out.elementCount) != mTotal*nOut \(mTotal*nOut)")
+        precondition(indices.elementCount == mTotal,
+                     "moeGatherDequantGemmInt4Bm8: indices elements \(indices.elementCount) != mTotal \(mTotal)")
+        precondition(nOut % 32 == 0,
+                     "moeGatherDequantGemmInt4Bm8: nOut \(nOut) must be multiple of 32")
+        precondition(kIn % 32 == 0,
+                     "moeGatherDequantGemmInt4Bm8: kIn \(kIn) must be multiple of 32")
+
+        // 1 simdgroup per TG, BM=8 → grid Y = ceil(m/8).
+        let tgWidth = 32
+        let grid = MTLSize(width: (nOut / 32) * tgWidth,
+                           height: (mTotal + 7) / 8,
+                           depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let mTotalU = UInt32(mTotal)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm8_mpp_f32(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm8_mpp_f16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm8_mpp_bf16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4Bm8: unsupported dtype \(input.dtype)")
+        }
+    }
+
+    // ─── Fused GDN prep + recurrence step ─────────────────────────────
+    //
+    // One dispatch absorbs the per-head q/k RMSNorm + g/beta math +
+    // the existing GDN recurrence step, collapsing the 3 host
+    // commit+wait pairs in Qwen35GDNMixer.forward down to 1. Same
+    // dispatch geometry as `mt_gated_delta_step`:
+    //   grid = [dv, B·hv, 1]
+    //   tg   = [32, 1, 1]
+    // `convOut` layout: `[B, 2·Hk·Dk + Hv·Dv]` — q | k | v slabs.
+    // `qNormWeight` / `kNormWeight`: `[Hk·Dk]` (pass 1.0 × invKeyScale
+    // for the unweighted path).
+    public static func gatedDeltaPrepStep(
+        convOut: Tensor,
+        aLog: Tensor, dtBias: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormWeight: Tensor, kNormWeight: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
+                     && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
+                     && bRaw.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
+                     && kNormWeight.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                     && stateOut.dtype == y.dtype,
+                     "Ops.gatedDeltaPrepStep: every tensor must share dtype")
+        precondition(dk % 32 == 0,
+                     "Ops.gatedDeltaPrepStep: dk \(dk) must be multiple of 32")
+        precondition(dv % 32 == 0,
+                     "Ops.gatedDeltaPrepStep: dv \(dv) must be multiple of 32")
+        precondition(hv % hk == 0,
+                     "Ops.gatedDeltaPrepStep: hv \(hv) must be a multiple of hk \(hk) (GQA)")
+
+        let grid = MTLSize(width: dv,
+                           height: batchSize * hv,
+                           depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let dkU = UInt32(dk)
+        let dvU = UInt32(dv)
+        let hvU = UInt32(hv)
+        let hkU = UInt32(hk)
+
+        switch convOut.dtype {
+        case .f32:
+            MetalTileKernels.mt_gated_delta_prep_step_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_gated_delta_prep_step_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_gated_delta_prep_step_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaPrepStep: unsupported dtype \(convOut.dtype)")
+        }
     }
 }
