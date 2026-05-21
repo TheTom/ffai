@@ -954,6 +954,22 @@ public final class Qwen35GDNMixer: Module {
     /// add + FFN chain onto the same command buffer.
     let fused: Bool
 
+    /// Pre-allocated per-call scratch tensors. The fused GDN path
+    /// writes / reads these inside one command buffer per decode token;
+    /// the engine's `workCmd.commit()` + caller wait between tokens
+    /// guarantees the GPU has finished the previous token's writes
+    /// before the next token starts writing the same scratch. Metal's
+    /// default hazard tracking serialises any in-flight reads against
+    /// the next write. Replaces six per-decode-token `Tensor.empty`
+    /// allocations (× 30 GDN layers on Qwen3.6-A3B = 180 MTLBuffer
+    /// allocs / token recovered).
+    let convOutScratch: Tensor
+    let convActF32Scratch: Tensor
+    let aRawF32Scratch: Tensor
+    let bRawF32Scratch: Tensor
+    let yF32Scratch: Tensor
+    let yGatedScratch: Tensor
+
     init(inProjQKV: AnyLinear, inProjZ: AnyLinear,
          inProjB: AnyLinear, inProjA: AnyLinear, outProj: AnyLinear,
          convW: Tensor, convB: Tensor, mixerNorm: RMSNorm,
@@ -989,6 +1005,19 @@ public final class Qwen35GDNMixer: Module {
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
         self.fused = ProcessInfo.processInfo.environment["FFAI_GDN_FUSED_PREP"] != nil
+
+        // Per-decode-token scratch — pre-allocated once at init so the
+        // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
+        // See the comments next to the field declarations for the
+        // cross-token safety argument (Metal hazard tracking + the
+        // engine's per-token cmd wait).
+        self.convOutScratch = Tensor.empty(shape: [convDim], dtype: dtype, device: device)
+        self.convActF32Scratch = Tensor.empty(shape: [convDim], dtype: .f32, device: device)
+        self.aRawF32Scratch = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
+        self.bRawF32Scratch = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
+        self.yF32Scratch = Tensor.empty(shape: [numValueHeads, valueHeadDim],
+                                        dtype: .f32, device: device)
+        self.yGatedScratch = Tensor.empty(shape: [valueDim], dtype: dtype, device: device)
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -1026,12 +1055,11 @@ public final class Qwen35GDNMixer: Module {
         let bRaw = inProjB(xNorm, on: cmd)         // [num_value_heads]
         let aRaw = inProjA(xNorm, on: cmd)         // [num_value_heads]
 
-        let convOut = Tensor.empty(shape: [convDim], dtype: dtype, device: device)
         Ops.conv1dCausalStep(
             x: qkv, w: convW, b: convB,
-            state: cache.conv.state, into: convOut,
+            state: cache.conv.state, into: convOutScratch,
             nChannels: convDim, kernelSize: convKernel, on: cmd)
-        let convAct = Ops.silu(convOut, on: cmd)   // [conv_dim]
+        let convAct = Ops.silu(convOutScratch, on: cmd)   // [conv_dim]
 
         // ── Fused GDN prep + recurrence path (opt-in) ─────────────────
         //
@@ -1058,28 +1086,23 @@ public final class Qwen35GDNMixer: Module {
             // fused step runs the recurrence in fp32 against the
             // existing fp32 state slots, matching the canonical
             // precision of the legacy path.
-            let convActF32 = Tensor.empty(shape: [convDim], dtype: .f32, device: device)
-            let aRawF32 = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
-            let bRawF32 = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
-            Ops.castToF32(convAct, into: convActF32, on: cmd)
-            Ops.castToF32(aRaw, into: aRawF32, on: cmd)
-            Ops.castToF32(bRaw, into: bRawF32, on: cmd)
+            Ops.castToF32(convAct, into: convActF32Scratch, on: cmd)
+            Ops.castToF32(aRaw, into: aRawF32Scratch, on: cmd)
+            Ops.castToF32(bRaw, into: bRawF32Scratch, on: cmd)
 
-            let yF32 = Tensor.empty(shape: [numValueHeads, valueHeadDim],
-                                    dtype: .f32, device: device)
             Ops.gatedDeltaPrepStep(
-                convOut: convActF32,
+                convOut: convActF32Scratch,
                 aLog: aLogTF32, dtBias: dtBiasTF32,
-                aRaw: aRawF32, bRaw: bRawF32,
+                aRaw: aRawF32Scratch, bRaw: bRawF32Scratch,
                 qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
-                y: yF32,
+                y: yF32Scratch,
                 batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
                 hv: numValueHeads, hk: numKeyHeads,
                 on: cmd)
             cache.gdn.swap()
             cache.advance()
-            yT = yF32
+            yT = yF32Scratch
             // NOTE: no commit + wait here. The fused branch keeps phase
             // 1 + the fused step + the upcoming gatedMixerNorm + out_proj
             // all on `cmd`. Metal serialises dispatches inside a single
@@ -1165,14 +1188,13 @@ public final class Qwen35GDNMixer: Module {
         // committed.
         let result: Tensor
         if fused {
-            let yGatedT = Tensor.empty(shape: [valueDim], dtype: dtype, device: device)
             Ops.gatedMixerNorm(
                 y: yT, z: z, weight: mixerNorm.weight,
                 epsBuf: epsBufFused,
-                into: yGatedT,
+                into: yGatedScratch,
                 numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
                 on: cmd)
-            result = outProj(yGatedT, on: cmd)
+            result = outProj(yGatedScratch, on: cmd)
             // NOTE: no commit here. The fused path keeps `cmd` in-flight
             // so `Qwen35GDNLayer.decode` can chain the residual add +
             // FFN onto the same command buffer. The FFN (MoE branch)
