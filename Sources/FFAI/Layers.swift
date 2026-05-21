@@ -41,6 +41,16 @@ public final class Linear: Module {
         }
         return y
     }
+
+    /// T-batched. `x` is `[T, inDim]` flat row-major, returns
+    /// `[T, outDim]` flat. Dispatches `Ops.gemm` (one kernel, no per-row
+    /// host overhead). Bias path is unimplemented — the families that
+    /// currently call this (Qwen3-series) do not use linear biases.
+    public func callMany(_ x: Tensor, t: Int, on cmd: MTLCommandBuffer) -> Tensor {
+        precondition(bias == nil,
+                     "Linear.callMany: bias broadcast over T rows not implemented; no Qwen3-series caller needs it today")
+        return Ops.gemm(weight: weight, input: x, nRows: t, on: cmd)
+    }
 }
 
 // ─── QuantizedLinear (mlx int4 format) ────────────────────────────────
@@ -84,6 +94,26 @@ public final class QuantizedLinear: Module {
             input: x, bits: bits, groupSize: groupSize, on: cmd
         )
     }
+
+    /// T-batched. `x` is `[T, inDim]` flat row-major, returns
+    /// `[T, outDim]` flat. Dispatches `Ops.dequantGemmDynamicM` — one
+    /// `mt_qmm_mma` kernel for T multiple of 32, or one padded
+    /// dispatch + host slice for ragged T. Matches the batched-prefill
+    /// path (BP2).
+    public func callMany(_ x: Tensor, t: Int,
+                         on cmd: MTLCommandBuffer,
+                         device: Device) -> Tensor {
+        precondition(bits == 4,
+                     "QuantizedLinear.callMany: only 4-bit path wired today (mt_qmm_mma); got bits=\(bits)")
+        let outDim = weight.shape[0]
+        let inDim = scales.shape[scales.shape.count - 1] * groupSize
+        let out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
+        Ops.dequantGemmDynamicM(
+            input: x, weight: weight, scales: scales, biases: biases,
+            t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
+            on: cmd, device: device, into: out)
+        return out
+    }
 }
 
 /// Type-erasing wrapper so layers can hold either a regular Linear or a
@@ -91,21 +121,35 @@ public final class QuantizedLinear: Module {
 public final class AnyLinear: Module {
     public let inner: any Module
     private let forward: (Tensor, MTLCommandBuffer) -> Tensor
+    private let forwardMany: (Tensor, Int, MTLCommandBuffer, Device) -> Tensor
 
     public init(_ linear: Linear) {
         self.inner = linear
         self.forward = { linear($0, on: $1) }
+        self.forwardMany = { x, t, cmd, _ in linear.callMany(x, t: t, on: cmd) }
     }
 
     public init(_ linear: QuantizedLinear) {
         self.inner = linear
         self.forward = { linear($0, on: $1) }
+        self.forwardMany = { x, t, cmd, dev in
+            linear.callMany(x, t: t, on: cmd, device: dev)
+        }
     }
 
     public func parameters() -> [(String, Tensor)] { inner.parameters() }
 
     public func callAsFunction(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
         forward(x, cmd)
+    }
+
+    /// T-batched. `x` is `[T, inDim]` flat row-major, returns
+    /// `[T, outDim]` flat. Dispatches one `gemm` (dense) or one
+    /// `dequantGemmDynamicM` (quantized). Unblocks batched-prefill.
+    public func callMany(_ x: Tensor, t: Int,
+                         on cmd: MTLCommandBuffer,
+                         device: Device) -> Tensor {
+        forwardMany(x, t, cmd, device)
     }
 }
 
