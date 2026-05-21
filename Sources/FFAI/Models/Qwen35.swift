@@ -755,6 +755,18 @@ public final class Qwen35DenseMLP: Module {
         let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
         return downProj(inner, on: cmd)
     }
+
+    /// T-batched: down(silu(gate(x)) * up(x)) over T rows. Returns
+    /// `[T, hidden]` flat. Three batched projections + one elementwise
+    /// SwiGLU pass.
+    func forwardMany(_ xNormFlat: Tensor, t: Int,
+                     cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        let xRows = xNormFlat.reshaped(to: [t, xNormFlat.elementCount / t])
+        let g = gateProj.callMany(xRows, t: t, on: cmd, device: device)
+        let u = upProj.callMany(xRows, t: t, on: cmd, device: device)
+        let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
+        return downProj.callMany(inner, t: t, on: cmd, device: device)
+    }
 }
 
 // ─── Qwen35MoEFFN — MoE feed-forward with sigmoid-gated shared expert ─
@@ -838,6 +850,62 @@ public final class Qwen35MoEFFN: Module {
             into: result, on: fmaCmd)
         fmaCmd.commit()
         return result
+    }
+
+    /// T-batched MoE FFN. `xNormFlat` is `[T, hidden]` flat; returns
+    /// `[T, hidden]` flat. `MoELayer.decodeMany` commits the caller's
+    /// `cmd`; the shared-expert SwiGLU runs on a fresh `work` cmd and
+    /// the per-row sigmoidScalarFMA fan-out on fresh `fmaCmd`s. Mirrors
+    /// the single-token `forward`'s commit pattern; the returned
+    /// `outFlat` is in-flight on the last committed `fmaCmd` and
+    /// downstream reads hazard-track against it.
+    func forwardMany(_ xNormFlat: Tensor, t: Int,
+                     cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        let dt = xNormFlat.dtype
+        let dtBytes = dt.byteSize
+
+        // ── Routed top-K experts — commits `cmd`. ────────────────────────
+        let routed = moe.decodeMany(xNormFlat, t: t, cmd: cmd, device: device)
+        // routed: `[T, hidden]` flat, on `work`-internal-committed cmd.
+
+        // ── Shared expert batched: SwiGLU + scalar gate logit ────────────
+        let work = device.makeCommandBuffer()
+        let xRows = xNormFlat.reshaped(to: [t, hidden])
+        let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
+        let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
+        let sharedInnerAll = Ops.mul(Ops.silu(sgAll, on: work), suAll, on: work)
+        let sharedOutAll = sharedDownProj.callMany(sharedInnerAll, t: t,
+                                                    on: work, device: device)
+        // sharedExpertGate is `hidden → 1`; per row this is one scalar.
+        let gateLogitsAll = sharedExpertGate.callMany(xRows, t: t,
+                                                      on: work, device: device)
+        work.commit()
+
+        // ── Per-row sigmoidScalarFMA fan-out ─────────────────────────────
+        // `Ops.sigmoidScalarFMA` requires a `[1]` scalar gate; row-slice
+        // each token's gate logit + run the FMA. T fmaCmd commits but
+        // each is one small kernel that pipelines on the queue.
+        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
+        for r in 0..<t {
+            let gateRow = Tensor(buffer: gateLogitsAll.buffer,
+                                 offset: gateLogitsAll.offset + r * dtBytes,
+                                 shape: [1], dtype: dt)
+            let sharedRow = Tensor(buffer: sharedOutAll.buffer,
+                                   offset: sharedOutAll.offset + r * hidden * dtBytes,
+                                   shape: [hidden], dtype: dt)
+            let routedRow = Tensor(buffer: routed.buffer,
+                                   offset: routed.offset + r * hidden * dtBytes,
+                                   shape: [hidden], dtype: dt)
+            let outRow = Tensor(buffer: outFlat.buffer,
+                                offset: outFlat.offset + r * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+            let fmaCmd = device.makeCommandBuffer()
+            Ops.sigmoidScalarFMA(
+                gate: gateRow, value: sharedRow, base: routedRow,
+                into: outRow, on: fmaCmd)
+            fmaCmd.commit()
+        }
+        return outFlat
     }
 }
 
@@ -1656,40 +1724,14 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         // ── Residual add ────────────────────────────────────────────────
         let postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
 
-        // ── FFN half — per-row loop with the residual add writing
-        // directly into `outFlat[r]` via `Ops.add(into:)`. Same pattern
-        // as `Qwen35AttentionLayer.decodeMany`'s FFN-per-row branch.
-        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        var workCmd = cmd
-        for r in 0..<t {
-            let postMixRow = Tensor(buffer: postMix.buffer,
-                                    offset: postMix.offset + r * hidden * dtBytes,
-                                    shape: [hidden], dtype: dt)
-            let outRow = Tensor(buffer: outFlat.buffer,
-                                offset: outFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-            let ffnNorm = postNorm(postMixRow, on: workCmd)
-            switch ffn {
-            case .dense(let mlp):
-                let ffnOut = mlp.forward(ffnNorm, cmd: workCmd)
-                _ = Ops.add(postMixRow, ffnOut, on: workCmd, into: outRow)
-            case .moe(let moe):
-                let ffnOut = moe.forward(ffnNorm, position: startPosition + r,
-                                         cmd: workCmd, device: device)
-                let addCmd = device.makeCommandBuffer()
-                _ = Ops.add(postMixRow, ffnOut, on: addCmd, into: outRow)
-                addCmd.commit()
-                workCmd = device.makeCommandBuffer()
-            }
-        }
-        // For the dense FFN tail, workCmd holds the last row's writes
-        // uncommitted. The GDN layer's `commitsCommandBuffer = true`
-        // contract means the caller's model-level loop will refresh
-        // workCmd anyway; we commit here so outFlat is resident for
-        // that refresh's reads. (Mirrors the dense-path commit inside
-        // `qwen35ApplyFFN` when `commitCmd: true`.)
-        if case .dense = ffn { workCmd.commit() }
-        return outFlat
+        // ── FFN half — T-batched via qwen35ApplyFFNMany. ─────────────────
+        // For MoE FFN this dispatches `moe.decodeMany` (one BGEMM per
+        // gate/up/down at mTotal=T·topK + scatter-sum). For dense FFN
+        // it dispatches `mlp.forwardMany` (3 gemms). Mirrors the
+        // attention-layer's FFN dispatch.
+        return qwen35ApplyFFNMany(ffn, postMix: postMix, t: t,
+                                  postNorm: postNorm, hidden: hidden,
+                                  cmd: cmd, device: device)
     }
 }
 
@@ -1805,43 +1847,13 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
         // ── Residual add — one Ops.add over T·hidden elements ───────────
         let postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
 
-        // ── FFN half — per-row loop with the residual add writing
-        // directly into outFlat[r] via `Ops.add(into:)`. Inlines
-        // `qwen35ApplyFFN`'s body so the final add can target an outRow
-        // slice of the pre-allocated assembly buffer — there's no GPU
-        // blit-copy primitive on Ops today, and `Ops.add(into:)` is the
-        // existing pattern for "write here". `workCmd` refresh mirrors
-        // `Qwen35Model.forward`'s per-layer pattern: the MoE FFN commits
-        // workCmd inside `Qwen35MoEFFN.forward`, and the residual add
-        // runs on a fresh addCmd that commits immediately.
-        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        var workCmd = cmd
-        for r in 0..<t {
-            let postMixRow = Tensor(buffer: postMix.buffer,
-                                    offset: postMix.offset + r * hidden * dtBytes,
-                                    shape: [hidden], dtype: dt)
-            let outRow = Tensor(buffer: outFlat.buffer,
-                                offset: outFlat.offset + r * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-            let ffnNorm = postNorm(postMixRow, on: workCmd)
-            switch ffn {
-            case .dense(let mlp):
-                let ffnOut = mlp.forward(ffnNorm, cmd: workCmd)
-                _ = Ops.add(postMixRow, ffnOut, on: workCmd, into: outRow)
-                // workCmd stays uncommitted — model.forward's
-                // commitsCommandBuffer = false path leaves it in-flight.
-            case .moe(let moe):
-                let ffnOut = moe.forward(ffnNorm, position: startPosition + r,
-                                         cmd: workCmd, device: device)
-                // moe.forward committed workCmd. Run the residual add on
-                // a fresh addCmd that writes directly into outRow.
-                let addCmd = device.makeCommandBuffer()
-                _ = Ops.add(postMixRow, ffnOut, on: addCmd, into: outRow)
-                addCmd.commit()
-                workCmd = device.makeCommandBuffer()
-            }
-        }
-        return outFlat
+        // ── FFN half — T-batched via qwen35ApplyFFNMany. ─────────────────
+        // For MoE FFN this dispatches `moe.decodeMany` (one BGEMM per
+        // gate/up/down at mTotal=T·topK + scatter-sum). For dense FFN
+        // it dispatches `mlp.forwardMany` (3 gemms).
+        return qwen35ApplyFFNMany(ffn, postMix: postMix, t: t,
+                                  postNorm: postNorm, hidden: hidden,
+                                  cmd: cmd, device: device)
     }
 }
 
@@ -1852,6 +1864,44 @@ private func qwen35FFNParameters(_ ffn: Qwen35FFN) -> [(String, Tensor)] {
     switch ffn {
     case .dense(let mlp): return mlp.parameters()
     case .moe(let moe): return moe.parameters()
+    }
+}
+
+/// T-batched FFN application: post-attention norm + FFN.forwardMany +
+/// residual add over `[T, hidden]` rows. Returns `[T, hidden]` flat.
+/// Internally commits cmds for the MoE path (matching the per-row
+/// `qwen35ApplyFFN` behaviour); the returned buffer is in-flight on
+/// the last committed cmd, downstream reads hazard-track.
+///
+/// Replaces the per-row FFN loop in the layer-level `decodeMany`s
+/// when both FFN type and dtype support a batched form. Today: dense
+/// and MoE branches both have `forwardMany`. Layers always commit
+/// (MoE) or leave the layer's residual on the caller's cmd (dense —
+/// the dense-FFN add lives on `cmd` here, mirror commit-Cmd contract
+/// of `qwen35ApplyFFN`).
+private func qwen35ApplyFFNMany(_ ffn: Qwen35FFN, postMix: Tensor, t: Int,
+                                postNorm: RMSNorm, hidden: Int,
+                                cmd: MTLCommandBuffer, device: Device) -> Tensor {
+    let dt = postMix.dtype
+    // Post-norm over T rows of [hidden]. One rmsNormRows kernel.
+    let ffnNorm = Ops.rmsNormRows(
+        postMix, weight: postNorm.weight, eps: postNorm.eps,
+        nRows: t, rowSize: hidden, on: cmd)
+    switch ffn {
+    case .dense(let mlp):
+        let ffnOut = mlp.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
+        return Ops.add(postMix, ffnOut.reshaped(to: [t * hidden]), on: cmd)
+    case .moe(let moe):
+        // moe.forwardMany commits cmd; returns `[T, hidden]` flat on a
+        // fresh in-flight buffer. Run the residual add on a fresh
+        // addCmd so the returned tensor is independent of the
+        // already-committed cmd chain.
+        let ffnOut = moe.forwardMany(ffnNorm, t: t, cmd: cmd, device: device)
+        let addCmd = device.makeCommandBuffer()
+        let resultFlat = Ops.add(postMix, ffnOut, on: addCmd)
+        addCmd.commit()
+        let _ = resultFlat
+        return resultFlat
     }
 }
 

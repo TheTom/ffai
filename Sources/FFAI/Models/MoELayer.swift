@@ -491,6 +491,218 @@ public final class MoELayer: Module, DecoderLayer {
         return result
     }
 
+    /// T-batched MoE forward. `hFlat` is `[T, hidden]` flat; returns
+    /// `[T, hidden]` flat. The mTotal = T·topK rows fan into a single
+    /// `Ops.moeGatherDequantGemmInt4` (or bm8 variant) per projection
+    /// instead of T·topK sequential per-expert SwiGLU triplets. At
+    /// Qwen3.6-A3B T=32, topK=8 → mTotal=256 fills the BM=16 tiles
+    /// 16-deep — the regime where cooperative-tensor weight sharing
+    /// PAYS (the same kernels regress at T=1 because every row is a
+    /// unique expert with no shared weight).
+    ///
+    /// Requires `stackedInt4Experts` (the BGEMM weights layout). Falls
+    /// back to per-token `decode` loop otherwise.
+    ///
+    /// Architecture:
+    ///   1. Gate gemv batched (`gate.callMany`) → `[T, nExperts]`.
+    ///   2. `cmd.commit() + wait` — router needs logits on CPU.
+    ///   3. Per-token routing on host (T calls, each O(nExperts) + a
+    ///      partial sort).
+    ///   4. Build plan over T·topK rows: `sourceToken[m]`,
+    ///      `expertId[m]`, `weight[m]`. Sort by `expertId` ascending so
+    ///      consecutive rows share an expert (the kernel walks rows in
+    ///      tile order; sorted = weight tile reuse across rows in a
+    ///      tile).
+    ///   5. `Ops.gather(h, gatherIdx)` → `xGathered [mTotal, hidden]`
+    ///      in one dispatch (vs T·topK host memcpys).
+    ///   6. `moeGatherDequantGemmInt4` × 3 (gate / up / down) on the
+    ///      gathered batch — one dispatch each.
+    ///   7. `Ops.swiglu` element-wise across `[mTotal, moeIntermediate]`.
+    ///   8. Weighted scatter-sum: for each `m`, scale `downOut[m]` by
+    ///      `weights[m]` and accumulate into `outFlat[sourceToken[m]]`.
+    ///      Uses the same `Tensor.filled([hidden])` broadcast pattern as
+    ///      the single-token `batchedSwiGLU`, mTotal times. Scatter-sum
+    ///      is the dominant residual cost at large `mTotal`; a future
+    ///      `mt_moe_scatter_scale_add` kernel collapses these mTotal
+    ///      dispatches into one.
+    ///   9. Shared expert (if any): one per-row SwiGLU call across T
+    ///      tokens (also currently a T-loop because the single-token
+    ///      `swiGLU` path is the standing API).
+    ///
+    /// All work after the gate-readback runs on a fresh `work` cmd that
+    /// commits once at the end. The caller's `cmd` is consumed by the
+    /// gate gemv and the commit + wait.
+    public func decodeMany(_ hFlat: Tensor, t: Int,
+                           cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        precondition(hFlat.elementCount == t * hidden,
+                     "MoELayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)")
+        precondition(t > 0, "MoELayer.decodeMany: T must be positive")
+
+        let dt = hFlat.dtype
+
+        // ── 1. Gate gemv batched on caller's cmd ─────────────────────────
+        let hRows = hFlat.reshaped(to: [t, hidden])
+        let gateLogitsAll = gate.callMany(hRows, t: t, on: cmd, device: device)
+        // gateLogitsAll shape: [T, nExperts]
+
+        // ── 2. Commit + wait so the router can read logits ───────────────
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // ── 3. Per-token routing on host ─────────────────────────────────
+        let nExperts = router.nExperts
+        let topK = router.topK
+        let logitsHost = gateLogitsAll.toFloatArray()  // [T·nExperts]
+        var routings: [MoERouter.Routing] = []
+        routings.reserveCapacity(t)
+        for r in 0..<t {
+            let start = r * nExperts
+            let rowLogits = Array(logitsHost[start..<(start + nExperts)])
+            routings.append(router.route(logits: rowLogits))
+        }
+
+        // ── 4. Build sorted plan over T·topK rows ────────────────────────
+        let mTotal = t * topK
+        // Tuple: (sortKey expertId, sourceToken, originalSlot, weight)
+        var planTuples: [(Int, Int, Int, Float)] = []
+        planTuples.reserveCapacity(mTotal)
+        for r in 0..<t {
+            let routing = routings[r]
+            for slot in 0..<topK {
+                planTuples.append((routing.indices[slot], r, slot, routing.weights[slot]))
+            }
+        }
+        planTuples.sort { $0.0 < $1.0 }
+        var sortedExpertsHost = [UInt32](); sortedExpertsHost.reserveCapacity(mTotal)
+        var sourceTokensHost = [UInt32](); sourceTokensHost.reserveCapacity(mTotal)
+        var sortedWeightsHost = [Float](); sortedWeightsHost.reserveCapacity(mTotal)
+        for tuple in planTuples {
+            sortedExpertsHost.append(UInt32(tuple.0))
+            sourceTokensHost.append(UInt32(tuple.1))
+            sortedWeightsHost.append(tuple.3)
+        }
+
+        // ── 5. Fall back to per-token decode if no stacked-int4 weights ──
+        guard let stacked = stackedInt4Experts, stacked.dtype == dt else {
+            let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
+            let dtBytes = dt.byteSize
+            var workCmd = device.makeCommandBuffer()
+            for r in 0..<t {
+                let hRow = Tensor(buffer: hFlat.buffer,
+                                  offset: hFlat.offset + r * hidden * dtBytes,
+                                  shape: [hidden], dtype: dt)
+                let rowOut = decode(hRow, position: 0,
+                                    cache: StatelessLayerCache(),
+                                    cmd: workCmd, device: device)
+                let outRow = Tensor(buffer: outFlat.buffer,
+                                    offset: outFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                let copyCmd = device.makeCommandBuffer()
+                Ops.copy(rowOut, into: outRow, on: copyCmd)
+                copyCmd.commit()
+                workCmd = device.makeCommandBuffer()
+            }
+            return outFlat
+        }
+
+        // ── 6. Work cmd for the rest of the layer ────────────────────────
+        let work = device.makeCommandBuffer()
+        let moeIntermediate = stacked.moeIntermediate
+        let groupSize = stacked.groupSize
+
+        // ── 7. Build gather index + expert ids on GPU ────────────────────
+        let gatherIdxBuf = device.makeBuffer(length: mTotal * 4)
+        sourceTokensHost.withUnsafeBytes {
+            _ = memcpy(gatherIdxBuf.contents(), $0.baseAddress!, mTotal * 4)
+        }
+        let gatherIdxTensor = Tensor(buffer: gatherIdxBuf, offset: 0,
+                                     shape: [mTotal], dtype: .u32)
+        let expertIdsBuf = device.makeBuffer(length: mTotal * 4)
+        sortedExpertsHost.withUnsafeBytes {
+            _ = memcpy(expertIdsBuf.contents(), $0.baseAddress!, mTotal * 4)
+        }
+        let indices = Tensor(buffer: expertIdsBuf, offset: 0,
+                             shape: [mTotal], dtype: .u32)
+
+        // ── 8. Gather activations: [mTotal, hidden] ──────────────────────
+        // Source rows are picked from h[sourceToken] — one dispatch.
+        let xGathered = Ops.gather(table: hRows, tokenIds: gatherIdxTensor, on: work)
+        precondition(xGathered.elementCount == mTotal * hidden,
+                     "MoELayer.decodeMany: gather output unexpected size")
+
+        // ── 9. Gate / up BGEMM → [mTotal, moeIntermediate] ───────────────
+        let gateOut = Tensor.empty(shape: [mTotal, moeIntermediate], dtype: dt,
+                                   device: device)
+        let upOut = Tensor.empty(shape: [mTotal, moeIntermediate], dtype: dt,
+                                 device: device)
+        let useBm8 = topK <= 8 && useBm8Env && mTotal <= 8
+        let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
+        bgemm(xGathered,
+              stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+              indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
+        bgemm(xGathered,
+              stacked.upWeight, stacked.upScales, stacked.upBiases,
+              indices, mTotal, moeIntermediate, hidden, groupSize, work, upOut)
+
+        // ── 10. SwiGLU fused: silu(gate) * up ────────────────────────────
+        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: work)
+
+        // ── 11. Down BGEMM → [mTotal, hidden] ────────────────────────────
+        let downOut = Tensor.empty(shape: [mTotal, hidden], dtype: dt,
+                                   device: device)
+        bgemm(inner,
+              stacked.downWeight, stacked.downScales, stacked.downBiases,
+              indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
+
+        // ── 12. Weighted scatter-sum back to [T, hidden] ─────────────────
+        // mTotal dispatches of `mul + add`. Each row's weight is scalar
+        // broadcast via `Tensor.filled([hidden])` — matches the existing
+        // single-token batchedSwiGLU pattern. Future optimisation: a
+        // `mt_moe_scatter_scale_add` kernel collapses mTotal·2 dispatches
+        // into one.
+        let dtBytes = dt.byteSize
+        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
+        outFlat.zero()
+        for m in 0..<mTotal {
+            let sortedRow = Tensor(buffer: downOut.buffer,
+                                   offset: downOut.offset + m * hidden * dtBytes,
+                                   shape: [hidden], dtype: dt)
+            let destToken = Int(sourceTokensHost[m])
+            let outRow = Tensor(buffer: outFlat.buffer,
+                                offset: outFlat.offset + destToken * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+            let w = Tensor.filled(sortedWeightsHost[m],
+                                  shape: [hidden], dtype: dt, device: device)
+            let scaled = Ops.mul(sortedRow, w, on: work)
+            _ = Ops.add(outRow, scaled, on: work, into: outRow)
+        }
+
+        // ── 13. Optional shared expert — per-row T-loop ─────────────────
+        // Shared expert is one always-on per-token SwiGLU. Looping T
+        // calls here mirrors today's single-token flow; a batched
+        // shared-expert SwiGLU is a small follow-up (gate/up/down all
+        // accept callMany inputs).
+        if let sg = sharedGateProj, let su = sharedUpProj, let sd = sharedDownProj {
+            for r in 0..<t {
+                let hRow = Tensor(buffer: hFlat.buffer,
+                                  offset: hFlat.offset + r * hidden * dtBytes,
+                                  shape: [hidden], dtype: dt)
+                let sharedOut = swiGLU(hRow, gateProj: sg, upProj: su, downProj: sd,
+                                       on: work)
+                let outRow = Tensor(buffer: outFlat.buffer,
+                                    offset: outFlat.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+                _ = Ops.add(outRow, sharedOut, on: work, into: outRow)
+            }
+        }
+
+        // ── 14. Commit without wait — outFlat is in-flight; the caller's
+        // next read hazard-tracks against this write. Mirrors decode's
+        // commit pattern.
+        work.commit()
+        return outFlat
+    }
+
     /// Batched gather BGEMM fast path. T=1 decode: `mTotal = topK`. Each
     /// row of the gathered batch holds the same `[hidden]` activation
     /// vector but is paired with a different expert id via `indices`.

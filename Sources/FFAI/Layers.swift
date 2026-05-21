@@ -103,15 +103,37 @@ public final class QuantizedLinear: Module {
     public func callMany(_ x: Tensor, t: Int,
                          on cmd: MTLCommandBuffer,
                          device: Device) -> Tensor {
-        precondition(bits == 4,
-                     "QuantizedLinear.callMany: only 4-bit path wired today (mt_qmm_mma); got bits=\(bits)")
         let outDim = weight.shape[0]
         let inDim = scales.shape[scales.shape.count - 1] * groupSize
+        // 4-bit goes through the fast mt_qmm_mma path. Other bit-widths
+        // (commonly 8-bit on smaller projections like Qwen3.5's
+        // shared_expert_gate at hidden→1) fall back to T sequential
+        // `dequantGemv` calls on the same `cmd`. Slower than a true
+        // batched kernel but bit-identical to the per-token path, and
+        // the projections that hit this branch are tiny so the per-token
+        // launch overhead is in the noise.
+        if bits == 4 {
+            let out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
+            Ops.dequantGemmDynamicM(
+                input: x, weight: weight, scales: scales, biases: biases,
+                t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
+                on: cmd, device: device, into: out)
+            return out
+        }
+        let dtBytes = x.dtype.byteSize
         let out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
-        Ops.dequantGemmDynamicM(
-            input: x, weight: weight, scales: scales, biases: biases,
-            t: t, nOut: outDim, kIn: inDim, groupSize: groupSize,
-            on: cmd, device: device, into: out)
+        for r in 0..<t {
+            let xRow = Tensor(buffer: x.buffer,
+                              offset: x.offset + r * inDim * dtBytes,
+                              shape: [inDim], dtype: x.dtype)
+            let rowOut = Ops.dequantGemv(
+                weight: weight, scales: scales, biases: biases,
+                input: xRow, bits: bits, groupSize: groupSize, on: cmd)
+            let outRow = Tensor(buffer: out.buffer,
+                                offset: out.offset + r * outDim * dtBytes,
+                                shape: [outDim], dtype: x.dtype)
+            Ops.copy(rowOut, into: outRow, on: cmd)
+        }
         return out
     }
 }
