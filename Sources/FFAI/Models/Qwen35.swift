@@ -307,16 +307,38 @@ public struct Qwen35Hybrid: Qwen35Variant {
         }) else {
             throw Qwen35Error.missingConfig("embed_tokens.weight (model prefix)")
         }
+        // ── lm_head prefix — VLM-wrapped Qwen3.6 ships lm_head under
+        //    `language_model.lm_head.*` (NOT under `language_model.model`).
+        //    A text-only conversion drops the wrapper entirely.
+        let lmHeadCandidates = ["language_model.lm_head", "lm_head"]
+        let lmHeadPrefix = lmHeadCandidates.first(where: {
+            weights.has("\($0).weight")
+        })
+
+        let quant = config.quantization
 
         // ── Activation dtype — from the embedding table ───────────────
+        // Qwen3.6 ships a *quantized* embedding (uint32-packed weight +
+        // bf16 scales/biases). The activation dtype must come from the
+        // scales tensor in that case — the weight is a u32 pack table.
         let embedW = try weights.tensor(named: "\(modelPrefix).embed_tokens.weight")
-        let activationDtype = embedW.dtype
+        let activationDtype: DType
+        if weights.isQuantized("\(modelPrefix).embed_tokens") {
+            let sc = try weights.tensor(named: "\(modelPrefix).embed_tokens.scales")
+            activationDtype = sc.dtype
+        } else {
+            activationDtype = embedW.dtype
+        }
         precondition(
             activationDtype == .f32 || activationDtype == .bf16 || activationDtype == .f16,
             "Qwen3.5: unexpected activation dtype \(activationDtype)")
-        let embedTokens = AnyEmbedding(Embedding(weight: embedW))
+        // `loadEmbedding` picks Embedding vs QuantizedEmbedding based on
+        // the bundle's quant triplet — Qwen3.6's quantized embed is
+        // routed through `dequantGather` automatically.
+        let embedTokens = try loadEmbedding(
+            base: "\(modelPrefix).embed_tokens", in: weights,
+            hidden: hidden, quantization: quant)
 
-        let quant = config.quantization
         let invKeyScale = Foundation.pow(Float(linearKeyHeadDim), -0.5)
 
         // ── Per-layer construction ────────────────────────────────────
@@ -366,6 +388,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
                     keyDim: keyDim, valueDim: valueDim, convDim: convDim,
                     convKernel: convKernel, eps: eps,
                     invKeyScale: invKeyScale,
+                    quant: quant,
                     dtype: activationDtype, device: device)
                 layers.append(Qwen35GDNLayer(
                     inputNorm: inputNorm, postNorm: postNorm,
@@ -401,13 +424,19 @@ public struct Qwen35Hybrid: Qwen35Variant {
         let finalNorm = RMSNorm(
             weight: try weights.tensor(named: "\(modelPrefix).norm.weight"), eps: eps)
 
-        // lm_head — tied to the embedding table on every published
-        // Qwen3.5 checkpoint; honour an untied `lm_head.weight` if a
-        // checkpoint ships one.
+        // lm_head — most Qwen3.5 dense checkpoints tie to the embedding
+        // table; Qwen3.6 ships an UNTIED quantized lm_head under
+        // `language_model.lm_head.*`. Honour an explicit lm_head if the
+        // checkpoint provides one (located via `lmHeadPrefix` above),
+        // otherwise tie to the (raw) embedding weight.
         let lmHead: AnyLinear
-        if !tieEmbed, weights.has("lm_head.weight") {
-            lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
+        if !tieEmbed, let lmPrefix = lmHeadPrefix {
+            lmHead = try loadLinear(base: lmPrefix, in: weights, quantization: quant)
         } else {
+            // Tied path requires the raw embedding weight as a 2D matrix
+            // [vocab, hidden]. Only valid when the embedding itself is
+            // unquantized (Qwen3.6 doesn't take this branch — its
+            // checkpoint sets tie=false and ships an explicit lm_head).
             lmHead = AnyLinear(Linear(weight: embedW))
         }
 
@@ -426,6 +455,11 @@ public struct Qwen35Hybrid: Qwen35Variant {
     /// transposes the conv1d weight to the metaltile `[kernel, channels]`
     /// layout, and reads `A_log` + `dt_bias` to host arrays for the
     /// per-step gate computation.
+    ///
+    /// Qwen3.5 dense ships the linear-attention projections in raw bf16;
+    /// Qwen3.6 ships them affine-quantized (mlx layout, scales/biases
+    /// alongside the u32-packed weight). `loadLinear` picks the right
+    /// `Linear` vs `QuantizedLinear` variant per-tensor.
     private static func buildGDNMixer(
         prefix p: String, weights: SafeTensorsBundle,
         hidden: Int,
@@ -433,20 +467,21 @@ public struct Qwen35Hybrid: Qwen35Variant {
         keyHeadDim: Int, valueHeadDim: Int,
         keyDim: Int, valueDim: Int, convDim: Int,
         convKernel: Int, eps: Float, invKeyScale: Float,
+        quant: ModelConfig.QuantizationConfig?,
         dtype: DType, device: Device
     ) throws -> Qwen35GDNMixer {
         // Split projections — q|k|v stacked into `in_proj_qkv`; z, b, a
         // each their own projection. None ever carry bias on Qwen3.5.
-        let inProjQKV = AnyLinear(Linear(
-            weight: try weights.tensor(named: "\(p).in_proj_qkv.weight")))
-        let inProjZ = AnyLinear(Linear(
-            weight: try weights.tensor(named: "\(p).in_proj_z.weight")))
-        let inProjB = AnyLinear(Linear(
-            weight: try weights.tensor(named: "\(p).in_proj_b.weight")))
-        let inProjA = AnyLinear(Linear(
-            weight: try weights.tensor(named: "\(p).in_proj_a.weight")))
-        let outProj = AnyLinear(Linear(
-            weight: try weights.tensor(named: "\(p).out_proj.weight")))
+        let inProjQKV = try loadLinear(
+            base: "\(p).in_proj_qkv", in: weights, quantization: quant)
+        let inProjZ = try loadLinear(
+            base: "\(p).in_proj_z", in: weights, quantization: quant)
+        let inProjB = try loadLinear(
+            base: "\(p).in_proj_b", in: weights, quantization: quant)
+        let inProjA = try loadLinear(
+            base: "\(p).in_proj_a", in: weights, quantization: quant)
+        let outProj = try loadLinear(
+            base: "\(p).out_proj", in: weights, quantization: quant)
 
         // conv1d.weight ships [conv_dim, kernel, 1]; the metaltile kernel
         // wants [kernel, conv_dim].
@@ -523,6 +558,18 @@ public struct Qwen35Hybrid: Qwen35Variant {
         let router = MoERouter(
             nExperts: numExperts, topK: topK,
             gatingMode: .softmaxThenTopK, normTopKProb: normTopkProb)
+
+        // Batched gather BGEMM fast path: when the experts are mlx
+        // int4-quantized AND the shapes satisfy the bm16 tile contract
+        // (N%32 == 0, K%32 == 0), capture the stacked weight tensors so
+        // `MoELayer.decode` can dispatch `mt_moe_gather_qmm_mma_int4_bm16_*`
+        // — one launch per projection instead of `topK` sequential
+        // SwiGLU triplets (24 → 3 dispatches at `topK=8`).
+        let stackedInt4 = tryLoadStackedInt4(
+            base: "\(p).switch_mlp",
+            weights: weights, quant: quant,
+            numExperts: numExperts, moeIntermediate: moeIntermediate,
+            hidden: hidden)
         // The MoELayer carries only the routed experts — Qwen3.5's
         // shared expert is sigmoid-gated, which the plain MoELayer's
         // unconditional shared-expert add cannot express, so it is held
@@ -530,7 +577,8 @@ public struct Qwen35Hybrid: Qwen35Variant {
         let moe = MoELayer(
             gate: gate,
             gateProj: gateProj, upProj: upProj, downProj: downProj,
-            router: router, hidden: hidden)
+            router: router, hidden: hidden,
+            stackedInt4Experts: stackedInt4)
 
         // Sigmoid-gated always-on shared expert.
         let sharedGate = try loadLinear(
@@ -547,6 +595,77 @@ public struct Qwen35Hybrid: Qwen35Variant {
             sharedGateProj: sharedGate, sharedUpProj: sharedUp,
             sharedDownProj: sharedDown, sharedExpertGate: sharedExpertGate,
             hidden: hidden)
+    }
+
+    /// Try to load the stacked-int4-experts triplet for the batched
+    /// gather BGEMM fast path in `MoELayer.decode`. Returns nil unless
+    /// the checkpoint is mlx affine 4-bit AND the gate/up/down shapes
+    /// satisfy the `mt_moe_gather_qmm_mma_int4_bm16_*` tile contract
+    /// (`hidden % 32 == 0`, `moeIntermediate % 32 == 0`, derived bits
+    /// per-tensor == 4). The returned tensors are direct handles into
+    /// the safetensors mmap, so no extra allocations.
+    ///
+    /// On Qwen3.6-A3B (256 experts, hidden=2048, moeIntermediate=512,
+    /// groupSize=64, bits=4) this is the hot path — at decode `topK=8`
+    /// it replaces 24 sequential per-expert SwiGLU dispatches with 3
+    /// batched kernel launches + a handful of element-wise ops.
+    private static func tryLoadStackedInt4(
+        base: String, weights: SafeTensorsBundle,
+        quant: ModelConfig.QuantizationConfig?,
+        numExperts: Int, moeIntermediate: Int, hidden: Int
+    ) -> MoELayer.StackedInt4Experts? {
+        guard let q = quant,
+              weights.isQuantized("\(base).gate_proj"),
+              weights.isQuantized("\(base).up_proj"),
+              weights.isQuantized("\(base).down_proj")
+        else { return nil }
+        // bm16 tile contract — N must be multiple of 32, K must be
+        // multiple of 32. Gate / up: N=moeIntermediate K=hidden. Down:
+        // N=hidden K=moeIntermediate. Both reduce to the same
+        // divisibility test, since `moeIntermediate % 32 == 0 &&
+        // hidden % 32 == 0` implies both directions.
+        guard hidden % 32 == 0, moeIntermediate % 32 == 0 else { return nil }
+        // bm16 / bgemm fast path is int4-only — derive bits per-tensor
+        // from the stacked shapes; bail if any of the three is not 4.
+        do {
+            let gw = try weights.tensor(named: "\(base).gate_proj.weight")
+            let gs = try weights.tensor(named: "\(base).gate_proj.scales")
+            let gb = try weights.tensor(named: "\(base).gate_proj.biases")
+            let uw = try weights.tensor(named: "\(base).up_proj.weight")
+            let us = try weights.tensor(named: "\(base).up_proj.scales")
+            let ub = try weights.tensor(named: "\(base).up_proj.biases")
+            let dw = try weights.tensor(named: "\(base).down_proj.weight")
+            let ds = try weights.tensor(named: "\(base).down_proj.scales")
+            let db = try weights.tensor(named: "\(base).down_proj.biases")
+            // Derived bit-width must be 4 for all three projections.
+            let gateBits = deriveAffineQuantBits(
+                weightPackedCols: gw.shape[gw.shape.count - 1],
+                scaleCols: gs.shape[gs.shape.count - 1],
+                groupSize: q.groupSize)
+            let upBits = deriveAffineQuantBits(
+                weightPackedCols: uw.shape[uw.shape.count - 1],
+                scaleCols: us.shape[us.shape.count - 1],
+                groupSize: q.groupSize)
+            let downBits = deriveAffineQuantBits(
+                weightPackedCols: dw.shape[dw.shape.count - 1],
+                scaleCols: ds.shape[ds.shape.count - 1],
+                groupSize: q.groupSize)
+            guard gateBits == 4, upBits == 4, downBits == 4 else { return nil }
+            // Activations dtype matches scales / biases (mlx convention).
+            let dtype = gs.dtype
+            guard dtype == .f16 || dtype == .bf16 || dtype == .f32 else { return nil }
+            return MoELayer.StackedInt4Experts(
+                gateWeight: gw, gateScales: gs, gateBiases: gb,
+                upWeight: uw, upScales: us, upBiases: ub,
+                downWeight: dw, downScales: ds, downBiases: db,
+                numExperts: numExperts, moeIntermediate: moeIntermediate,
+                hidden: hidden, groupSize: q.groupSize, dtype: dtype)
+        } catch {
+            // Any missing tensor → silently fall back. The per-expert
+            // sliced path will load these same tensors via the regular
+            // `sliceStackedExperts` route.
+            return nil
+        }
     }
 
     /// Slice a stacked `[numExperts, outDim, inDim]` expert tensor into
@@ -1392,6 +1511,60 @@ public final class Qwen35Model: LanguageModel {
         // Final norm + lm_head queue onto the caller's pristine `cmd`.
         let normed = finalNorm(h, on: cmd)
         return lmHead(normed, on: cmd)
+    }
+
+    /// Multi-token forward over `tokenIds[startPosition .. startPosition+T)`
+    /// for prefill. Returns the logits of the *last* token only — every
+    /// preceding token's logits is consumed only by its KV/GDN cache
+    /// write. Mirrors mlx-lm's chunked-prefill driver.
+    ///
+    /// ─── Current state (Phase 0 — API + per-token loop) ─────────────────
+    ///
+    /// This is the entry point for batched prefill in Qwen3.5/3.6. The
+    /// per-token-state architecture (single-token decode kernels for
+    /// projections, conv1d, GDN, and attention) means a real batched-T
+    /// implementation requires:
+    ///
+    ///   1. A batched-T variant of every projection (`dequantGemv` /
+    ///      `gemv` → batched `dequantGemm` / `gemm`). The existing
+    ///      `mt_qmm_mma_m16` is BM=16 fixed; a dynamic-M qmm + chunking
+    ///      dispatcher is needed.
+    ///   2. A batched-T conv1d_causal (the GDN input projection's conv1d
+    ///      is rolling over `convKernel`; chunked form exists in
+    ///      metaltile-ffai's `mt_gated_delta_chunk` for the *recurrence*
+    ///      but conv1d still has to step T times).
+    ///   3. Per-layer `decodeMany(_ inputs: [T, hidden], ...)` on
+    ///      `Qwen35GDNLayer` / `Qwen35AttentionLayer` that uses
+    ///      `Ops.gatedDeltaChunk` + `Ops.sdpaPrefillMma` (both newly
+    ///      added) on the recurrence / SDPA hot path.
+    ///
+    /// Until those land, this entry point loops per-token through the
+    /// existing decode path. The shape of the API is the same, so a
+    /// future agent can swap the loop body without changing callers
+    /// (the bench harness, the `Generate.swift` prefill driver).
+    public func forwardMany(tokenIds: [Int], startPosition: Int,
+                            caches: [any LayerCacheProtocol],
+                            on cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        precondition(!tokenIds.isEmpty,
+                     "Qwen35Model.forwardMany: tokenIds must not be empty")
+        if tokenIds.count == 1 {
+            return forward(tokenId: tokenIds[0], position: startPosition,
+                           caches: caches, on: cmd, device: device)
+        }
+        // Per-token loop for the (T-1) prefix — each call commits its own
+        // work buffers, so `cmd` stays pristine. The final token queues
+        // onto the caller's `cmd` so the default `forwardSample` /
+        // `forwardSampleCategorical` overlay their output kernels.
+        let prefix = tokenIds.count - 1
+        for i in 0..<prefix {
+            let stepCmd = device.makeCommandBuffer()
+            _ = forward(tokenId: tokenIds[i], position: startPosition + i,
+                        caches: caches, on: stepCmd, device: device)
+            stepCmd.commit()
+            stepCmd.waitUntilCompleted()
+        }
+        return forward(tokenId: tokenIds[prefix], position: startPosition + prefix,
+                       caches: caches, on: cmd, device: device)
     }
 }
 
