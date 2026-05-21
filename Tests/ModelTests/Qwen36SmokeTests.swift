@@ -133,6 +133,71 @@ struct Qwen36SmokeTests {
         print("\(label): RESULT prefill_ms=\(String(format: "%.0f", prefillMs)) decode_tps=\(String(format: "%.2f", decodeTps)) steady_tps=\(String(format: "%.2f", steadyTps)) prefill_tps=\(String(format: "%.1f", prefillTps))")
     }
 
+    @Test("Qwen3.6-35B-A3B forwardMany bench — T=32 prefill, batched vs per-token")
+    func forwardManyBench() async throws {
+        let path = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
+        guard FileManager.default.fileExists(atPath: path) else {
+            print("Qwen3.6 forwardManyBench skipped: \(path) not found")
+            return
+        }
+        var optsBuilder = LoadOptions()
+        optsBuilder.prewarm = false
+        let opts = optsBuilder
+        let m: Model = try await ModelLoadLock.shared.loadSerially {
+            try await Model.load(path, options: opts)
+        }
+        guard let qwen = m.qwen35 else {
+            Issue.record("expected Qwen35Model engine")
+            return
+        }
+        // T=32 prompt — matches benchShort target. Pad / truncate as needed.
+        let prompt = "The history of the printing press began when European craftsmen of the 15th century combined movable metal type with oil based ink screw presses paper to mass produce printed books pamphlets and broadsheets revolutionising communication"
+        var encoded = m.tokenizer.encode(text: prompt)
+        let target = 32
+        if encoded.count > target { encoded = Array(encoded.prefix(target)) }
+        let T = encoded.count
+        print("forwardManyBench T=\(T)")
+
+        // Warm up Metal PSO + first-token JIT.
+        let warmCaches = qwen.makeLayerCaches()
+        for (i, tok) in encoded.prefix(2).enumerated() {
+            _ = qwen.forward(tokenId: tok, position: i, caches: warmCaches)
+        }
+
+        // Per-token loop baseline (5 runs, mean).
+        var perTokenSecs: [Double] = []
+        for _ in 0..<5 {
+            let caches = qwen.makeLayerCaches()
+            let t0 = Date()
+            for (i, tok) in encoded.enumerated() {
+                _ = qwen.forward(tokenId: tok, position: i, caches: caches)
+            }
+            perTokenSecs.append(Date().timeIntervalSince(t0))
+        }
+        perTokenSecs.sort()
+        let perTokenMedian = perTokenSecs[perTokenSecs.count / 2]
+        print("per-token T=\(T): runs=\(perTokenSecs.map { String(format: "%.3f", $0) }) median=\(String(format: "%.3f", perTokenMedian))s = \(String(format: "%.2f", Double(T)/perTokenMedian)) tps")
+
+        // Batched forwardMany (5 runs, mean).
+        var batchedSecs: [Double] = []
+        for _ in 0..<5 {
+            let caches = qwen.makeLayerCaches()
+            let bCmd = Device.shared.makeCommandBuffer()
+            let t0 = Date()
+            _ = qwen.forwardMany(tokenIds: encoded, startPosition: 0,
+                                 caches: caches, on: bCmd, device: Device.shared)
+            bCmd.commit()
+            await bCmd.completed()
+            batchedSecs.append(Date().timeIntervalSince(t0))
+        }
+        batchedSecs.sort()
+        let batchedMedian = batchedSecs[batchedSecs.count / 2]
+        print("batched T=\(T): runs=\(batchedSecs.map { String(format: "%.3f", $0) }) median=\(String(format: "%.3f", batchedMedian))s = \(String(format: "%.2f", Double(T)/batchedMedian)) tps")
+
+        let speedup = perTokenMedian / batchedMedian
+        print("forwardManyBench RESULT T=\(T): per_token=\(String(format: "%.0f", perTokenMedian*1000))ms batched=\(String(format: "%.0f", batchedMedian*1000))ms speedup=\(String(format: "%.2fx", speedup))")
+    }
+
     @Test("Qwen3.6-35B-A3B forwardMany matches per-token forward")
     func forwardManyEquivalence() async throws {
         let path = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
