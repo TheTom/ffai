@@ -2680,6 +2680,95 @@ public enum Ops {
     // descriptor (M=8, N=32, K=16) clears the simdgroup-scope
     // constraint that the all-cooperative `matmul2d` would reject.
     // Requires macOS 26.2+ / Apple10 GPU (M5 Max).
+    /// BM=64 MPP / NAX cooperative-tensor MoE gather BGEMM. Half-height
+    /// counterpart of the Bm16 default — fills `ceil(m/64)` tiles
+    /// instead of `ceil(m/16)`. Sweet spot for the batched-prefill
+    /// regime where `mTotal = T·topK ≥ 64`: at Qwen3.6-A3B T=32 topK=8
+    /// mTotal=256 = exactly 4 BM=64 tiles, no boundary waste. Falls back
+    /// to the regular Bm16 path under `mTotal < 64` (the caller should
+    /// gate selection).
+    ///
+    /// Requires macOS 26.2+ on Apple10+ GPU (M5 Max) — the MPP path
+    /// uses the cooperative-tensor `mpp::tensor_ops::matmul2d` per the
+    /// metaltile MPP NAX primitive landing.
+    public static func moeGatherDequantGemmInt4Bm64Mpp(
+        input: Tensor,
+        weight: Tensor, scales: Tensor, biases: Tensor,
+        indices: Tensor,
+        mTotal: Int, nOut: Int, kIn: Int,
+        groupSize: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(weight.dtype == .u32,
+                     "moeGatherDequantGemmInt4Bm64Mpp: weight must be u32 packed")
+        precondition(indices.dtype == .u32,
+                     "moeGatherDequantGemmInt4Bm64Mpp: indices must be u32")
+        precondition(input.dtype == scales.dtype && scales.dtype == biases.dtype,
+                     "moeGatherDequantGemmInt4Bm64Mpp: input/scales/biases dtype must match")
+        precondition(out.dtype == input.dtype,
+                     "moeGatherDequantGemmInt4Bm64Mpp: out dtype must match input")
+        precondition(input.elementCount == mTotal * kIn,
+                     "moeGatherDequantGemmInt4Bm64Mpp: input elements \(input.elementCount) ≠ mTotal·kIn \(mTotal * kIn)")
+        precondition(out.elementCount == mTotal * nOut,
+                     "moeGatherDequantGemmInt4Bm64Mpp: out elements \(out.elementCount) ≠ mTotal·nOut \(mTotal * nOut)")
+        precondition(indices.elementCount == mTotal,
+                     "moeGatherDequantGemmInt4Bm64Mpp: indices elements \(indices.elementCount) ≠ mTotal \(mTotal)")
+        precondition(nOut % 32 == 0,
+                     "moeGatherDequantGemmInt4Bm64Mpp: nOut (\(nOut)) must be multiple of 32")
+        precondition(kIn % 32 == 0,
+                     "moeGatherDequantGemmInt4Bm64Mpp: kIn (\(kIn)) must be multiple of 32")
+
+        // 1 simdgroup per TG, BM=64 → grid Y = ceil(m/64).
+        let tgWidth = 32
+        let grid = MTLSize(width: (nOut / 32) * tgWidth,
+                           height: (mTotal + 63) / 64,
+                           depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let mTotalU = UInt32(mTotal)
+        let nOutU = UInt32(nOut)
+        let kInU = UInt32(kIn)
+        let groupSizeU = UInt32(groupSize)
+
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm64_mpp_f32(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm64_mpp_f16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_gather_qmm_mma_int4_bm64_mpp_bf16(
+                x: input.buffer, xOffset: input.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                indices: indices.buffer, indicesOffset: indices.offset,
+                out: out.buffer, outOffset: out.offset,
+                m_total: mTotalU, n_out: nOutU, k_in: kInU,
+                group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4Bm64Mpp: unsupported dtype \(input.dtype)")
+        }
+    }
+
     public static func moeGatherDequantGemmInt4Bm8(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,

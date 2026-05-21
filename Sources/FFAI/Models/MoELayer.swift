@@ -635,8 +635,30 @@ public final class MoELayer: Module, DecoderLayer {
                                    device: device)
         let upOut = Tensor.empty(shape: [mTotal, moeIntermediate], dtype: dt,
                                  device: device)
-        let useBm8 = topK <= 8 && useBm8Env && mTotal <= 8
-        let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
+        // Tile selection for the batched-prefill regime:
+        //   - mTotal ≥ 64 + `FFAI_MOE_BGEMM_BM64=1` → bm64_mpp (NAX
+        //     cooperative-tensor). Wrapper in tree but dispatch-shape
+        //     fails the equivalence canary (argmax 220 — the same
+        //     dispatchThreads/threadgroups grid bug we saw at m1).
+        //     Needs verification against the metaltile-ffai kernel
+        //     source. **Default off** until that's resolved.
+        //   - 16 ≤ mTotal → bm16 (the default `moeGatherDequant
+        //     GemmInt4`). 16-deep tile fill across consecutive
+        //     sorted-by-expert rows. THIS is the path that drives the
+        //     2.69× T=32 win.
+        //   - mTotal ≤ 8 + `FFAI_MOE_BGEMM_BM8=1` → bm8 (decode T=1
+        //     fallback).
+        let useBm64 = mTotal >= 64
+            && ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_BM64"] != nil
+        let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
+        let bgemm: (Tensor, Tensor, Tensor, Tensor, Tensor, Int, Int, Int, Int, MTLCommandBuffer, Tensor) -> Void
+        if useBm64 {
+            bgemm = Ops.moeGatherDequantGemmInt4Bm64Mpp
+        } else if useBm8 {
+            bgemm = Ops.moeGatherDequantGemmInt4Bm8
+        } else {
+            bgemm = Ops.moeGatherDequantGemmInt4
+        }
         bgemm(xGathered,
               stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
               indices, mTotal, moeIntermediate, hidden, groupSize, work, gateOut)
