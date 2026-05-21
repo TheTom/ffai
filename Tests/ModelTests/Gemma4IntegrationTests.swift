@@ -4,7 +4,10 @@
 //
 //   • two attention geometries (sliding head_dim 256 + global 512)
 //   • ProportionalRoPE on the global layers
-//   • value RMSNorm, per-head q/k norms, Gemma `(1 + weight)` fold
+//   • value RMSNorm, per-head q/k norms, plain RMSNorm (no Gemma
+//     `(1 + weight)` fold — Gemma 4 dropped that convention)
+//   • leading `<bos>` prefix (Gemma 4's tokenizer post-processor
+//     does not add one — `Gemma4Model.requiresLeadingBOS`)
 //   • Per-Layer Embeddings (PLE) — E2B / E4B are PLE variants
 //   • per-layer learned scalar
 //   • sqrt(hidden) embed scale, GELU MLP, tied embeddings
@@ -78,38 +81,26 @@ struct Gemma4IntegrationTests {
         #expect(globalCount == 7)
         #expect(slidingCount == 28)
 
-        // ── KNOWN ISSUE — generation coherence not yet verified ──────
+        // Greedy decode is verified coherent: the incoherent-output bug
+        // was a missing leading `<bos>` token. Gemma 4 is BOS-critical,
+        // but unlike Gemma 3 its `tokenizer.json` post-processor's
+        // `single` template is bare (no `<bos>` special token), so
+        // `Tokenizer.encode` returned no BOS and the residual stream was
+        // subtly wrong from token 0. `Gemma4Model.requiresLeadingBOS`
+        // now drives `Generate.encodePrompt` to prepend it. See
+        // `Sources/FFAI/Generate.swift` and `Models/Gemma4.swift`.
         //
-        // The model loads, the variant + cache geometry resolve
-        // correctly (asserted above), and a forward pass runs end to
-        // end without crashing. But greedy decode currently produces
-        // incoherent tokens, so the `expectCoherentOutput` assertion is
-        // gated behind `GEMMA4_RUN_GENERATION` until the numerical bug
-        // is found. Two open suspects:
-        //
-        //   1. The 512-wide global-attention path — `globalAttention`
-        //      runs a host-side SDPA with `ropeProportional`; the
-        //      ProportionalRoPE pairing / frequency convention against
-        //      the shared `ffai_rope_llama` kernel needs a kernel-level
-        //      round-trip test to confirm.
-        //   2. The PLE mix (`Gemma4PLE.perLayerInputs` +
-        //      `applyPLEAndScalar`) — scaling-constant order or a
-        //      double-applied embedding scale.
-        //
-        // The host-side global SDPA is also far too slow for a routine
-        // integration test (~60 s/token in a debug build); a 512-wide
-        // `Ops.sdpaDecode` specialization is the prerequisite for
-        // re-enabling this end-to-end check.
-        guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
-            print("Gemma 4 E2B generation coherence check skipped " +
-                  "(set GEMMA4_RUN_GENERATION=1 to run — known incoherent, see comment).")
-            return
-        }
+        // NOTE — slow: the 512-wide global-attention layers run a
+        // host-side SDPA (~60 s/token in a debug build), so this single
+        // 24-token generation takes ~30 min. A 512-wide `Ops.sdpaDecode`
+        // specialization is the follow-up that brings it back to a
+        // routine-cost integration test.
 
         let result = try await m.generate(
             prompt: prompt,
             parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
         )
+        print("Gemma 4 E2B decoded: \"\(prompt)\(result.text)\"")
         #expect(result.tokensPerSecond > 0)
         expectCoherentOutput(result.generatedTokens, minTokens: maxTokens,
                              label: "Gemma 4 E2B-it bf16")
@@ -133,11 +124,19 @@ struct Gemma4IntegrationTests {
         #expect(gemma4 != nil)
         #expect(gemma4?.ple == nil, "31B is a dense (non-PLE) variant")
 
-        // Generation gated behind the same flag as the E2B test — see
-        // the KNOWN ISSUE note in `loadAndGenerateE2B`.
+        // Generation stays gated behind `GEMMA4_RUN_GENERATION` for the
+        // dense 31B variant — *not* a coherence issue (the BOS fix that
+        // un-gated the E2B test applies here too), but a separate
+        // dense-path limitation: the 31B `finalNorm` is an `RMSNorm`
+        // over hidden=5376, and `Ops.rmsNorm`'s single-row kernel caps
+        // at n=4096 (1024-thread × 4 elements). It fatal-errors before
+        // emitting a token. The fix is a chunked / row-wise final-norm
+        // path for >4096-wide hidden states; until then this generation
+        // check is opt-in so it cannot crash the CI suite process.
         guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
-            print("Gemma 4 31B generation coherence check skipped " +
-                  "(set GEMMA4_RUN_GENERATION=1 to run).")
+            print("Gemma 4 31B generation check skipped " +
+                  "(set GEMMA4_RUN_GENERATION=1 to run — dense-path " +
+                  "rmsNorm n=5376 cap, see comment).")
             return
         }
         let result = try await m.generate(

@@ -81,7 +81,7 @@ public extension Model {
     func generate(prompt: String,
                   parameters: GenerationParameters? = nil,
                   profile: Profile = .shared) async throws -> GenerationResult {
-        let promptTokens = tokenizer.encode(text: prompt)
+        let promptTokens = encodePrompt(prompt)
         let params = parameters ?? defaultGenerationParameters
         let stream = generateStreamInternal(promptTokens: promptTokens,
                                             parameters: params, profile: profile)
@@ -100,10 +100,35 @@ public extension Model {
                         parameters: GenerationParameters? = nil,
                         profile: Profile = .shared)
         -> AsyncThrowingStream<GenerationChunk, Error> {
-        let promptTokens = tokenizer.encode(text: prompt)
+        let promptTokens = encodePrompt(prompt)
         let params = parameters ?? defaultGenerationParameters
         return generateStreamInternal(promptTokens: promptTokens,
                                       parameters: params, profile: profile)
+    }
+
+    // MARK: - Prompt encoding
+
+    /// Encode a raw prompt string to token ids, prepending the model's
+    /// `<bos>` token when the engine declares `requiresLeadingBOS` and
+    /// the tokenizer's post-processor did not already add one.
+    ///
+    /// Gemma 4 is the motivating case: it is BOS-critical, but its
+    /// `tokenizer.json` post-processor's `single` template is bare, so
+    /// `Tokenizer.encode` returns no leading BOS. Without this prefix
+    /// the model generates incoherent text. Gemma 3 and most other
+    /// families list `<bos>` in their post-processor and need no fixup
+    /// here. The guard against a BOS already being present keeps the
+    /// helper idempotent and safe for families whose post-processor
+    /// does add one.
+    internal func encodePrompt(_ prompt: String) -> [Int] {
+        var tokens = tokenizer.encode(text: prompt)
+        guard engine.requiresLeadingBOS,
+              let bos = tokenizer.bosTokenId ?? config.bosTokenId
+        else { return tokens }
+        if tokens.first != bos {
+            tokens.insert(bos, at: 0)
+        }
+        return tokens
     }
 
     // MARK: - Internal entry points (shared by chat overloads)

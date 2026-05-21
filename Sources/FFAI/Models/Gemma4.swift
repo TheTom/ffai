@@ -13,9 +13,12 @@
 //
 // ─── Architecture vs Gemma 3 ─────────────────────────────────────────
 //
-// Gemma 4 keeps Gemma 3's backbone shape — four per-block norms, the
-// Gemma `(1 + weight)` RMSNorm, per-head q/k norms, sqrt(hidden) embed
-// scale, GELU MLP, tied embeddings — and adds:
+// Gemma 4 keeps Gemma 3's backbone shape — four per-block norms,
+// per-head q/k norms, sqrt(hidden) embed scale, GELU MLP, tied
+// embeddings — but **drops the Gemma `(1 + weight)` RMSNorm
+// convention**: Gemma 4 norms are plain RMSNorm (`x_normed · weight`)
+// and the checkpoints store the norm weight as the direct multiplier
+// (see `loadGemma4RMSNorm`). Gemma 4 also adds:
 //
 //   1. **Two attention geometries.** `layer_types` labels each layer
 //      `sliding_attention` or `full_attention`. Sliding layers use
@@ -546,43 +549,27 @@ enum Gemma4Loader {
 /// in rotate-half pairs, so the count must be even.
 private func evenFloor(_ n: Int) -> Int { n - (n % 2) }
 
-// MARK: - Gemma 4 RMSNorm load (the (1 + weight) fold)
+// MARK: - Gemma 4 RMSNorm load
 
-/// Load a Gemma RMSNorm weight, folding the `(1 + weight)` offset into
-/// the tensor at load time so the stock `RMSNorm` kernel applies
-/// unchanged. Identical fold to `Gemma3.loadGemmaRMSNorm` — Gemma 4
-/// keeps the same norm convention.
+/// Load a Gemma 4 RMSNorm weight verbatim.
+///
+/// **Gemma 4 dropped the `(1 + weight)` RMSNorm convention.** Gemma 3
+/// (and earlier Gemma) store norm weights centred near 0 and the norm
+/// computes `x_normed · (1 + weight)`; FFAI's `Gemma3.loadGemmaRMSNorm`
+/// folds the `+1` in at load time. Gemma 4's reference (`mlx-lm`
+/// `gemma4_text`) uses a *plain* `nn.RMSNorm` — `x_normed · weight` —
+/// and the checkpoints store the norm weights as the *direct*
+/// multiplier (hidden-size norms have mean ≈ 10, the per-layer
+/// projection norm has values spanning 0.09 … 5.5). Folding `+1` here
+/// inflates every small weight — for the per-layer projection norm a
+/// 0.09 weight becomes 1.09, a ~12× error — and was the cause of the
+/// incoherent-generation bug. Load the weight as-is.
 private func loadGemma4RMSNorm(
     base: String, in weights: SafeTensorsBundle, eps: Double
 ) throws -> RMSNorm {
     let raw = try weights.tensor(named: base)
     precondition(raw.shape.count == 1, "Gemma4 RMSNorm weight must be 1D, got \(raw.shape)")
-    let n = raw.elementCount
-    let foldedBuf = Device.shared.makeBuffer(length: raw.byteCount)
-    let folded = Tensor(buffer: foldedBuf, offset: 0, shape: raw.shape, dtype: raw.dtype)
-    let dstPtr = foldedBuf.contents()
-    let srcPtr = raw.buffer.contents().advanced(by: raw.offset)
-    switch raw.dtype {
-    case .f32:
-        let src = srcPtr.bindMemory(to: Float.self, capacity: n)
-        let dst = dstPtr.bindMemory(to: Float.self, capacity: n)
-        for i in 0..<n { dst[i] = src[i] + 1.0 }
-    case .f16:
-        let src = srcPtr.bindMemory(to: UInt16.self, capacity: n)
-        let dst = dstPtr.bindMemory(to: UInt16.self, capacity: n)
-        for i in 0..<n {
-            dst[i] = floatToHalfBitsForTest(halfBitsToFloatForTest(src[i]) + 1.0)
-        }
-    case .bf16:
-        let src = srcPtr.bindMemory(to: UInt16.self, capacity: n)
-        let dst = dstPtr.bindMemory(to: UInt16.self, capacity: n)
-        for i in 0..<n {
-            dst[i] = floatToBf16BitsForTest(bf16BitsToFloatForTest(src[i]) + 1.0)
-        }
-    default:
-        fatalError("Gemma4 RMSNorm: unsupported weight dtype \(raw.dtype)")
-    }
-    return RMSNorm(weight: folded, eps: Float(eps))
+    return RMSNorm(weight: raw, eps: Float(eps))
 }
 
 /// Fill a flat `[n]` tensor with a scalar (used for the embed-scale
@@ -645,6 +632,7 @@ public final class Gemma4PLE: Module {
     /// tensor (one row per decoder layer).
     func perLayerInputs(tokenTensor: Tensor, h: Tensor,
                         on cmd: MTLCommandBuffer) -> Tensor {
+        let tap = InspectTap.fromEnvironment
         // 1. Embed token through the per-layer table, scale by
         //    sqrt(hiddenSizePerLayerInput).
         let plEmbed = embed(tokenTensor, on: cmd)
@@ -660,9 +648,27 @@ public final class Gemma4PLE: Module {
             plProj, weight: projectionNorm.weight, eps: projectionNorm.eps,
             nRows: nLayers, rowSize: hiddenSizePerLayerInput, on: cmd)
         let combined = Ops.add(normed, scaledEmbed, on: cmd)
-        return Ops.mul(combined, combineScaleVec, on: cmd)
+        let result = Ops.mul(combined, combineScaleVec, on: cmd)
             .reshaped(to: [nLayers, hiddenSizePerLayerInput])
+        // Stash the substep tensors so `forward` can dump them AFTER it
+        // commits the prep command buffer (committing here would
+        // double-commit the caller's cmd).
+        if tap.active {
+            inspectSubsteps = [
+                ("ple.plEmbed_raw", plEmbed),
+                ("ple.plEmbed_scaled", scaledEmbed),
+                ("ple.plProj_scaled", plProj),
+                ("ple.plProj_normed", normed),
+                ("ple.pli_final", result),
+            ]
+        }
+        return result
     }
+
+    /// Debug-only: substep tensors captured by the last `perLayerInputs`
+    /// call when `InspectTap` is active. `forward` dumps these after the
+    /// prep command buffer has been committed. Empty in production.
+    var inspectSubsteps: [(String, Tensor)] = []
 }
 
 /// Per-layer PLE modules held on each decoder block (Gemma4E).
@@ -1223,6 +1229,14 @@ public final class Gemma4Model: LanguageModel {
     public let hidden, nLayers, nHeads, nKVHeads, headDim, vocab, maxSeq: Int
     public let dtype: DType
 
+    /// Gemma 4 is BOS-critical and its `tokenizer.json` post-processor's
+    /// `single` template is bare (`[Sequence A]`, no `<bos>` special
+    /// token) — unlike Gemma 3, whose post-processor lists `<bos>`. So
+    /// `Tokenizer.encode` returns no leading BOS for Gemma 4, and
+    /// `Generate.swift` must prepend it explicitly. Without the BOS the
+    /// model generates degraded, incoherent text.
+    public let requiresLeadingBOS = true
+
     let kvCacheKind: KVCacheKind
     /// Soft-cap value for the final logits; nil ⇒ no capping.
     let finalLogitSoftcapping: Float?
@@ -1300,6 +1314,7 @@ public final class Gemma4Model: LanguageModel {
         // own command buffers and commits before returning resident `h`.
         // The caller's pristine `cmd` is touched only by the embedding +
         // PLE prep and the final norm / lm_head / soft-cap.
+        let tap = InspectTap.fromEnvironment
         let tokenBuf = device.makeBuffer(length: 4)
         var tid = UInt32(tokenId)
         memcpy(tokenBuf.contents(), &tid, 4)
@@ -1319,6 +1334,18 @@ public final class Gemma4Model: LanguageModel {
         }
         prepCmd.commit()
         prepCmd.waitUntilCompleted()
+        if tap.active {
+            _ = tap.dumpLayerBoundary(h, label: "embed*scale", layer: -1,
+                                      cmd: device.makeCommandBuffer(), device: device)
+            for (label, t) in ple?.inspectSubsteps ?? [] {
+                _ = tap.dumpLayerBoundary(t, label: label, layer: -1,
+                                          cmd: device.makeCommandBuffer(), device: device)
+            }
+            if let pli = perLayerInputs {
+                _ = tap.dumpLayerBoundary(pli, label: "pli", layer: -1,
+                                          cmd: device.makeCommandBuffer(), device: device)
+            }
+        }
 
         // Batchable (sliding + dense) layers queue onto a shared
         // `workCmd`; a global / MoE layer needs a mid-layer host sync,
@@ -1353,11 +1380,27 @@ public final class Gemma4Model: LanguageModel {
             } else {
                 batchPending = true
             }
+            if tap.shouldDump(layer: i) {
+                // `h` is resident if the layer committed; otherwise the
+                // pending batch must be flushed before reading it.
+                if batchPending {
+                    workCmd.commit()
+                    workCmd.waitUntilCompleted()
+                    workCmd = device.makeCommandBuffer()
+                    batchPending = false
+                }
+                _ = tap.dumpLayerBoundary(h, label: "layer_out", layer: i,
+                                          cmd: device.makeCommandBuffer(), device: device)
+            }
         }
         // Flush any trailing batched work so `h` is resident.
         if batchPending {
             workCmd.commit()
             workCmd.waitUntilCompleted()
+        }
+        if tap.active {
+            _ = tap.dumpLayerBoundary(h, label: "h_pre_finalnorm", layer: -1,
+                                      cmd: device.makeCommandBuffer(), device: device)
         }
 
         // Final norm + lm_head. Soft-capping needs the logits on the

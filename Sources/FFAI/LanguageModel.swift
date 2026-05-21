@@ -15,6 +15,23 @@ public protocol LanguageModel: Module {
     var maxSeq: Int { get }
     var dtype: DType { get }
 
+    /// Whether this family requires a leading `<bos>` token on every
+    /// prompt for coherent generation, *and* cannot rely on the
+    /// tokenizer's post-processor to add it.
+    ///
+    /// Most families either don't need a BOS or get one "for free" from
+    /// their `tokenizer.json` `TemplateProcessing` post-processor (its
+    /// `single` template lists `<bos>` as a special token). Gemma 4 is
+    /// the exception: it is BOS-critical — running it without a leading
+    /// `<bos>` yields degraded, incoherent output — yet its
+    /// `tokenizer.json` post-processor's `single` template is bare
+    /// (`[Sequence A]`, no special token), so `Tokenizer.encode` returns
+    /// no BOS. Gemma 3, by contrast, lists `<bos>` in its post-processor
+    /// and works for free. Families that set this to `true` get an
+    /// explicit BOS prepended by `Generate.swift` when `encode` did not
+    /// already produce one. Default `false`.
+    var requiresLeadingBOS: Bool { get }
+
     /// One per-layer state cache, sized for the model's defaults. The
     /// concrete type returned depends on the family (raw `KVCache` /
     /// `AffineQuantizedKVCache` for attention models, `Mamba2LayerCache`
@@ -47,6 +64,11 @@ public protocol LanguageModel: Module {
 }
 
 public extension LanguageModel {
+    /// Default: no explicit BOS prefixing. Families that are BOS-critical
+    /// and whose tokenizer post-processor does not add one (Gemma 4)
+    /// override this to `true`.
+    var requiresLeadingBOS: Bool { false }
+
     func makeLayerCaches(maxSeq: Int? = nil, device: Device = .shared) -> [any LayerCacheProtocol] {
         makeLayerCaches(maxSeq: maxSeq, device: device)
     }
