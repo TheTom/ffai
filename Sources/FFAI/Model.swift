@@ -10,13 +10,46 @@ public enum ModelError: Error, CustomStringConvertible {
     case unsupportedArchitecture(String)
     case unsupportedModelType(String)
     case capabilityNotAvailable(Capability)
+    case visionModelNotIntegrated(String)
 
     public var description: String {
         switch self {
         case .unsupportedArchitecture(let a): return "Unsupported architecture: \(a)"
         case .unsupportedModelType(let m): return "Unsupported model_type: \(m)"
         case .capabilityNotAvailable(let c): return "Capability not available: \(c)"
+        case .visionModelNotIntegrated(let a):
+            return "Vision-language checkpoint '\(a)' detected. The FFAI "
+                + "vision foundation (VisionEncoder, ImagePreprocessing, "
+                + "VLModel cross-modal splice, conv2d/patch_embed/rope_2d "
+                + "Ops) is in tree, but this VL family is not yet wired to "
+                + "a checkpoint loader. Load the text-only checkpoint, or "
+                + "compose a VLModel directly from VisionEncoder + the text "
+                + "engine."
         }
+    }
+}
+
+/// Architecture strings that identify a vision-language checkpoint. A
+/// VL checkpoint carries a `vision_config` block and prefixes its text
+/// weights under `language_model.*`; the registry recognizes these so a
+/// VL load fails with an actionable `visionModelNotIntegrated` error
+/// rather than a generic "unsupported architecture".
+public enum VisionLanguageArchitectures {
+    public static let architectures: Set<String> = [
+        "Gemma3ForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen2VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    ]
+
+    /// True if `config` describes a VL checkpoint — by architecture
+    /// string or by the presence of a `vision_config` block.
+    public static func isVisionLanguage(_ config: ModelConfig) -> Bool {
+        if let arch = config.architecture, architectures.contains(arch) {
+            return true
+        }
+        return config.nested("vision_config") != nil
     }
 }
 
@@ -33,13 +66,20 @@ public enum ModelRegistry {
         /// Capabilities the loaded variant supports. Text-only families
         /// report `Capability.textOnly`; VL variants add `.visionIn`.
         public let availableCapabilities: Set<Capability>
+        /// The composed vision-language model, when the checkpoint is a
+        /// VLM. `nil` for text-only families. The `engine` is the VL
+        /// model's text backbone, so text-only generation works
+        /// regardless; `vlModel` adds the cross-modal image path.
+        public let vlModel: VLModel?
 
         public init(engine: any LanguageModel,
                     defaultGenerationParameters: GenerationParameters,
-                    availableCapabilities: Set<Capability> = Capability.textOnly) {
+                    availableCapabilities: Set<Capability> = Capability.textOnly,
+                    vlModel: VLModel? = nil) {
             self.engine = engine
             self.defaultGenerationParameters = defaultGenerationParameters
             self.availableCapabilities = availableCapabilities
+            self.vlModel = vlModel
         }
     }
 
@@ -49,6 +89,30 @@ public enum ModelRegistry {
         options: LoadOptions,
         device: Device
     ) throws -> Loaded {
+        // Vision-language checkpoints carry a nested `vision_config` and
+        // prefix their text weights under `language_model.*`.
+        if VisionLanguageArchitectures.isVisionLanguage(config) {
+            // Gemma 3 VL — SigLIP tower + Gemma 3 text backbone. Fully
+            // wired: the SigLIP architecture is exactly `VisionEncoder`.
+            if config.architecture == "Gemma3ForConditionalGeneration" {
+                let vlm = try Gemma3VL.load(
+                    config: config, weights: weights,
+                    options: options, device: device)
+                return Loaded(
+                    engine: vlm.engine,
+                    defaultGenerationParameters: Gemma3Dense.defaultGenerationParameters,
+                    availableCapabilities: Capability.textOnly.union([.visionIn]),
+                    vlModel: vlm)
+            }
+            // Other VL families (Qwen 2.5/3.5-VL, …) — the FFAI vision
+            // foundation (VisionEncoder, ImagePreprocessing, VLModel
+            // splice, conv2d/patch_embed/rope_2d Ops) is in tree, but
+            // these towers need windowed attention / dynamic resolution
+            // / M-RoPE not yet wired to a checkpoint loader. Fail with
+            // an actionable error rather than a generic "unsupported".
+            throw ModelError.visionModelNotIntegrated(
+                config.architecture ?? config.modelType ?? "<unknown>")
+        }
         if let arch = config.architecture, Llama.architectures.contains(arch) {
             return try loadLlama(config: config, weights: weights,
                                  options: options, device: device)
@@ -397,12 +461,19 @@ public enum ModelRegistry {
 /// High-level loaded model with tokenizer attached. The public API users
 /// touch.
 public final class Model: @unchecked Sendable {
-    /// The concrete model engine (LlamaModel, Qwen3Model, …).
+    /// The concrete model engine (LlamaModel, Qwen3Model, …). For a VLM
+    /// this is the text backbone — text-only generation works
+    /// regardless of whether `.visionIn` is enabled.
     public let engine: any LanguageModel
     public let tokenizer: any Tokenizer
     public let config: ModelConfig
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
+
+    /// The composed vision-language model — `nil` unless the checkpoint
+    /// is a VLM. Use `vlModel.generate(...)` for an image+text prompt;
+    /// available only when `availableCapabilities` contains `.visionIn`.
+    public let vlModel: VLModel?
 
     /// Currently-enabled capabilities. Mutated via `enable(_:)` /
     /// `disable(_:)`; guarded by `capabilityLock` for thread safety.
@@ -479,12 +550,14 @@ public final class Model: @unchecked Sendable {
          modelDirectory: URL,
          availableCapabilities: Set<Capability>,
          enabledCapabilities: Set<Capability>,
-         defaultGenerationParameters: GenerationParameters) {
+         defaultGenerationParameters: GenerationParameters,
+         vlModel: VLModel? = nil) {
         self.engine = engine
         self.tokenizer = tokenizer
         self.config = config
         self.modelDirectory = modelDirectory
         self.availableCapabilities = availableCapabilities
+        self.vlModel = vlModel
         // textIn / textOut are universal — always enabled. Other
         // requested capabilities are honored only if the model declares
         // them available.
@@ -594,7 +667,8 @@ public final class Model: @unchecked Sendable {
                     modelDirectory: dir,
                     availableCapabilities: loaded.availableCapabilities,
                     enabledCapabilities: options.capabilities,
-                    defaultGenerationParameters: loaded.defaultGenerationParameters
+                    defaultGenerationParameters: loaded.defaultGenerationParameters,
+                    vlModel: loaded.vlModel
                 )
             }
         }

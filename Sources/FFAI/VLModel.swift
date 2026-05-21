@@ -45,14 +45,20 @@ public final class VLModel: @unchecked Sendable {
     /// The text backbone (Gemma3Model, Qwen3Model, …).
     public let engine: any LanguageModel
     /// Token id the chat template emits as an image placeholder. Each
-    /// occurrence is replaced by one vision-encoder patch token.
+    /// occurrence is replaced by one vision token.
     public let imageTokenId: Int
     /// Per-channel image normalization the checkpoint expects.
     public let normalization: ImageNormalization
+    /// Number of vision tokens one image contributes to the text stream.
+    /// Usually `visionEncoder.config.numPatches`, but a family whose
+    /// projector pools the patch grid (Gemma 3 VL: 4096 patches → 256
+    /// tokens) passes the pooled count explicitly.
+    public let imageTokenCount: Int
 
     public init(visionEncoder: VisionEncoder, engine: any LanguageModel,
                 imageTokenId: Int,
-                normalization: ImageNormalization) throws {
+                normalization: ImageNormalization,
+                imageTokenCount: Int? = nil) throws {
         guard engine.supportsEmbeddingInput else {
             throw VLModelError.engineLacksEmbeddingInput(String(describing: type(of: engine)))
         }
@@ -60,10 +66,8 @@ public final class VLModel: @unchecked Sendable {
         self.engine = engine
         self.imageTokenId = imageTokenId
         self.normalization = normalization
+        self.imageTokenCount = imageTokenCount ?? visionEncoder.config.numPatches
     }
-
-    /// Number of patch tokens one image contributes to the stream.
-    public var imageTokenCount: Int { visionEncoder.config.numPatches }
 
     // ─── Cross-modal splice ──────────────────────────────────────────
 

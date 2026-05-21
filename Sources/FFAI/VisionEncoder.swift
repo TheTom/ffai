@@ -248,7 +248,10 @@ public final class VisionEncoderLayer: Module {
 /// A SigLIP / CLIP-style ViT vision tower. Holds the patch-embed conv
 /// weights, the learned position embedding, the encoder block stack,
 /// the post-LayerNorm, and the projection into the text hidden dim.
-public final class VisionEncoder: Module {
+// Non-final so family files can subclass it — e.g. Gemma 3 VL's
+// composed encoder+projector tower (`Gemma3VLComposedEncoder`) overrides
+// `encode` to append its multi-modal projector.
+public class VisionEncoder: Module {
     public let config: VisionEncoderConfig
 
     /// conv2d patch-embed weight `[hidden, inChannels, patchSize, patchSize]`.
