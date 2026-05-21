@@ -51,15 +51,24 @@ the audio `Capability` set.
 | Family | File | `model_type` | Capability | Notes |
 |---|---|---|---|---|
 | **Whisper** | [`Models/Whisper.swift`](../Sources/FFAI/Models/Whisper.swift) | `whisper` | `speechToText` | STT, tiny → large-v3 (one variant). `AudioEncoder` + a causal text decoder cross-attending to the audio features. |
+| **SenseVoice** | [`Models/SenseVoice.swift`](../Sources/FFAI/Models/SenseVoice.swift) | `sensevoice` | `speechToText` | Non-autoregressive STT — a SAN-M encoder (fused QKV + FSMN depthwise-conv memory block) and a CTC head. Greedy CTC collapse instead of a decoder loop. Kaldi-style FBANK + LFR front-end. |
 | **Kokoro** | [`Models/Kokoro.swift`](../Sources/FFAI/Models/Kokoro.swift) | `kokoro` | `textToSpeech` | TTS. Ships the GPU iSTFTNet vocoder tail (`Ops.vocoderISTFT`); the StyleTTS2 acoustic front-end is a later port. |
 | **Qwen-Omni** | [`Models/QwenOmni.swift`](../Sources/FFAI/Models/QwenOmni.swift) | `qwen2_5_omni`, `qwen3_omni` | `omniAudio` | Audio-in path: a Whisper-style encoder projecting into the text backbone hidden dim. Vision path is the Qwen-VL port. |
 
-All three share the [`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift)
+Whisper, Kokoro and Qwen-Omni share the
+[`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift)
 module (a Whisper-style conv stem + bidirectional transformer) and the
 [`AudioPreprocessing`](../Sources/FFAI/AudioPreprocessing.swift)
 front-end (log-Mel STFT framing). The three FFAI audio kernels —
 `mel_spectrogram`, `audio_conv1d`, `vocoder_istft` — are wrapped by
 `Ops.melSpectrogram` / `Ops.audioConv1d` / `Ops.vocoderISTFT`.
+
+SenseVoice is a standalone SAN-M family: its Kaldi-style FBANK front-end
+(per-frame mean removal, pre-emphasis, power-of-two FFT, HTK Mel, plain
+log) and low-frame-rate stacking differ from the shared log-Mel
+front-end, so it carries its own `SenseVoiceFrontEnd` CPU path. The
+FSMN memory block is a depthwise (per-channel) 1-D convolution — also a
+CPU path, since `Ops.audioConv1d` is a dense (non-grouped) conv.
 
 **GPT-OSS** is OpenAI's GPT-OSS-20B — a 24-layer mixture-of-experts
 transformer (~20B total / ~3.6B active params). Three structural
@@ -417,6 +426,7 @@ efficiency metric.
 | Repo | Family | Notes |
 |---|---|---|
 | `openai/whisper-tiny` | Whisper STT | Integration-test baseline — encoder + cross-attending decoder. |
+| `mlx-community/SenseVoiceSmall` | SenseVoice STT | Integration-test baseline — SAN-M encoder + CTC head, greedy CTC decode. |
 | `hexgrad/Kokoro-82M` | Kokoro TTS | Integration-test baseline — the iSTFTNet vocoder tail. |
 | `Qwen/Qwen2.5-Omni-3B` | Qwen-Omni | Integration-test baseline — the audio-in encoder path. |
 

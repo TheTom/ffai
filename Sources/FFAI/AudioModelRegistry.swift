@@ -15,6 +15,7 @@ import Foundation
 /// the enum; tests pull the concrete type out.
 public enum LoadedAudioModel: @unchecked Sendable {
     case whisper(WhisperModel)
+    case senseVoice(SenseVoiceModel)
     case kokoro(KokoroModel)
     case qwenOmni(QwenOmniModel)
 
@@ -23,6 +24,7 @@ public enum LoadedAudioModel: @unchecked Sendable {
     public var capabilities: Set<Capability> {
         switch self {
         case .whisper: return Capability.speechToText
+        case .senseVoice: return Capability.speechToText
         case .kokoro: return Capability.textToSpeech
         case .qwenOmni: return Capability.omniAudio
         }
@@ -37,6 +39,7 @@ public enum AudioModelRegistry {
     /// registry (audio) before committing to a load path.
     public static func handles(_ config: ModelConfig) -> Bool {
         WhisperModel.handles(config)
+            || SenseVoiceModel.handles(config)
             || KokoroModel.handles(config)
             || QwenOmniModel.handles(config)
     }
@@ -58,6 +61,7 @@ public enum AudioModelRegistry {
         -> Set<Capability>? {
         if QwenOmniModel.handles(config) { return Capability.omniAudio }
         if WhisperModel.handles(config) { return Capability.speechToText }
+        if SenseVoiceModel.handles(config) { return Capability.speechToText }
         if KokoroModel.handles(config) { return Capability.textToSpeech }
         return nil
     }
@@ -75,6 +79,10 @@ public enum AudioModelRegistry {
         if WhisperModel.handles(config) {
             return .whisper(try WhisperModel.load(directory: directory,
                                                   device: device))
+        }
+        if SenseVoiceModel.handles(config) {
+            return .senseVoice(try SenseVoiceModel.load(directory: directory,
+                                                        device: device))
         }
         if KokoroModel.handles(config) {
             return .kokoro(try KokoroModel.load(directory: directory,
