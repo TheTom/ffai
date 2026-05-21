@@ -15,10 +15,11 @@
 //
 // Gemma 4 keeps Gemma 3's backbone shape — four per-block norms,
 // per-head q/k norms, sqrt(hidden) embed scale, GELU MLP, tied
-// embeddings — but **drops the Gemma `(1 + weight)` RMSNorm
-// convention**: Gemma 4 norms are plain RMSNorm (`x_normed · weight`)
-// and the checkpoints store the norm weight as the direct multiplier
-// (see `loadGemma4RMSNorm`). Gemma 4 also adds:
+// embeddings — and adds:
+//
+//   0. **Plain RMSNorm.** Gemma 4 drops the Gemma 1/2/3 `(1 + weight)`
+//      unit-offset convention: norm weight is initialised to ones and
+//      applied as a plain `x/rms(x) · weight` (no `+1` fold at load).
 //
 //   1. **Two attention geometries.** `layer_types` labels each layer
 //      `sliding_attention` or `full_attention`. Sliding layers use
@@ -47,16 +48,12 @@
 //      `softcap · tanh(logits / softcap)` (`final_logit_softcapping`,
 //      30.0 across the family).
 //
-// ─── First-light attention path ─────────────────────────────────────
+// ─── Attention path ─────────────────────────────────────────────────
 //
-// FFAI's `Ops.sdpaDecode` supports head_dim ∈ {64, 128, 256}. Sliding
-// layers (head_dim 256) take that fast GPU kernel. The global layers'
-// 512-wide head has no specialised kernel, so global-layer attention
-// runs through `globalAttentionCPU` — a host-side single-token SDPA
-// (ProportionalRoPE + score + softmax + V-weighted-sum). The decode
-// loop is one token at a time, so this is a bounded, deterministic
-// readback; a 512-wide `sdpaDecode` specialization is the perf
-// follow-up.
+// FFAI's `Ops.sdpaDecode` supports head_dim ∈ {64, 128, 256, 512}.
+// Sliding layers (head_dim 256) take the d256 GPU kernel; global layers
+// (head_dim 512) take the d512 specialization. Both attention paths are
+// pure-GPU single-token decode dispatches — no host readback.
 //
 // ─── KV sharing (Gemma4E) ────────────────────────────────────────────
 //
@@ -103,9 +100,9 @@ public enum Gemma4Error: Error, CustomStringConvertible {
         case .missingConfig(let f):
             return "Gemma4: required config field missing: \(f)"
         case .unsupportedHeadDim(let d):
-            return "Gemma4: sliding head_dim \(d) unsupported (Ops.sdpaDecode needs 64/128/256)"
+            return "Gemma4: head_dim \(d) unsupported (Ops.sdpaDecode needs 64/128/256/512)"
         case .unalignedNorm(let n):
-            return "Gemma4: norm row size \(n) must be 128-aligned and ≤ 4096"
+            return "Gemma4: norm row size \(n) must be 128-aligned"
         }
     }
 }
@@ -345,17 +342,24 @@ enum Gemma4Loader {
         let prefix = resolvePrefix(weights)
         let quant = config.quantization
 
-        // q/k/v head-dim norms feed `rmsNormRows` — its row size must be
-        // 128-aligned and ≤ 4096. Sliding 256 + global 512 both qualify.
-        for d in [p.headDim, p.globalHeadDim] {
-            if d % 128 != 0 || d > 4096 {
+        // Every RMSNorm row goes through the `rmsNorm` / `rmsNormRows`
+        // kernels, whose only row-width invariant is 128-alignment
+        // (simdgroup granularity); rows wider than 4096 route to the
+        // wide-row kernel automatically. Checked dims:
+        //   • q/k/v head-dim norms — `headDim` / `globalHeadDim`.
+        //   • the four per-block norms + final norm — `hidden`.
+        for d in [p.headDim, p.globalHeadDim, p.hidden] {
+            if d % 128 != 0 {
                 throw Gemma4Error.unalignedNorm(d)
             }
         }
-        // Sliding layers go through Ops.sdpaDecode — head_dim must be a
-        // kernel-supported specialization.
-        if !OpsValidation.supportedSdpaHeadDims.contains(p.headDim) {
-            throw Gemma4Error.unsupportedHeadDim(p.headDim)
+        // Both attention geometries go through Ops.sdpaDecode — the
+        // sliding head_dim and the global head_dim must each be a
+        // kernel-supported specialization (256 → d256, 512 → d512).
+        for d in [p.headDim, p.globalHeadDim] {
+            if !OpsValidation.supportedSdpaHeadDims.contains(d) {
+                throw Gemma4Error.unsupportedHeadDim(d)
+            }
         }
 
         let embedTokens = try loadEmbedding(
@@ -514,37 +518,73 @@ enum Gemma4Loader {
             kvCacheKind: options.kvCache, device: device)
     }
 
-    /// Build a Gemma 4 MoE feed-forward block from the stacked expert
-    /// tensors. Gemma 4 stores experts as `[numExperts, outDim, inDim]`
-    /// stacks under `experts.{gate,up,down}_proj`.
+    /// Build a Gemma 4 MoE feed-forward block (26B-A4B). A MoE layer
+    /// runs a shared dense MLP and a routed expert mixture in parallel,
+    /// each with its own pre/post norm, then sums them. Experts ship as
+    /// `[numExperts, outDim, inDim]` stacks under `experts.{gate,up,down}_proj`.
     private static func buildMoE(
         prefix lp: String, weights: SafeTensorsBundle, p: Gemma4Params,
         quant: ModelConfig.QuantizationConfig?
     ) throws -> Gemma4MoEFFN {
-        let gate = try loadLinear(base: "\(lp).router.proj",
-                                  in: weights, quantization: quant)
+        // Shared dense GELU MLP — the `h1` branch, runs every token.
+        let sharedGate = try loadLinear(base: "\(lp).mlp.gate_proj",
+                                        in: weights, quantization: quant)
+        let sharedUp = try loadLinear(base: "\(lp).mlp.up_proj",
+                                      in: weights, quantization: quant)
+        let sharedDown = try loadLinear(base: "\(lp).mlp.down_proj",
+                                        in: weights, quantization: quant)
+        let sharedMLP = Gemma4DenseMLP(
+            gateProj: sharedGate, upProj: sharedUp, downProj: sharedDown,
+            intermediate: p.intermediate)
+
+        // Router: logit projection + the learned input-norm scale +
+        // the per-expert combine-weight scale.
+        let routerProj = try loadLinear(base: "\(lp).router.proj",
+                                        in: weights, quantization: quant)
+        let routerScale = try weights.tensor(named: "\(lp).router.scale")
+        let perExpertScale = try weights.tensor(named: "\(lp).router.per_expert_scale")
+
+        // Stacked experts → per-expert GELU-SwiGLU projections. Raw
+        // Gemma 4 checkpoints key the expert stacks under
+        // `experts.switch_glu.{gate,up,down}_proj` (mlx-lm strips the
+        // `switch_glu` segment in its sanitize step; FFAI loads the raw
+        // key directly).
         let gateProj = try sliceStacked(
-            base: "\(lp).experts.gate_proj", in: weights,
+            base: "\(lp).experts.switch_glu.gate_proj", in: weights,
             numExperts: p.numExperts, outDim: p.moeIntermediate, inDim: p.hidden,
             quant: quant)
         let upProj = try sliceStacked(
-            base: "\(lp).experts.up_proj", in: weights,
+            base: "\(lp).experts.switch_glu.up_proj", in: weights,
             numExperts: p.numExperts, outDim: p.moeIntermediate, inDim: p.hidden,
             quant: quant)
         let downProj = try sliceStacked(
-            base: "\(lp).experts.down_proj", in: weights,
+            base: "\(lp).experts.switch_glu.down_proj", in: weights,
             numExperts: p.numExperts, outDim: p.hidden, inDim: p.moeIntermediate,
             quant: quant)
-        // Gemma 4 gating: softmax over the top-K logits (top-K then
-        // softmax), as in `gemma4_text.py`. The plain MoELayer with
-        // `.topKThenSoftmax` matches this.
+
+        // The MoE block's three extra norms (plain Gemma 4 RMSNorm).
+        let preNorm2 = try loadGemma4RMSNorm(
+            base: "\(lp).pre_feedforward_layernorm_2.weight", in: weights, eps: p.eps)
+        let postNorm1 = try loadGemma4RMSNorm(
+            base: "\(lp).post_feedforward_layernorm_1.weight", in: weights, eps: p.eps)
+        let postNorm2 = try loadGemma4RMSNorm(
+            base: "\(lp).post_feedforward_layernorm_2.weight", in: weights, eps: p.eps)
+
+        // Gemma 4 gating: top-K of the router logits, then softmax over
+        // just those K (gemma4_text.py).
         let router = MoERouter(
             nExperts: p.numExperts, topK: p.topKExperts,
             gatingMode: .topKThenSoftmax)
-        let moe = MoELayer(
-            gate: gate, gateProj: gateProj, upProj: upProj, downProj: downProj,
-            router: router, hidden: p.hidden)
-        return Gemma4MoEFFN(moe: moe)
+
+        return Gemma4MoEFFN(
+            sharedMLP: sharedMLP,
+            gateProj: gateProj, upProj: upProj, downProj: downProj,
+            routerProj: routerProj, routerScale: routerScale,
+            rootSize: Float(pow(Double(p.hidden), -0.5)),
+            routerEps: Float(p.eps), perExpertScale: perExpertScale,
+            router: router,
+            preNorm2: preNorm2, postNorm1: postNorm1, postNorm2: postNorm2,
+            hidden: p.hidden)
     }
 
     /// Slice a stacked `[numExperts, outDim, inDim]` expert tensor into
@@ -589,7 +629,7 @@ enum Gemma4Loader {
 /// in rotate-half pairs, so the count must be even.
 private func evenFloor(_ n: Int) -> Int { n - (n % 2) }
 
-// MARK: - Gemma 4 RMSNorm load
+// MARK: - Gemma 4 RMSNorm load (plain — NO (1 + weight) fold)
 
 /// Load a Gemma 4 RMSNorm weight verbatim.
 ///
@@ -769,35 +809,143 @@ public final class Gemma4DenseMLP: Module {
     }
 }
 
-/// MoE feed-forward (Gemma4MoE). Thin wrapper over `MoELayer`.
-/// `MoELayer.decode` commits the command buffer it is given — the host
-/// layer / model must refresh the work buffer afterward.
+/// Gemma 4 MoE feed-forward block (26B-A4B). A MoE layer runs a shared
+/// dense GELU MLP and a routed expert mixture *in parallel* — each
+/// branch with its own pre/post RMSNorm — and sums them:
+///
+///   h1 = post_ffn_norm_1(sharedMLP(pre_ffn_norm(h)))
+///   h2 = post_ffn_norm_2( Σ wₑ · expertₑ(pre_ffn_norm_2(h)) )
+///   ffnOut = h1 + h2
+///
+/// The router normalises its input with a learned `scale · hidden^(-0.5)`
+/// weight, picks the top-K experts, softmaxes their logits, and scales
+/// the combine weights by a learned per-expert factor. Mirrors
+/// `gemma4_text.py`.
+///
+/// `forward` commits internally (the router needs its logits on the
+/// host for top-K), so the caller must refresh its command buffer.
 public final class Gemma4MoEFFN: Module {
-    let moe: MoELayer
+    /// Shared dense MLP — the `h1` branch.
+    let sharedMLP: Gemma4DenseMLP
+    /// Per-expert GELU-SwiGLU projections (index-aligned with expert id).
+    let gateProj, upProj, downProj: [AnyLinear]
+    /// Router logit projection: hidden → numExperts.
+    let routerProj: AnyLinear
+    /// Router input-norm weight (the learned `router.scale`, [hidden]).
+    let routerScale: Tensor
+    /// `hidden^(-0.5)` — folded into the router logits. A positive
+    /// scalar, so it leaves the top-K selection unchanged but sets the
+    /// softmax temperature, matching the reference's `scale · hidden^-0.5`
+    /// input norm.
+    let rootSize: Float
+    let routerEps: Float
+    /// Per-expert combine-weight scale (`router.per_expert_scale`,
+    /// [numExperts]).
+    let perExpertScale: Tensor
+    /// Top-K + softmax routing math.
+    let router: MoERouter
+    /// The MoE block's three extra norms.
+    let preNorm2, postNorm1, postNorm2: RMSNorm
+    let hidden: Int
 
-    init(moe: MoELayer) { self.moe = moe }
+    init(sharedMLP: Gemma4DenseMLP,
+         gateProj: [AnyLinear], upProj: [AnyLinear], downProj: [AnyLinear],
+         routerProj: AnyLinear, routerScale: Tensor, rootSize: Float,
+         routerEps: Float, perExpertScale: Tensor, router: MoERouter,
+         preNorm2: RMSNorm, postNorm1: RMSNorm, postNorm2: RMSNorm,
+         hidden: Int) {
+        self.sharedMLP = sharedMLP
+        self.gateProj = gateProj; self.upProj = upProj; self.downProj = downProj
+        self.routerProj = routerProj; self.routerScale = routerScale
+        self.rootSize = rootSize; self.routerEps = routerEps
+        self.perExpertScale = perExpertScale; self.router = router
+        self.preNorm2 = preNorm2; self.postNorm1 = postNorm1
+        self.postNorm2 = postNorm2; self.hidden = hidden
+    }
 
     public func parameters() -> [(String, Tensor)] {
-        // MoELayer emits flat `gate.*` / `experts.<e>.*` names; Gemma 4
-        // checkpoints key the router as `router.proj` and the experts
-        // as stacked `experts.{gate,up,down}_proj`. Re-key for round-trip.
         var out: [(String, Tensor)] = []
-        for (k, v) in moe.parameters() {
-            if k.hasPrefix("gate.") {
-                out.append(("router.proj." + k.dropFirst("gate.".count), v))
-            } else {
-                out.append((k, v))
-            }
+        out.append(contentsOf: sharedMLP.parameters())
+        for (e, proj) in gateProj.enumerated() {
+            for (k, v) in proj.parameters() { out.append(("experts.\(e).gate_proj.\(k)", v)) }
+        }
+        for (e, proj) in upProj.enumerated() {
+            for (k, v) in proj.parameters() { out.append(("experts.\(e).up_proj.\(k)", v)) }
+        }
+        for (e, proj) in downProj.enumerated() {
+            for (k, v) in proj.parameters() { out.append(("experts.\(e).down_proj.\(k)", v)) }
+        }
+        for (k, v) in routerProj.parameters() { out.append(("router.proj.\(k)", v)) }
+        out.append(("router.scale", routerScale))
+        out.append(("router.per_expert_scale", perExpertScale))
+        for (k, v) in preNorm2.parameters() {
+            out.append(("pre_feedforward_layernorm_2.\(k)", v))
+        }
+        for (k, v) in postNorm1.parameters() {
+            out.append(("post_feedforward_layernorm_1.\(k)", v))
+        }
+        for (k, v) in postNorm2.parameters() {
+            out.append(("post_feedforward_layernorm_2.\(k)", v))
         }
         return out
     }
 
-    /// Run the MoE FFN. Commits `cmd` (via `MoELayer.decode`); returns a
-    /// fully-resident tensor.
-    func forward(_ xNorm: Tensor, position: Int,
+    /// Run the Gemma 4 MoE FFN.
+    /// - `preFFNormed`: `preFeedforwardLayerNorm(h)` — the shared-MLP
+    ///   branch input.
+    /// - `h`: the post-attention residual — the router and expert-branch
+    ///   input (each applies its own norm).
+    /// Returns `ffnOut = h1 + h2`; the caller adds `postFeedforwardLayerNorm`
+    /// + the residual. Commits internally, so the caller must refresh its
+    /// command buffer.
+    func forward(preFFNormed: Tensor, h: Tensor,
                  cmd: MTLCommandBuffer, device: Device) -> Tensor {
-        moe.decode(xNorm, position: position,
-                   cache: StatelessLayerCache(), cmd: cmd, device: device)
+        // ── Router: rmsNorm(h, router.scale) → proj → logits ─────────
+        let routerNormed = Ops.rmsNorm(h, weight: routerScale,
+                                       eps: routerEps, on: cmd)
+        let logitsTensor = routerProj(routerNormed, on: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Fold hidden^(-0.5) into the logits — the reference normalises
+        // the router input by `scale · hidden^-0.5`; `proj` is linear and
+        // the factor is a positive scalar, so applying it to the logits
+        // is equivalent and sets the softmax temperature.
+        let logits = logitsTensor.toFloatArray().map { $0 * rootSize }
+        let routing = router.route(logits: logits)
+        let perExpert = perExpertScale.toFloatArray()
+        // Combine weight = softmax weight × per-expert scale.
+        let weights = routing.indices.enumerated().map { slot, expertId in
+            routing.weights[slot] * perExpert[expertId]
+        }
+
+        // ── Both branches on a private command buffer ────────────────
+        let work = device.makeCommandBuffer()
+
+        // h1: shared dense MLP.
+        var h1 = sharedMLP.forward(preFFNormed, on: work)
+        h1 = postNorm1(h1, on: work)
+
+        // h2: weighted sum of the selected experts (GELU-SwiGLU).
+        let expertInput = preNorm2(h, on: work)
+        var h2acc: Tensor?
+        for (slot, expertId) in routing.indices.enumerated() {
+            let g = gateProj[expertId](expertInput, on: work)
+            let u = upProj[expertId](expertInput, on: work)
+            let inner = Ops.mul(Ops.gelu(g, on: work), u, on: work)
+            let expertOut = downProj[expertId](inner, on: work)
+            let wTensor = Tensor.filled(weights[slot], shape: [hidden],
+                                        dtype: h.dtype, device: device)
+            let scaled = Ops.mul(expertOut, wTensor, on: work)
+            h2acc = h2acc.map { Ops.add($0, scaled, on: work) } ?? scaled
+        }
+        // topK ≥ 1 ⇒ h2acc is non-nil.
+        let h2 = postNorm2(h2acc!, on: work)
+
+        let ffnOut = Ops.add(h1, h2, on: work)
+        work.commit()
+        work.waitUntilCompleted()
+        return ffnOut
     }
 }
 
@@ -885,13 +1033,13 @@ public final class Gemma4Layer: Module {
         return out
     }
 
-    /// A sliding-attention + dense-FFN layer needs no mid-layer host
-    /// sync — it can run entirely on a shared command buffer batched
-    /// with its neighbours. Global layers (CPU SDPA) and MoE layers
-    /// (MoELayer host readback) must commit mid-layer, so they break
+    /// A dense-FFN layer needs no mid-layer host sync — it runs entirely
+    /// on a shared command buffer batched with its neighbours. Both the
+    /// sliding (head_dim 256) and global (head_dim 512) attention paths
+    /// are pure-GPU `Ops.sdpaDecode` dispatches. Only MoE layers
+    /// (`MoELayer` host readback) must commit mid-layer, so they break
     /// the batch.
     var batchable: Bool {
-        if isGlobal { return false }
         if case .moe = ffn { return false }
         return true
     }
@@ -935,9 +1083,13 @@ public final class Gemma4Layer: Module {
                                 donorCache: (any KVCacheProtocol)? = nil)
         -> Tensor {
         let xNorm = inputNorm(h, on: cmd)
-        let attnOut = slidingAttentionBatched(xNorm, position: position,
-                                              cache: cache, cmd: cmd,
-                                              donorCache: donorCache)
+        let attnOut = isGlobal
+            ? globalAttentionBatched(xNorm, position: position,
+                                     cache: cache, cmd: cmd,
+                                     donorCache: donorCache)
+            : slidingAttentionBatched(xNorm, position: position,
+                                      cache: cache, cmd: cmd,
+                                      donorCache: donorCache)
         let oOut = oProj(attnOut.reshaped(to: [nHeads * headDim]), on: cmd)
         let normedAttn = postAttnNorm(oOut, on: cmd)
         var hOut = Ops.add(h, normedAttn, on: cmd)
@@ -992,12 +1144,15 @@ public final class Gemma4Layer: Module {
             postCmd.waitUntilCompleted()
             return hOut
         case .moe(let moe):
-            // MoELayer commits the buffer it is given. Sync `postCmd`,
-            // run the FFN, finish the residual on a fresh buffer.
+            // Gemma 4 MoE block: parallel shared MLP + routed experts.
+            // It needs both the pre-FFN-normed input (shared MLP branch)
+            // and the raw post-attention residual (router + expert
+            // branch), and commits internally (host readback for top-K
+            // routing). Sync `postCmd` so both inputs are resident.
             postCmd.commit()
             postCmd.waitUntilCompleted()
             let moeCmd = device.makeCommandBuffer()
-            let ffnOut = moe.forward(ffnNorm, position: position,
+            let ffnOut = moe.forward(preFFNormed: ffnNorm, h: hOut,
                                      cmd: moeCmd, device: device)
             let addCmd = device.makeCommandBuffer()
             let normedFFN = postFFNorm(ffnOut, on: addCmd)
@@ -1126,26 +1281,18 @@ public final class Gemma4Layer: Module {
         return out
     }
 
-    /// Host-side single-token SDPA for the 512-wide global-attention
-    /// layers (`Ops.sdpaDecode` has no 512 specialization). Projects +
-    /// norms q/k/v, applies ProportionalRoPE, appends K/V to the cache
-    /// on the GPU, commits `cmd`, reads the full K/V slab back, and
-    /// computes `softmax(q·Kᵀ) · V` per head on the CPU. Returns the
-    /// resident `[nHeads, headDim]` attention output.
-    ///
-    /// The decode loop is one token at a time, so the readback is
-    /// `length · headDim` per head — bounded and deterministic. A 512
-    /// `sdpaDecode` kernel would replace this; see the file header.
+    /// Global-layer (512-wide) attention queued onto a shared `cmd` —
+    /// ProportionalRoPE + GPU `sdpaDecode` (head_dim 512). Does NOT
+    /// commit; the caller batches and commits. Returns `[nHeads, headDim]`.
     ///
     /// `donorCache` is non-nil for a KV-shared global layer: it projects
-    /// only Q, applies ProportionalRoPE to Q, and runs the host-side
-    /// SDPA against the donor's already-updated slab — no K/V projection
-    /// and no cache append.
-    private func globalAttention(
-        _ xNorm: Tensor, position: Int,
-        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device: Device,
-        donorCache: (any KVCacheProtocol)? = nil
-    ) -> Tensor {
+    /// + RoPEs only Q and runs SDPA against the donor's already-updated
+    /// slab — no K/V projection, no cache append.
+    private func globalAttentionBatched(_ xNorm: Tensor, position: Int,
+                                        cache: any KVCacheProtocol,
+                                        cmd: MTLCommandBuffer,
+                                        donorCache: (any KVCacheProtocol)? = nil)
+        -> Tensor {
         let q: Tensor
         let attnCache: any KVCacheProtocol
         if let donorCache {
@@ -1157,113 +1304,44 @@ public final class Gemma4Layer: Module {
             attnCache = donorCache
         } else {
             let (qOwn, k, v) = projectAndNorm(xNorm, on: cmd)
-            // 1. ProportionalRoPE on q and k. The kernel rotates pairs
-            //    `(i, i + headDim/2)` for `i ∈ [0, rotatedDim/2)` with
-            //    frequency `theta^(-2i/headDim)` — exactly Gemma 4's
-            //    ProportionalRoPE. `ropeProportional` drives the shared
-            //    RoPE kernel with a grid height of `rotatedDim/2`.
+            // ProportionalRoPE on q and k (in-place): rotates pairs
+            // `(i, i + headDim/2)` for `i ∈ [0, rotatedDim/2)` with
+            // frequency `theta^(-2i/headDim)`. The unrotated tail passes
+            // through.
             Gemma4Ops.ropeProportional(
                 qOwn, position: position, headDim: headDim, rotatedDim: rotatedDim,
                 thetaBase: ropeTheta, on: cmd)
             Gemma4Ops.ropeProportional(
                 k, position: position, headDim: headDim, rotatedDim: rotatedDim,
                 thetaBase: ropeTheta, on: cmd)
-            // 2. Append the rotated K and the value-normed V to the cache.
             cache.appendOnGPU(kFlat: k, vFlat: v, on: cmd)
             q = qOwn
             attnCache = cache
         }
         let (cacheK, cacheV) = attnCache.prepareForAttention(on: cmd)
+        // Gemma 4 uses SDPA scale = 1.0 (pre-scaling lives in q_norm).
+        // head_dim 512 routes to the d512 `sdpaDecode` specialization.
+        return Ops.sdpaDecode(
+            q: q, k: cacheK, v: cacheV,
+            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+            nKV: attnCache.length, kvStride: attnCache.maxSeq,
+            scale: 1.0, on: cmd)
+    }
 
-        // 3. Sync so the host can read q, K and V.
+    /// Global attention that commits `cmd` and returns resident output
+    /// — used by a global + MoE layer whose MoE FFN needs the attention
+    /// result resident before its own host sync.
+    private func globalAttention(
+        _ xNorm: Tensor, position: Int,
+        cache: any KVCacheProtocol, cmd: MTLCommandBuffer, device _: Device,
+        donorCache: (any KVCacheProtocol)? = nil
+    ) -> Tensor {
+        let out = globalAttentionBatched(xNorm, position: position,
+                                         cache: cache, cmd: cmd,
+                                         donorCache: donorCache)
         cmd.commit()
         cmd.waitUntilCompleted()
-
-        let cache = attnCache
-        let nKV = cache.length
-        let qHost = q.toFloatArray()                       // [nHeads, headDim]
-        let kHost = sliceCacheRows(cacheK, nKVHeads: nKVHeads,
-                                   maxSeq: cache.maxSeq, headDim: headDim, nKV: nKV)
-        let vHost = sliceCacheRows(cacheV, nKVHeads: nKVHeads,
-                                   maxSeq: cache.maxSeq, headDim: headDim, nKV: nKV)
-
-        // 4. Per-head SDPA on the host. GQA: q-head h reads KV head
-        //    `h / (nHeads / nKVHeads)`. Gemma 4 SDPA scale = 1.0.
-        let headsPerKV = nHeads / nKVHeads
-        var outHost = [Float](repeating: 0, count: nHeads * headDim)
-        for qh in 0..<nHeads {
-            let kvh = qh / headsPerKV
-            let qBase = qh * headDim
-            // scores[j] = Σ_d q[d] · K[kvh, j, d]
-            var scores = [Float](repeating: 0, count: nKV)
-            var maxScore = -Float.infinity
-            for j in 0..<nKV {
-                var s: Float = 0
-                let kBase = (kvh * nKV + j) * headDim
-                for d in 0..<headDim { s += qHost[qBase + d] * kHost[kBase + d] }
-                scores[j] = s
-                if s > maxScore { maxScore = s }
-            }
-            // softmax
-            var sum: Float = 0
-            for j in 0..<nKV {
-                let e = Foundation.exp(scores[j] - maxScore)
-                scores[j] = e
-                sum += e
-            }
-            let invSum = sum > 0 ? 1.0 / sum : 0
-            // out[d] = Σ_j prob[j] · V[kvh, j, d]
-            let outBase = qh * headDim
-            for j in 0..<nKV {
-                let p = scores[j] * invSum
-                let vBase = (kvh * nKV + j) * headDim
-                for d in 0..<headDim { outHost[outBase + d] += p * vHost[vBase + d] }
-            }
-        }
-
-        // 5. Upload the [nHeads, headDim] result in the model dtype.
-        let out = Tensor.empty(shape: [nHeads, headDim], dtype: q.dtype, device: device)
-        copyFloatsInto(out, floats: outHost)
         return out
-    }
-}
-
-/// Read the live `[nKVHeads, nKV, headDim]` rows out of a cache tensor
-/// laid out as `[nKVHeads, maxSeq, headDim]`. The cache stride is
-/// `maxSeq`; the live data occupies the first `nKV` positions of each
-/// head.
-private func sliceCacheRows(_ t: Tensor, nKVHeads: Int, maxSeq: Int,
-                            headDim: Int, nKV: Int) -> [Float] {
-    let full = t.toFloatArray()  // [nKVHeads * maxSeq * headDim]
-    var out = [Float](repeating: 0, count: nKVHeads * nKV * headDim)
-    for h in 0..<nKVHeads {
-        let srcHead = h * maxSeq * headDim
-        let dstHead = h * nKV * headDim
-        for j in 0..<nKV {
-            let src = srcHead + j * headDim
-            let dst = dstHead + j * headDim
-            for d in 0..<headDim { out[dst + d] = full[src + d] }
-        }
-    }
-    return out
-}
-
-/// Write a `[Float]` host array into a tensor in its native dtype.
-private func copyFloatsInto(_ t: Tensor, floats: [Float]) {
-    precondition(floats.count == t.elementCount, "copyFloatsInto: count mismatch")
-    let ptr = t.buffer.contents().advanced(by: t.offset)
-    switch t.dtype {
-    case .f32:
-        let p = ptr.bindMemory(to: Float.self, capacity: floats.count)
-        for i in 0..<floats.count { p[i] = floats[i] }
-    case .f16:
-        let p = ptr.bindMemory(to: UInt16.self, capacity: floats.count)
-        for i in 0..<floats.count { p[i] = floatToHalfBitsForTest(floats[i]) }
-    case .bf16:
-        let p = ptr.bindMemory(to: UInt16.self, capacity: floats.count)
-        for i in 0..<floats.count { p[i] = floatToBf16BitsForTest(floats[i]) }
-    default:
-        fatalError("Gemma4 copyFloatsInto: unsupported dtype \(t.dtype)")
     }
 }
 

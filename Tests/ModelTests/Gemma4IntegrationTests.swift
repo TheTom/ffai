@@ -36,10 +36,6 @@ struct Gemma4IntegrationTests {
         // `minTokens` budget. A story opener keeps the model generating
         // sustained prose across every architectural path (sliding +
         // global attention, PLE, KV sharing, soft-capping).
-        //
-        // A modest token budget keeps the run bounded: the 512-wide
-        // global-attention layers run a host-side SDPA whose cost grows
-        // with the KV length, so a long generation is expensive.
         let prompt = "Once upon a time, in a quiet village"
         let maxTokens = 24
 
@@ -85,21 +81,17 @@ struct Gemma4IntegrationTests {
         #expect(globalCount == 7)
         #expect(slidingCount == 28)
 
-        // Greedy decode is verified coherent: the incoherent-output bug
-        // was a missing leading `<bos>` token. Gemma 4 is BOS-critical,
-        // but unlike Gemma 3 its `tokenizer.json` post-processor's
-        // `single` template is bare (no `<bos>` special token), so
-        // `Tokenizer.encode` returned no BOS and the residual stream was
-        // subtly wrong from token 0. `Gemma4Model.requiresLeadingBOS`
-        // now drives `Generate.encodePrompt` to prepend it. See
-        // `Sources/FFAI/Generate.swift` and `Models/Gemma4.swift`.
-        //
-        // NOTE — slow: the 512-wide global-attention layers run a
-        // host-side SDPA (~60 s/token in a debug build), so this single
-        // 24-token generation takes ~30 min. A 512-wide `Ops.sdpaDecode`
-        // specialization is the follow-up that brings it back to a
-        // routine-cost integration test.
-
+        // Greedy decode must produce coherent text. Two first-light bugs
+        // were fixed: (1) a missing leading `<bos>` — Gemma 4 is
+        // BOS-critical, but unlike Gemma 3 its `tokenizer.json`
+        // post-processor's `single` template is bare (no `<bos>`), so
+        // `Tokenizer.encode` returned none and the residual stream was
+        // wrong from token 0; `Gemma4Model.requiresLeadingBOS` now
+        // drives `Generate.encodePrompt` to prepend it. (2) a Gemma
+        // 3-style `(1 + weight)` RMSNorm fold applied at load — Gemma 4
+        // dropped that convention, so the fold doubled every norm scale.
+        // Global-layer attention runs the d512 `Ops.sdpaDecode` GPU
+        // kernel (no host readback).
         let result = try await m.generate(
             prompt: prompt,
             parameters: GenerationParameters(maxTokens: maxTokens, temperature: 0)
@@ -117,30 +109,31 @@ struct Gemma4IntegrationTests {
         let modelId = "mlx-community/gemma-4-31b-it-4bit"
         let prompt = "Once upon a time, in a quiet village"
 
+        // Guard-skip if the 31B checkpoint isn't cached locally — it is
+        // large (4-bit ~17 GB) and not in the default test set. The
+        // 5376-wide hidden state exercises the wide-row RMSNorm kernel
+        // during the prewarm forward, so a successful load already
+        // proves that path.
         let m: Model
         do {
             m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
         } catch {
-            print("Gemma 4 31B integration test skipped (no small/raw checkpoint): \(error)")
+            print("Gemma 4 31B integration test skipped (checkpoint not available): \(error)")
             return
         }
         let gemma4 = m.engine as? Gemma4Model
         #expect(gemma4 != nil)
         #expect(gemma4?.ple == nil, "31B is a dense (non-PLE) variant")
 
-        // Generation stays gated behind `GEMMA4_RUN_GENERATION` for the
-        // dense 31B variant — *not* a coherence issue (the BOS fix that
-        // un-gated the E2B test applies here too), but a separate
-        // dense-path limitation: the 31B `finalNorm` is an `RMSNorm`
-        // over hidden=5376, and `Ops.rmsNorm`'s single-row kernel caps
-        // at n=4096 (1024-thread × 4 elements). It fatal-errors before
-        // emitting a token. The fix is a chunked / row-wise final-norm
-        // path for >4096-wide hidden states; until then this generation
-        // check is opt-in so it cannot crash the CI suite process.
+        // Generation gated behind `GEMMA4_RUN_GENERATION`: the 31B
+        // checkpoint is large and greedy-decoding 48 tokens is slow for
+        // a routine run. The 5376-wide hidden state routes through the
+        // wide-row RMSNorm kernel (the old 4096-row cap is gone). The
+        // E2B test above covers the same code paths unconditionally;
+        // this is the dense-variant spot check.
         guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
             print("Gemma 4 31B generation check skipped " +
-                  "(set GEMMA4_RUN_GENERATION=1 to run — dense-path " +
-                  "rmsNorm n=5376 cap, see comment).")
+                  "(set GEMMA4_RUN_GENERATION=1 to run — large checkpoint).")
             return
         }
         let result = try await m.generate(
@@ -149,5 +142,45 @@ struct Gemma4IntegrationTests {
         )
         expectCoherentOutput(result.generatedTokens, minTokens: 48,
                              label: "Gemma 4 31B-it 4bit")
+    }
+
+    @Test("Gemma4MoE (26B-A4B): load + greedy generate produces coherent output")
+    func loadAndGenerateMoE() async throws {
+        // 26B-A4B is the mixture-of-experts variant: every layer runs a
+        // shared dense MLP and an 8-of-128 routed expert mixture in
+        // parallel, each branch with its own pre/post norm, plus the
+        // Gemma 4 router (input RMSNorm + per-expert scale). The 8-bit
+        // checkpoint is uniformly quantised, so it loads with the global
+        // quantization config; the 4-bit checkpoint mixes 4-/8-bit per
+        // layer and needs per-layer quantization support (not yet wired).
+        let modelId = "mlx-community/gemma-4-26b-a4b-it-8bit"
+        let prompt = "The capital of France is"
+
+        let m: Model
+        do {
+            m = try await ModelLoadLock.shared.loadSerially { try await Model.load(modelId) }
+        } catch {
+            print("Gemma 4 26B-A4B integration test skipped (checkpoint not available): \(error)")
+            return
+        }
+        let gemma4 = m.engine as? Gemma4Model
+        #expect(gemma4 != nil, "expected Gemma4Model engine")
+        // 26B-A4B has hidden_size_per_layer_input = 0 → MoE, not PLE.
+        #expect(gemma4?.ple == nil, "26B-A4B is the MoE (non-PLE) variant")
+
+        // Generation gated behind `GEMMA4_RUN_GENERATION`: the 26B
+        // checkpoint is large (8-bit ~28 GB) and slow to greedy-decode.
+        guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
+            print("Gemma 4 26B-A4B generation coherence check skipped " +
+                  "(set GEMMA4_RUN_GENERATION=1 to run).")
+            return
+        }
+        let result = try await m.generate(
+            prompt: prompt,
+            parameters: GenerationParameters(maxTokens: 24, temperature: 0)
+        )
+        #expect(result.tokensPerSecond > 0)
+        expectCoherentOutput(result.generatedTokens, minTokens: 24,
+                             label: "Gemma 4 26B-A4B-it 8bit")
     }
 }

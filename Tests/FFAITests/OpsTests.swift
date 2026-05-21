@@ -333,6 +333,37 @@ struct OpsTests {
         }
     }
 
+    @Test("rmsNorm f32 — wide row (n=5376) routes to mt_rms_norm_wide")
+    func rmsNormWideF32() {
+        autoreleasepool {
+            // n = 5376 (Gemma 4 31B hidden) is past the 4096 cap of the
+            // 4-elements-per-thread kernel, so Ops.rmsNorm routes to the
+            // strided mt_rms_norm_wide kernel. eps eps=1e-6 like Gemma 4.
+            let n = 5376
+            let eps: Float = 1e-6
+            let xs: [Float] = (0..<n).map { Float(($0 % 37) - 18) * 0.21 }
+            let ws: [Float] = (0..<n).map { 1.0 + Float($0 % 11) * 0.03 }
+
+            let x = Tensor.empty(shape: [n], dtype: .f32)
+            x.copyIn(from: xs)
+            let weight = Tensor.empty(shape: [n], dtype: .f32)
+            weight.copyIn(from: ws)
+
+            var out: Tensor!
+            runAndWait { cb in out = Ops.rmsNorm(x, weight: weight, eps: eps, on: cb) }
+            let result = out.toArray(as: Float.self)
+
+            // CPU reference: rms = sqrt(mean(x^2) + eps); y = x/rms*weight.
+            let ssq = xs.reduce(Float(0)) { $0 + $1 * $1 }
+            let expectedRms = (ssq / Float(n) + eps).squareRoot()
+            for i in 0..<n {
+                let expected = xs[i] / expectedRms * ws[i]
+                #expect(abs(result[i] - expected) < 1e-3,
+                        "i=\(i) got \(result[i]) expected \(expected)")
+            }
+        }
+    }
+
     @Test("rope f32 at position 0 is identity (cos=1, sin=0)")
     func ropePos0Identity() {
         autoreleasepool {
@@ -846,6 +877,57 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaDecode f32 — head_dim 512 (Gemma 4 global layer)")
+    func sdpaDecodeD512() {
+        autoreleasepool {
+            // Gemma 4 global-attention layout: head_dim 512, 8 q-heads,
+            // 1 KV head (GQA fan-out 8). Routes to the d512 kernel,
+            // which dispatches at 512 threads/threadgroup (the 16-wide
+            // per-lane footprint caps the pipeline below 1024).
+            let D = 512
+            let kvStride = 4
+            let nKV = 1
+            let nQHeads = 8
+            let nKVHeads = 1
+
+            let q = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+
+            // Every q-head = e_0; K[0] = e_0 → dot(Q, K[0]) = 1.
+            var qData = [Float](repeating: 0, count: nQHeads * D)
+            for h in 0..<nQHeads { qData[h * D + 0] = 1 }
+            q.copyIn(from: qData)
+
+            var kData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            kData[0] = 1                                 // K[head=0, pos=0, d=0]
+            k.copyIn(from: kData)
+
+            // V[0] = ramp; positions [1..3] are zero so an over-read
+            // past `n_kv` would show up in the output.
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for d in 0..<D { vData[d] = Float(d + 1) }   // [1, 2, …, 512]
+            v.copyIn(from: vData)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.sdpaDecode(q: q, k: k, v: v,
+                                     nQHeads: nQHeads, nKVHeads: nKVHeads,
+                                     headDim: D, nKV: nKV, kvStride: kvStride,
+                                     scale: 1.0, on: cb)
+            }
+            // n_kv = 1 → softmax([single_score]) = 1 → output == V[0]
+            // for every q-head.
+            let r = out.toArray(as: Float.self)
+            for h in 0..<nQHeads {
+                for d in 0..<D {
+                    #expect(abs(r[h * D + d] - Float(d + 1)) < 1e-3,
+                            "head \(h) out[\(d)] = \(r[h * D + d]), expected \(d + 1)")
+                }
+            }
+        }
+    }
+
     @Test("ropeYaRN — factor=1 collapses to plain RoPE")
     func ropeYaRNFactorOneIsPlainRope() {
         autoreleasepool {
@@ -935,6 +1017,64 @@ struct OpsTests {
                     #expect(abs(got[r * outDim + o] - acc) < 1e-4,
                             "r=\(r) o=\(o): expected \(acc), got \(got[r * outDim + o])")
                 }
+            }
+        }
+    }
+
+    @Test("ropeProportional f32 — matches a CPU ProportionalRoPE oracle")
+    func ropeProportionalMatchesOracle() {
+        autoreleasepool {
+            // Gemma 4 global-layer ProportionalRoPE: dims=512,
+            // rotatedDim=128. Rotates pairs (i, i + 256) for i ∈ [0, 64)
+            // at frequency theta^(-2i/512); dims [64, 256) and their
+            // partners pass through untouched. Drives the shared
+            // ffai_rope_llama kernel — this pins the pairing offset
+            // (headDim/2, NOT rotatedDim/2) and the frequency
+            // denominator (the full headDim).
+            let headDim = 512
+            let rotatedDim = 128
+            let theta: Float = 1_000_000
+            let position = 7
+            let nHeads = 3
+
+            // Deterministic, non-trivial input.
+            var data = [Float](repeating: 0, count: nHeads * headDim)
+            for i in 0..<data.count {
+                data[i] = Float((i * 7) % 19 - 9) * 0.13
+            }
+            let qk = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            qk.copyIn(from: data)
+
+            runAndWait { cb in
+                Gemma4Ops.ropeProportional(
+                    qk, position: position, headDim: headDim,
+                    rotatedDim: rotatedDim, thetaBase: theta, on: cb)
+            }
+            let got = qk.toArray(as: Float.self)
+
+            // CPU oracle of the reference's ProportionalRoPE.
+            let half = headDim / 2            // 256 — pairing offset
+            let rotatedPairs = rotatedDim / 2 // 64 — rotated pair count
+            var expected = data
+            for h in 0..<nHeads {
+                let base = h * headDim
+                for i in 0..<rotatedPairs {
+                    // inv_freq = theta^(-2i/headDim) = theta^(-i/half)
+                    let invFreq = Float(
+                        pow(Double(theta), -Double(i) / Double(half)))
+                    let angle = Double(position) * Double(invFreq)
+                    let c = Float(cos(angle))
+                    let s = Float(sin(angle))
+                    let x1 = data[base + i]
+                    let x2 = data[base + i + half]
+                    expected[base + i] = x1 * c - x2 * s
+                    expected[base + i + half] = x1 * s + x2 * c
+                }
+                // i ∈ [rotatedPairs, half): pass-through (unchanged).
+            }
+            for idx in 0..<got.count {
+                #expect(abs(got[idx] - expected[idx]) < 1e-3,
+                        "idx=\(idx): got \(got[idx]) expected \(expected[idx])")
             }
         }
     }

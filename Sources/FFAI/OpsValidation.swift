@@ -28,15 +28,17 @@ public enum OpsValidation {
 
     // ─── rmsNorm + rmsNormRows ─────────────────────────────────────
     //
-    // Kernel invariants (from `crates/metaltile-std/src/mlx/rms_norm.rs`
-    // §"DISPATCH INVARIANTS"):
-    //   1. `N = TPG * 4` — each thread owns 4 consecutive elements.
-    //      The wrapper computes `TPG = n / 4`.
-    //   2. `TPG` must be a multiple of 32 (cross-simdgroup reduction).
-    //      Combined with (1): `n` must be a multiple of 128.
-    //   3. `TPG ≤ 1024` (Apple's max-threads-per-threadgroup cap).
-    //      Combined with (1): `n ≤ 4096`. Larger rows need
-    //      `rmsNormRows` chunked dispatch (forthcoming).
+    // `Ops.dispatchRmsNorm` routes by row width across two metaltile
+    // kernels (`crates/metaltile-std/src/mlx/rms_norm.rs`):
+    //   • `n ≤ 4096` → `mt_rms_norm`. `N = TPG * 4` (4 elements per
+    //     thread), `TPG = n / 4`, `TPG` a multiple of 32 ⇒ `n` a
+    //     multiple of 128, `TPG ≤ 1024` ⇒ `n ≤ 4096`.
+    //   • `n > 4096` → `mt_rms_norm_wide`. Each thread strides over
+    //     the row, so there is no upper bound; `TPG` is fixed at 1024.
+    //
+    // The only row-width invariant common to both — and the one the
+    // wrapper must enforce — is the 128-element (simdgroup × 4)
+    // granularity. Every real model hidden size satisfies it.
 
     /// Validate the row-width parameter for `Ops.rmsNorm` and
     /// `Ops.rmsNormRows`. The single-row and multi-row dispatches
@@ -48,9 +50,6 @@ public enum OpsValidation {
         if !n.isMultiple(of: 128) {
             return "n=\(n) must be a multiple of 128 (32-lane simdgroup × 4 elements/thread)"
         }
-        if n / 4 > 1024 {
-            return "n=\(n) > 4096 — exceeds the 1024-thread cap of this kernel; use rmsNormRows or a chunked variant for larger rows"
-        }
         return nil
     }
 
@@ -58,14 +57,15 @@ public enum OpsValidation {
     //
     // Kernel invariants (from `crates/metaltile-std/src/ffai/sdpa_decode.rs`
     // + `sdpa_decode_d64.rs` §"DISPATCH INVARIANTS"):
-    //   1. `head_dim ∈ {64, 128}`. Each lane owns `head_dim / 32`
-    //      consecutive Q/K/V elements; loads are unconditional. Wrong
-    //      head_dim → wrong TPG → infinite loop in
+    //   1. `head_dim ∈ {64, 128, 256, 512}`. Each lane owns
+    //      `head_dim / 32` consecutive Q/K/V elements; loads are
+    //      unconditional. Wrong head_dim → wrong TPG → infinite loop in
     //      `for _t in range(sg, n_kv, ns=TPG/32)` when `TPG < 32`
     //      makes `ns = 0`. (See FFAI post-mortem 2026-05-19.)
-    //      head_dim=256 is queued; head_dim=128 covers Llama 3.2 3B+ /
-    //      Qwen3 / GPT-OSS full layers, head_dim=64 covers Llama 3.2 1B
-    //      and GPT-OSS sliding-window layers.
+    //      head_dim=128 covers Llama 3.2 3B+ / Qwen3 / GPT-OSS full
+    //      layers, head_dim=64 covers Llama 3.2 1B and GPT-OSS
+    //      sliding-window layers, head_dim=256 covers Gemma 3 / Gemma 4
+    //      sliding layers, head_dim=512 covers Gemma 4 global layers.
     //   2. `nQHeads % nKVHeads == 0` so GQA fan-out is integer.
     //   3. `n_kv ≤ kv_stride`. The kernel walks `[0, n_kv)` only;
     //      `kv_stride` is the pre-allocated maxSeq capacity.
@@ -85,7 +85,7 @@ public enum OpsValidation {
     /// head_dim values for which a kernel specialization currently
     /// exists. Caller is responsible for routing to the matching
     /// kernel; see `Ops.sdpaDecode`.
-    public static let supportedSdpaHeadDims: Set<Int> = [64, 128, 256]
+    public static let supportedSdpaHeadDims: Set<Int> = [64, 128, 256, 512]
 
     /// head_dim values whose kernel variant carries the `sink_end` /
     /// `window_start` constexprs. The d64 / d256 variants are dense-only
