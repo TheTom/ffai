@@ -856,8 +856,10 @@ private func scaleBySigmoidGate35(_ value: Tensor, gateLogit: Tensor,
                                 device: device)
     let scaled = Ops.mul(value, gateVec, on: cmd)
     let result = Ops.add(base, scaled, on: cmd)
+    // Commit-only: `result` is on the in-flight cmd; the caller's
+    // residual-add cmd reads it through Metal hazard tracking. One
+    // wait per MoE layer × 40 layers × per-token recovered.
     cmd.commit()
-    cmd.waitUntilCompleted()
     return result
 }
 
