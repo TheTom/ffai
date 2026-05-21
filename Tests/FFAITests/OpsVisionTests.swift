@@ -357,6 +357,46 @@ struct OpsVisionTests {
         }
     }
 
+    // ─── layer_norm ──────────────────────────────────────────────────
+
+    @Test("layerNorm f32 — multi-row normalization with scale + shift")
+    func layerNormF32() {
+        autoreleasepool {
+            let nRows = 3, rowSize = 8
+            var xData = [Float](repeating: 0, count: nRows * rowSize)
+            for i in xData.indices { xData[i] = Float(i % 5) * 0.5 - 1.0 }
+            let weightData = (0..<rowSize).map { Float($0) * 0.1 + 1.0 }
+            let biasData = (0..<rowSize).map { Float($0) * 0.05 }
+
+            let x = Tensor.empty(shape: [nRows, rowSize], dtype: .f32)
+            x.copyIn(from: xData)
+            let weight = Tensor.empty(shape: [rowSize], dtype: .f32)
+            weight.copyIn(from: weightData)
+            let bias = Tensor.empty(shape: [rowSize], dtype: .f32)
+            bias.copyIn(from: biasData)
+
+            var out: Tensor!
+            runAndWait { cb in
+                out = Ops.layerNorm(x, weight: weight, bias: bias, eps: 1e-5,
+                                    nRows: nRows, rowSize: rowSize, on: cb)
+            }
+            #expect(out.shape == [nRows, rowSize])
+            let got = out.toArray(as: Float.self)
+            // CPU reference.
+            for r in 0..<nRows {
+                let row = Array(xData[(r * rowSize)..<((r + 1) * rowSize)])
+                let mean = row.reduce(0, +) / Float(rowSize)
+                let varc = row.map { ($0 - mean) * ($0 - mean) }
+                    .reduce(0, +) / Float(rowSize)
+                let inv = 1 / (varc + 1e-5).squareRoot()
+                for c in 0..<rowSize {
+                    let want = (row[c] - mean) * inv * weightData[c] + biasData[c]
+                    #expect(abs(got[r * rowSize + c] - want) < 1e-3)
+                }
+            }
+        }
+    }
+
     // ─── helpers ─────────────────────────────────────────────────────
 
     /// Round a Float to its bf16 bit pattern (top 16 bits of the f32).
