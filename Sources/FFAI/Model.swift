@@ -30,6 +30,17 @@ public enum ModelRegistry {
     public struct Loaded {
         public let engine: any LanguageModel
         public let defaultGenerationParameters: GenerationParameters
+        /// Capabilities the loaded variant supports. Text-only families
+        /// report `Capability.textOnly`; VL variants add `.visionIn`.
+        public let availableCapabilities: Set<Capability>
+
+        public init(engine: any LanguageModel,
+                    defaultGenerationParameters: GenerationParameters,
+                    availableCapabilities: Set<Capability> = Capability.textOnly) {
+            self.engine = engine
+            self.defaultGenerationParameters = defaultGenerationParameters
+            self.availableCapabilities = availableCapabilities
+        }
     }
 
     public static func dispatchAndLoad(
@@ -392,7 +403,17 @@ public final class Model: @unchecked Sendable {
     public let config: ModelConfig
     public let modelDirectory: URL
     public let availableCapabilities: Set<Capability>
-    public let enabledCapabilities: Set<Capability>
+
+    /// Currently-enabled capabilities. Mutated via `enable(_:)` /
+    /// `disable(_:)`; guarded by `capabilityLock` for thread safety.
+    private var _enabledCapabilities: Set<Capability>
+    private let capabilityLock = NSLock()
+
+    /// Snapshot of the enabled-capability set.
+    public var enabledCapabilities: Set<Capability> {
+        capabilityLock.lock(); defer { capabilityLock.unlock() }
+        return _enabledCapabilities
+    }
     /// Default generation parameters declared by the model's family
     /// variant. Use as-is, or call `.with { $0.maxTokens = ... }` to
     /// tweak a field without losing the family-tuned baseline.
@@ -464,7 +485,12 @@ public final class Model: @unchecked Sendable {
         self.config = config
         self.modelDirectory = modelDirectory
         self.availableCapabilities = availableCapabilities
-        self.enabledCapabilities = enabledCapabilities
+        // textIn / textOut are universal — always enabled. Other
+        // requested capabilities are honored only if the model declares
+        // them available.
+        self._enabledCapabilities = enabledCapabilities
+            .union(Capability.textOnly)
+            .intersection(availableCapabilities.union(Capability.textOnly))
         self.defaultGenerationParameters = defaultGenerationParameters
         // Bounded buffer — when no consumer is reading, keep the most
         // recent `eventsBufferCapacity` events and drop older ones.
@@ -485,6 +511,53 @@ public final class Model: @unchecked Sendable {
         _currentState = event.state
         stateLock.unlock()
         eventsContinuation.yield(event)
+    }
+
+    // ─── Capability enable / disable ─────────────────────────────────
+
+    /// Whether a capability is currently enabled.
+    public func isEnabled(_ capability: Capability) -> Bool {
+        enabledCapabilities.contains(capability)
+    }
+
+    /// Enable a capability at runtime — e.g. `enable(.visionIn)` lights
+    /// up the vision path on a model loaded text-only. No-op if the
+    /// capability isn't in `availableCapabilities` (a text-only model
+    /// can't gain vision) or is already enabled. Emits a lifecycle
+    /// event tagged with the capability so consumers can react.
+    ///
+    /// `textIn` / `textOut` are universal and always enabled — calling
+    /// `enable` / `disable` on them is a harmless no-op.
+    @discardableResult
+    public func enable(_ capability: Capability) -> Bool {
+        guard availableCapabilities.contains(capability)
+            || Capability.textOnly.contains(capability) else { return false }
+        capabilityLock.lock()
+        let changed = !_enabledCapabilities.contains(capability)
+        _enabledCapabilities.insert(capability)
+        capabilityLock.unlock()
+        if changed {
+            eventsContinuation.yield(
+                ModelLifecycleEvent(capability: capability, state: currentState))
+        }
+        return changed
+    }
+
+    /// Disable a capability at runtime. `textIn` / `textOut` are
+    /// universal and cannot be disabled — those calls are a no-op.
+    /// Emits a capability-tagged lifecycle event when the set changes.
+    @discardableResult
+    public func disable(_ capability: Capability) -> Bool {
+        guard !Capability.textOnly.contains(capability) else { return false }
+        capabilityLock.lock()
+        let changed = _enabledCapabilities.contains(capability)
+        _enabledCapabilities.remove(capability)
+        capabilityLock.unlock()
+        if changed {
+            eventsContinuation.yield(
+                ModelLifecycleEvent(capability: capability, state: currentState))
+        }
+        return changed
     }
 
     // ─── Top-level loader ────────────────────────────────────────────
@@ -519,7 +592,7 @@ public final class Model: @unchecked Sendable {
                 return Model(
                     engine: loaded.engine, tokenizer: tokenizer, config: config,
                     modelDirectory: dir,
-                    availableCapabilities: Capability.textOnly,
+                    availableCapabilities: loaded.availableCapabilities,
                     enabledCapabilities: options.capabilities,
                     defaultGenerationParameters: loaded.defaultGenerationParameters
                 )
