@@ -841,34 +841,6 @@ public final class Qwen35MoEFFN: Module {
     }
 }
 
-/// `sigmoid(gateLogit) * value + base`, broadcasting the scalar
-/// `gateLogit` ([1]) across the `[hidden]` `value` / `base` tensors.
-///
-/// `gateLogit` MUST already be resident (its producing command buffer
-/// committed + waited) — this helper reads it host-side. The broadcast
-/// scalar is materialised via `Tensor.filled` and the scaled add runs on
-/// a fresh, locally-committed command buffer so the result is resident.
-private func scaleBySigmoidGate35(_ value: Tensor, gateLogit: Tensor,
-                                  addTo base: Tensor, hidden: Int,
-                                  device: Device) -> Tensor {
-    precondition(value.elementCount == hidden && base.elementCount == hidden,
-                 "scaleBySigmoidGate35: value/base must be [hidden]")
-    let logit = gateLogit.toFloatArray()
-    precondition(logit.count == 1,
-                 "scaleBySigmoidGate35: shared_expert_gate must project to [1]")
-    let gate = sigmoid35(logit[0])
-    let cmd = device.makeCommandBuffer()
-    let gateVec = Tensor.filled(gate, shape: [hidden], dtype: value.dtype,
-                                device: device)
-    let scaled = Ops.mul(value, gateVec, on: cmd)
-    let result = Ops.add(base, scaled, on: cmd)
-    // Commit-only: `result` is on the in-flight cmd; the caller's
-    // residual-add cmd reads it through Metal hazard tracking. One
-    // wait per MoE layer × 40 layers × per-token recovered.
-    cmd.commit()
-    return result
-}
-
 /// Re-key a flat `MoELayer` parameter name into Qwen3.5's checkpoint
 /// layout. `MoELayer` emits `gate.*` / `experts.<e>.*`; Qwen3.5 stores
 /// `mlp.gate.*` and stacked `mlp.switch_mlp.*` (the per-expert weights
