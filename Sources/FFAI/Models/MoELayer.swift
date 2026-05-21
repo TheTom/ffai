@@ -110,24 +110,40 @@ public struct MoERouter: Sendable {
                      "MoERouter.route: logits.count \(logits.count) ≠ nExperts \(nExperts)")
 
         switch gatingMode {
+        case .softmaxThenTopK where normTopKProb:
+            // Fast path: `softmaxThenTopK + normTopKProb=true` produces
+            // the same weights as `.topKThenSoftmax`. Proof:
+            //   softmax(L)[i] = exp(L[i] - M) / Z, M = max(L), Z = Σ
+            //   top-K of softmax probs by value desc = top-K of raw
+            //     logits (softmax is monotonic on selection)
+            //   weights_pre[k] = exp(L[idx_k] - M) / Z
+            //   renorm: weights[k] = weights_pre[k] / Σ_k weights_pre
+            //     = exp(L[idx_k]) / Σ_k exp(L[idx_k])
+            //     = softmax over just the K picked logits
+            // Skips the full softmax over `nExperts=256` (~500 ops
+            // including 256 exp + sum reduction + 256 div). Saves
+            // ~40 K host ops / token on Qwen3.6-A3B (40 MoE layers ×
+            // ~1000 ops per route saved). Qwen3 / Qwen3.5 / Qwen3.6 MoE
+            // all hit this branch (`norm_topk_prob: true` in every
+            // shipped config).
+            let idx = Self.topKIndices(logits, k: topK)
+            let weights = Self.softmax(idx.map { logits[$0] })
+            return Routing(indices: idx, weights: weights)
+
         case .softmaxThenTopK:
-            // 1. softmax over ALL experts (numerically stable).
+            // `normTopKProb=false` case — semantically distinct
+            // (unnormalised softmax probs as weights). Must walk the
+            // full softmax over all nExperts.
             let probs = Self.softmax(logits)
-            // 2. top-K of the softmax probabilities.
             let idx = Self.topKIndices(probs, k: topK)
-            var weights = idx.map { probs[$0] }
-            // 3. optional re-normalisation of the K picked probs.
-            if normTopKProb {
-                let sum = weights.reduce(0, +)
-                if sum > 0 { weights = weights.map { $0 / sum } }
-            }
+            let weights = idx.map { probs[$0] }
             return Routing(indices: idx, weights: weights)
 
         case .topKThenSoftmax:
-            // 1. top-K of the raw logits.
+            // Top-K of raw logits, softmax over just the K picked —
+            // always normalised by construction so `normTopKProb`
+            // doesn't apply.
             let idx = Self.topKIndices(logits, k: topK)
-            // 2. softmax over just the K picked logits — always
-            //    normalised, so `normTopKProb` does not apply.
             let weights = Self.softmax(idx.map { logits[$0] })
             return Routing(indices: idx, weights: weights)
         }
