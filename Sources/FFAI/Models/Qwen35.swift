@@ -1562,6 +1562,95 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
                               position: position, cmd: cmd,
                               commitCmd: false, device: device)
     }
+
+    /// T-batched layer forward for batched prefill. `hFlat` is
+    /// `[T, hidden]` flat (T·hidden elements). `startPosition` is the
+    /// position of `hFlat[0]`. Returns `[T, hidden]` flat.
+    ///
+    /// Architecture: pre-norm + mixer fan through one batched dispatch
+    /// each (`Ops.rmsNormRows` over T rows, `Qwen35AttentionMixer.
+    /// forwardMany`). The residual add over `[T, hidden]` is also one
+    /// kernel. The FFN half STILL loops per token — `MoELayer.decodeMany`
+    /// is multi-day work (per Decode Plan §4) and unblocking the mixer
+    /// piece is the lower-risk first ship. The expensive dispatches
+    /// (qmm / sdpa / gemm) all amortise once.
+    ///
+    /// Command-buffer ownership matches single-token `decode`:
+    ///   - Dense FFN: `cmd` stays in-flight with all T row writes;
+    ///     caller's `commitsCommandBuffer = false` contract holds.
+    ///   - MoE FFN: iter 0's `moe.forward` commits `cmd`; subsequent
+    ///     iters spin fresh `workCmd`s. Each iter's residual add runs
+    ///     on a fresh `addCmd` that commits immediately. Output's writes
+    ///     are scattered across T committed `addCmd`s — caller's
+    ///     `commitsCommandBuffer = true` contract triggers the model-
+    ///     level `workCmd` refresh; the next layer reads via Metal hazard
+    ///     tracking.
+    public func decodeMany(_ hFlat: Tensor, t: Int, startPosition: Int,
+                           cache: any LayerCacheProtocol,
+                           cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        guard let kv = cache as? KVCache else {
+            fatalError("Qwen35AttentionLayer.decodeMany: expected KVCache, "
+                       + "got \(type(of: cache))")
+        }
+        precondition(t > 0, "Qwen35AttentionLayer.decodeMany: T must be positive")
+        precondition(hFlat.elementCount == t * hidden,
+                     "Qwen35AttentionLayer.decodeMany: hFlat size \(hFlat.elementCount) "
+                     + "≠ T·hidden = \(t * hidden)")
+
+        let dt = hFlat.dtype
+        let dtBytes = dt.byteSize
+
+        // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
+        let xNormFlat = Ops.rmsNormRows(
+            hFlat, weight: inputNorm.weight, eps: inputNorm.eps,
+            nRows: t, rowSize: hidden, on: cmd)
+
+        // ── Batched attention mixer ─────────────────────────────────────
+        let mixerOut = mixer.forwardMany(
+            xNormFlat, t: t, startPosition: startPosition,
+            cache: kv, cmd: cmd, device: device)
+
+        // ── Residual add — one Ops.add over T·hidden elements ───────────
+        let postMix = Ops.add(hFlat, mixerOut, on: cmd)
+
+        // ── FFN half — per-row loop with the residual add writing
+        // directly into outFlat[r] via `Ops.add(into:)`. Inlines
+        // `qwen35ApplyFFN`'s body so the final add can target an outRow
+        // slice of the pre-allocated assembly buffer — there's no GPU
+        // blit-copy primitive on Ops today, and `Ops.add(into:)` is the
+        // existing pattern for "write here". `workCmd` refresh mirrors
+        // `Qwen35Model.forward`'s per-layer pattern: the MoE FFN commits
+        // workCmd inside `Qwen35MoEFFN.forward`, and the residual add
+        // runs on a fresh addCmd that commits immediately.
+        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
+        var workCmd = cmd
+        for r in 0..<t {
+            let postMixRow = Tensor(buffer: postMix.buffer,
+                                    offset: postMix.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+            let outRow = Tensor(buffer: outFlat.buffer,
+                                offset: outFlat.offset + r * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+            let ffnNorm = postNorm(postMixRow, on: workCmd)
+            switch ffn {
+            case .dense(let mlp):
+                let ffnOut = mlp.forward(ffnNorm, cmd: workCmd)
+                _ = Ops.add(postMixRow, ffnOut, on: workCmd, into: outRow)
+                // workCmd stays uncommitted — model.forward's
+                // commitsCommandBuffer = false path leaves it in-flight.
+            case .moe(let moe):
+                let ffnOut = moe.forward(ffnNorm, position: startPosition + r,
+                                         cmd: workCmd, device: device)
+                // moe.forward committed workCmd. Run the residual add on
+                // a fresh addCmd that writes directly into outRow.
+                let addCmd = device.makeCommandBuffer()
+                _ = Ops.add(postMixRow, ffnOut, on: addCmd, into: outRow)
+                addCmd.commit()
+                workCmd = device.makeCommandBuffer()
+            }
+        }
+        return outFlat
+    }
 }
 
 // ─── Shared FFN helpers ──────────────────────────────────────────────
