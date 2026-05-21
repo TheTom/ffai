@@ -436,6 +436,73 @@ public enum Ops {
         return result
     }
 
+    /// Multi-row LayerNorm — `out[r,:] = (x[r,:] - mean) / sqrt(var+eps)
+    /// * weight + bias`. Input is `[nRows, rowSize]`; `weight` / `bias`
+    /// are `[rowSize]` (shared across rows). Vision-transformer encoders
+    /// (SigLIP / CLIP) use LayerNorm rather than RMSNorm, so this is the
+    /// vision-side counterpart of `rmsNormRows`.
+    ///
+    /// Backed by the `mt_layer_norm` reduction kernel — one threadgroup
+    /// per row, TPG fixed at 1024 (`tpg=1024`, `class=RowNorm` in
+    /// `metaltile-std/src/mlx/layer_norm.rs`).
+    public static func layerNorm(_ x: Tensor, weight: Tensor, bias: Tensor,
+                                 eps: Float, nRows: Int, rowSize: Int,
+                                 on cmd: MTLCommandBuffer,
+                                 into out: Tensor? = nil) -> Tensor {
+        precondition(x.elementCount == nRows * rowSize,
+                     "Ops.layerNorm: x size \(x.elementCount) ≠ nRows*rowSize "
+                     + "\(nRows * rowSize) (layer_norm.rs)")
+        precondition(weight.elementCount == rowSize,
+                     "Ops.layerNorm: weight must be [rowSize] (layer_norm.rs)")
+        precondition(bias.elementCount == rowSize,
+                     "Ops.layerNorm: bias must be [rowSize] (layer_norm.rs)")
+        precondition(x.dtype == weight.dtype && weight.dtype == bias.dtype,
+                     "Ops.layerNorm: x/weight/bias dtype mismatch (layer_norm.rs)")
+        let result = out ?? Tensor.empty(shape: x.shape, dtype: x.dtype)
+
+        // eps as a 1-element f32 buffer (the kernel reads eps_buf[0]).
+        var epsValue = eps
+        let epsBuf = device.makeBuffer(length: 4)
+        memcpy(epsBuf.contents(), &epsValue, 4)
+
+        // Reduction kernel: TPG must be 1024 (the kernel's `tpg=1024`
+        // contract — a smaller TPG would mis-stride the reduce). One
+        // threadgroup per row → dispatch nRows*1024 threads in a flat
+        // 1D grid so Metal slices into nRows groups of 1024.
+        let tgWidth = 1024
+        let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.mt_layer_norm_f32(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                b: bias.buffer, bOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(rowSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_layer_norm_f16(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                b: bias.buffer, bOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(rowSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_layer_norm_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                b: bias.buffer, bOffset: bias.offset,
+                out: result.buffer, outOffset: result.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0, n: UInt32(rowSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.layerNorm: unsupported dtype \(x.dtype)")
+        }
+        return result
+    }
+
     /// Shared RMSNorm dispatch for `rmsNorm` (nRows = 1) and
     /// `rmsNormRows`. Routes by row width:
     ///   • `n ≤ 4096` → `mt_rms_norm`, 4 elements per thread,
