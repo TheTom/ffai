@@ -52,8 +52,6 @@ Custom kernels (turbo / gated-delta / SSM / …) live on **`ekryski/mlx@alpha`**
 
 ### Wrapping a kernel in a Swift `Ops` function
 
-> DO read [`papers/post-mortem-2026-05-19-dispatch-shape-gpu-freeze.md`](papers/post-mortem-2026-05-19-dispatch-shape-gpu-freeze.md) once — a wrong-dispatch wrapper froze a dev machine for a day.
-
 An `Ops` wrapper is the boundary between caller-supplied dimensions and the GPU. For **reduction-mode kernels** (`simd_*` / `threadgroup_alloc` / `KernelMode::Reduction` in the `.rs`, or a fixed `tpg=` in the `BenchSpec`) it is the only thing enforcing the geometry contract the kernel can't check at runtime:
 
 1. DO read the kernel's `## DISPATCH INVARIANTS` block. If it has none, DO add one in the same commit.

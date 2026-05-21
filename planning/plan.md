@@ -185,7 +185,7 @@ the GPU, (4) fused kernels for hot paths to minimize memory bandwidth.
 
 ---
 
-## Phase 0 — Plumbing (this repo + metaltile)
+## Phase 0 — Plumbing (this repo + metaltile) ✅ SHIPPED
 
 **Goal:** Round-trip a single trivial kernel from Rust `#[kernel]` to
 Swift dispatch, with the SPM build plugin auto-invoking the emit step.
@@ -310,7 +310,7 @@ MLX involved.
 
 ---
 
-## Phase 1 — Foundation kernels
+## Phase 1 — Foundation kernels ✅ SHIPPED
 
 **Goal:** Have enough kernels in metaltile + Swift wrappers to express a
 basic Llama-style forward pass without quantization.
@@ -364,7 +364,7 @@ at threshold.
 
 ---
 
-## Phase 2 — First model end-to-end (Llama 3.2 1B)
+## Phase 2 — First model end-to-end (Llama 3.2 1B) ✅ SHIPPED
 
 **Target model: Llama 3.2 1B.** ~1.2GB fp16, standard transformer
 (GQA + RoPE + RMSNorm + SwiGLU MLP). Maps 1:1 to the Phase 1 kernel
@@ -455,7 +455,7 @@ recorded as baseline.
 
 ---
 
-## Phase 2.5 — Second model (Qwen3 4B)
+## Phase 2.5 — Second model (Qwen3 4B) ✅ SHIPPED
 
 **Target model: Qwen3 4B.** Same kernel set as Llama plus one
 structural addition: per-head q_norm and k_norm RMSNorms applied to
@@ -500,7 +500,7 @@ to support next, not speculatively.
 
 ---
 
-## Phase 3 — Quantization
+## Phase 3 — Quantization ✅ SHIPPED
 
 **Goal:** Match MLX's standard 4-bit / 8-bit affine quantization for
 weight-only quantized inference.
@@ -529,7 +529,7 @@ decode.
 
 ---
 
-## Phase 4 — Performance optimizations
+## Phase 4 — Performance optimizations ✅ SHIPPED
 
 **Goal:** Close the gap between Phase 0-3 correctness-first kernels
 and the M-series GPU's actual ceiling. The Phase 0-3 implementation
@@ -581,11 +581,11 @@ should support 80-200 tok/s on these workloads.
 - New `Tests/PerfTests/` measures tok/s at fixed seed; CI publishes
   the numbers per commit (regression-tracker)
 
-**Out of scope (deferred to Phase 7 autotuner):**
+**Deferred out of Phase 4:**
 
-- Per-shape kernel parameter selection
-- Argument buffer / ICB dispatch modes
-- Multi-token batched prefill
+- Per-shape kernel parameter selection → Phase 9 autotuner.
+- Argument-buffer / ICB dispatch modes → Phase 9.
+- Multi-token batched (chunked) prefill → Phase 6.6.
 
 ---
 
@@ -728,7 +728,7 @@ reference produces coherent Qwen3 output with `useBias: false`. The
 earlier "codebook recalibration / DC-bias correction needed"
 hypothesis was **refuted** — DC-bias is a GPT-OSS-only feature
 (`RMSNorm → Linear(bias=True)` projections), not a Qwen3
-requirement. Full audit: `planning/aura-audit-and-task-inventory-2026-05-19.md`.
+requirement.
 
 **AURA performance — deferred to Phase 6.3.** FFAI currently runs
 AURA through a dequant-then-`sdpaDecode` path with a persistent
@@ -736,10 +736,10 @@ working buffer. Compressed-domain attention (`aura_flash_p1/p2`),
 two separate K/V codecs, two-phase prefill, the W_o offline fold,
 strided-output encode, and the cache-layout flip are all perf /
 architecture work — **correctness does not depend on any of them**.
-Picked up after the rest of Phase 5 + Phase 6. Spec:
-`planning/aura-stage1b-refactor-spec.md`.
+Picked up after the rest of Phase 5 + Phase 6 — full scope in
+Phase 6.3 below.
 
-### Phase 5e — SSM / GDN hybrid models
+### Phase 5e — SSM / GDN hybrid models ✅ SHIPPED
 
 Unlocks Qwen 3.5 (GDN + attention), Mamba 2 families (NemotronH,
 GraniteMoeHybrid, FalconH1).
@@ -804,36 +804,23 @@ and `Models/Mamba2.swift` ships the end-to-end dense path.
   loads `mlx-community/mamba2-130m`, verifies shapes match config,
   runs greedy decode to completion (~130 tok/s on M-series).
 
-**Still planned for 5e — forward / decode path only.** The
-execution plan (scope, dependency graph, ordering, delegation) lives
-in [`planning/phase-5e-plan.md`](phase-5e-plan.md). Summary:
+**Shipped — Phase 5e complete.** The forward / decode path for all
+five hybrid families landed, each with a coherent-output integration
+test:
 
-- **GDN forward kernel** — `gated_delta_step_{Dk}_{Dv}_{Hk}_{Hv}`,
-  recurrence `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`,
-  fp32 state throughout. Port from `ekryski/mlx@alpha`
-  `gated_delta.metal`. Paired GPU correctness test, same commit.
-- **`GDNStateCache`** (`Sources/FFAI/GDNStateCache.swift`) —
-  per-layer GDN recurrent state, **forward-only**, mirrors the
-  shipped `SSMStateCache`.
-- **MoE inference infrastructure** — top-K expert router +
-  per-expert FFN dispatch. No MoE support exists in FFAI today;
-  shared by the MoE-bearing families below. Start with a dense
-  masked loop over experts; optimise to a sparse gather later.
-- **Per-layer mixer scaffolding** — a layer-type-driven mixer
-  abstraction so a family interleaves Mamba 2 / attention / MoE /
-  MLP layers. Extends `makeLayerCaches`'s `[any LayerCacheProtocol]`.
-- **Family files** (one integration test each, mlx-community
-  download + coherent-output assertion):
-  - `Models/FalconH1.swift` — Mamba 2 + attention / MLP, per-layer
-    multipliers. No MoE, no GDN — the first family end-to-end.
-  - `Models/NemotronH.swift` — layer-type string parsing (`M`
-    Mamba, `*` attention, `E` MoE, `-` MLP).
-  - `Models/GraniteMoeHybrid.swift` — Mamba 2 + MoE + attention.
-  - `Models/Jamba.swift` — Mamba 2 + attention / MoE; handle the
-    2D `A_log` shape.
-  - `Models/Qwen35.swift` — `Qwen35Dense`, `Qwen35MoE`, `Qwen35GDN`
-    variants; GDN ↔ full-attention alternation every
-    `fullAttentionInterval` layers. Headline; most-coupled; last.
+- **GDN forward kernel** — `mt_gated_delta_step` (recurrence
+  `S_t = g_t·S_{t-1} + β_t·k_t·(v_t − k_tᵀ·S_{t-1})ᵀ`, fp32 state)
+  + `Ops.gatedDeltaStep` + `GDNStateCache` (forward-only, mirrors
+  `SSMStateCache`).
+- **MoE inference infrastructure** — `MoERouter` + `MoELayer`
+  (top-K router + per-expert SwiGLU dispatch).
+- **Per-layer mixer scaffolding** — the `DecoderLayer` protocol +
+  `StatelessLayerCache`, driving a heterogeneous `[any DecoderLayer]`
+  decode loop.
+- **Family files** — `Models/{FalconH1,NemotronH,GraniteMoeHybrid,
+  Jamba,Qwen35}.swift`, with `Jamba`'s 2D `A_log` selective scan
+  handled host-side (a GPU 2D-`A` `ssm_step` variant is a tracked
+  perf follow-up — see metaltile `docs/KERNEL_AUDIT.md`).
 
 **Deferred out of 5e:**
 
@@ -847,7 +834,7 @@ in [`planning/phase-5e-plan.md`](phase-5e-plan.md). Summary:
 - **Conditional:** generalise `ssm_step` to `n_groups > 1` (grouped
   B / C) only if a target checkpoint's `config.json` needs it.
 
-### Phase 5f — Attention sinks + sliding window + GPT-OSS-20B
+### Phase 5f — Attention sinks + sliding window + GPT-OSS-20B ✅ SHIPPED
 
 **Kernels:**
 
@@ -878,10 +865,17 @@ in [`planning/phase-5e-plan.md`](phase-5e-plan.md). Summary:
 
 ---
 
-## Phase 6 — Dense-text model wave
+## Phase 6 — Dense-text model wave ✅ SHIPPED
 
 For each model: family file (consuming existing kernels), config-key
 plumbing, registry entry, one integration test, doc row update.
+
+Shipped: Mistral, Phi, Gemma 3, Gemma 4 (`Gemma4Dense` / `Gemma4E` /
+`Gemma4MoE` — incl. the 26B-A4B MoE), Qwen 3.5 dense + MoE (via
+`Qwen35.swift`), and `NemotronLabsDiffusion` (NVIDIA Nemotron-Labs-
+Diffusion tri-mode text backbone). The `ModelKVCacheMatrixIntegrationTests`
+cross-product (model family × weight-bitwidth × KV-cache scheme) also
+landed in this wave.
 
 - **Qwen3.5 / 3.6 dense** (0.8B, 2B, 4B, 9B, 27B) — `Qwen35Dense`
   variant. Already partially scaffolded by Phase 5e for the hybrid
@@ -938,13 +932,18 @@ AURA emit path surfaces as a reviewable text diff.
 ## Phase 6.3 — AURA performance
 
 Deferred from Phase 5d. **Correctness does not depend on any of
-this** — it is the architecture + perf pass. Full spec:
-`planning/aura-stage1b-refactor-spec.md`.
+this** — it is the architecture + perf pass. (The AURA index-50
+coherence collapse was a separate correctness bug — a stride
+mismatch in `aura_dequant_rotated` — and is already fixed; every
+AURA scheme decodes coherently in `ModelKVCacheMatrixIntegrationTests`.)
 
 **Stage 1b — compressed-domain attention.**
 
-- Two separate K/V codecs (independent SRHT seeds — decorrelated
-  quantization noise; matches the mlx-swift-lm reference).
+- Two separate K/V codecs — independent SRHT seeds per layer
+  (e.g. `2·layerIdx` for K, `2·layerIdx+1` for V); Q rotated with
+  the K rotation (score cancellation), output un-rotated with the V
+  rotation. Decorrelated quantization noise; matches the
+  mlx-swift-lm reference.
 - Two-phase prefill — raw fp16 buffer during prefill, batch-compress
   at the prefill→decode boundary, per-token encode after.
 - Compressed-domain attention via `aura_flash_p1` / `aura_flash_pass2`
@@ -952,7 +951,12 @@ this** — it is the architecture + perf pass. Full spec:
   `sharedWorkingK/V` mirror buffers.
 - Opt-in B-path — short-lived per-layer dequant buffer + `sdpaDecode`
   for callers with the memory headroom who want matrix-engine SDPA.
+  The dequant buffer must be tight-scoped (one layer's worth resident
+  at a time, not a persistent `maxSeq`-sized mirror).
 - W_o offline fold — replaces Stage 1a's runtime output un-rotation.
+- Norm correction — keep FFAI's always-applied `‖x‖/‖recon‖`;
+  revisit only via an A/B test (PPL/KLD + speed) vs the reference's
+  raw-norm WHT path.
 
 **Stage 3 — encode + layout perf.**
 
@@ -1010,6 +1014,33 @@ that lifecycle events stream correctly to consumers.
 - Capability matrix tests (every subset).
 - Vision encoder forward correctness vs `mlx-vlm`-captured fixture.
 - Multi-modal generation determinism on each VLM.
+
+---
+
+## Phase 6.6 — Chunked (batched) prefill
+
+Today FFAI prefills a prompt one token per dispatch (`Generate.swift`
+— `prefillStepSize` is a no-op placeholder). Batch the prompt into
+chunks so prefill processes N tokens per forward — a large TTFT win
+on long prompts.
+
+- Drive a multi-token forward — `forwardMulti(tokenIds:positions:
+  caches:)` — over a chunk of prompt tokens.
+- Chunk attention uses the existing
+  `ffai/sdpa_decode_batched_prefill` metaltile kernel; the KV-cache
+  append writes the whole chunk's K/V in one shot.
+- Honor `GenerationParameters.prefillStepSize` (Gemma 4's
+  4096-token prefill chunk becomes a real path, not a placeholder).
+- Hybrid families: chunked prefill for the attention layers; the
+  SSM/GDN recurrent layers still step per token (their recurrence is
+  inherently sequential) until the deferred chunked-scan kernels land.
+
+**Prioritized** — wanted before the Phase 6.5 Vision wave.
+`forwardMulti` is also the Phase 8.0 speculative-decoding prereq, so
+this de-risks Phase 8.
+
+**Tests:** prefill correctness (chunked vs per-token prefill produce
+identical logits) + a TTFT regression check.
 
 ---
 
@@ -1136,31 +1167,31 @@ Sub-phases land in priority order per
 
 ### 8.13 — Sparse prefill (spec 031 vertical-slash + spec 032 speculative prefill)
 
-### 8.14 — DFlash on GPU (spec 015, phases 1–3)
+### 8.14 — KV cache write fusion (spec 024)
+
+- Eliminate the `copy_bfloat16` dispatches per decode token.
+
+### 8.15 — Profile-guided Morton-order expert reorder (spec 026)
+
+### 8.16 — Adaptive per-layer mixed-precision (spec 027)
+
+- Recipe-driven framework via JSON sidecar + glob-pattern matching.
+
+### 8.17 — Quadratic / chunkwise WY GDN prefill (spec 028)
+
+- Highest research bet. Could regress if it doesn't work.
+
+### 8.18 — DFlash on GPU (spec 015, phases 1–3)
 
 - Phase 2: draft model from `z-lab/Qwen3.5-*-DFlash`.
 - Phase 3: refactor onto `StateReplayCache` protocol.
 
-### 8.15 — Mirror SD (spec 021) + ANE concurrency primitives (spec 025)
+### 8.19 — Mirror SD (spec 021) + ANE concurrency primitives (spec 025)
 
 - ANE + GPU concurrency primitives (spec 025) land first.
 - Then `MirrorSpeculativeLoop` glue.
 - Decision point: ANE + GPU truly concurrent on Apple Silicon?
   Failure here kills 021 + spec 029. Document and pivot.
-
-### 8.16 — KV cache write fusion (spec 024)
-
-- Eliminate the `copy_bfloat16` dispatches per decode token.
-
-### 8.17 — Profile-guided Morton-order expert reorder (spec 026)
-
-### 8.18 — Adaptive per-layer mixed-precision (spec 027)
-
-- Recipe-driven framework via JSON sidecar + glob-pattern matching.
-
-### 8.19 — Quadratic / chunkwise WY GDN prefill (spec 028)
-
-- Highest research bet. Could regress if it doesn't work.
 
 ### 8.20 — ANE-offloaded LM head + Gemma 4 PLE projection (spec 029)
 
@@ -1222,20 +1253,6 @@ same Model API.
   consumer instructions.
 - **Benchmarks** — full sweep vs MLX baseline across the model zoo.
 - **Documentation site polish.**
-
----
-
-## Out of scope / deferred
-
-- **CoreML / ANE backend.** Realistic only for boring kernels (RMSNorm,
-  RoPE, layer norm, plain GEMV at fp16/int8). AURA, FWHT, online
-  softmax, recurrent SSM/GDN do not fit ANE constraints. Add a `mil/`
-  codegen sibling to `msl/` in metaltile-codegen when v0.3 demand justifies it.
-- **Swift macro frontend** for kernel authoring. metaltile IR is
-  serde-serializable; a Swift `@kernel` macro emitting IR JSON could feed
-  the same backend later. Don't build it preemptively — wait for demand.
-- **Training / autograd.** Different project.
-- **CUDA / Linux backends.** Different project.
 
 ---
 

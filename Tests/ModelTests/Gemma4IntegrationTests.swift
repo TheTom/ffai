@@ -125,15 +125,15 @@ struct Gemma4IntegrationTests {
         #expect(gemma4 != nil)
         #expect(gemma4?.ple == nil, "31B is a dense (non-PLE) variant")
 
-        // Generation gated behind `GEMMA4_RUN_GENERATION`: the 31B
+        // Generation gated behind `FFAI_BUILD_MACHINE`: the 31B
         // checkpoint is large and greedy-decoding 48 tokens is slow for
         // a routine run. The 5376-wide hidden state routes through the
         // wide-row RMSNorm kernel (the old 4096-row cap is gone). The
         // E2B test above covers the same code paths unconditionally;
         // this is the dense-variant spot check.
-        guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
+        guard ProcessInfo.processInfo.environment["FFAI_BUILD_MACHINE"] != nil else {
             print("Gemma 4 31B generation check skipped " +
-                  "(set GEMMA4_RUN_GENERATION=1 to run — large checkpoint).")
+                  "(set FFAI_BUILD_MACHINE to run — large checkpoint).")
             return
         }
         let result = try await m.generate(
@@ -149,10 +149,10 @@ struct Gemma4IntegrationTests {
         // 26B-A4B is the mixture-of-experts variant: every layer runs a
         // shared dense MLP and an 8-of-128 routed expert mixture in
         // parallel, each branch with its own pre/post norm, plus the
-        // Gemma 4 router (input RMSNorm + per-expert scale). The 8-bit
-        // checkpoint is uniformly quantised, so it loads with the global
-        // quantization config; the 4-bit checkpoint mixes 4-/8-bit per
-        // layer and needs per-layer quantization support (not yet wired).
+        // Gemma 4 router (input RMSNorm + per-expert scale). This test
+        // uses the uniformly-8-bit checkpoint; the 4-bit checkpoint
+        // mixes 4-/8-bit per layer, now handled by the per-tensor
+        // `deriveAffineQuantBits` bit-width derivation.
         let modelId = "mlx-community/gemma-4-26b-a4b-it-8bit"
         let prompt = "The capital of France is"
 
@@ -168,11 +168,11 @@ struct Gemma4IntegrationTests {
         // 26B-A4B has hidden_size_per_layer_input = 0 → MoE, not PLE.
         #expect(gemma4?.ple == nil, "26B-A4B is the MoE (non-PLE) variant")
 
-        // Generation gated behind `GEMMA4_RUN_GENERATION`: the 26B
+        // Generation gated behind `FFAI_BUILD_MACHINE`: the 26B
         // checkpoint is large (8-bit ~28 GB) and slow to greedy-decode.
-        guard ProcessInfo.processInfo.environment["GEMMA4_RUN_GENERATION"] == "1" else {
+        guard ProcessInfo.processInfo.environment["FFAI_BUILD_MACHINE"] != nil else {
             print("Gemma 4 26B-A4B generation coherence check skipped " +
-                  "(set GEMMA4_RUN_GENERATION=1 to run).")
+                  "(set FFAI_BUILD_MACHINE to run).")
             return
         }
         let result = try await m.generate(

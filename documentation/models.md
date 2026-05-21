@@ -1,10 +1,13 @@
 # Supported Models
 
-FFAI ships several architecture families today; all run real
+FFAI ships the full text-LLM family set today; all run real
 HuggingFace checkpoints end-to-end through `Model.load("org/repo")`.
-Beyond the dense transformer families (Llama, Qwen 3, Mistral, Phi,
-Gemma 3, …) the in-tree set now includes the dense SSM family Mamba 2
-and the first *hybrid* family, FalconH1 (Mamba 2 + attention).
+That spans the dense transformer families (Llama + the
+Llama-compatible zoo, Qwen 2 / 3, Mistral, Phi, Gemma 3, Gemma 4),
+the GPT-OSS-20B MoE, the dense SSM family Mamba 2, the SSM/GDN hybrid
+families (FalconH1, NemotronH, GraniteMoeHybrid, Jamba, Qwen 3.5),
+and Nemotron-Labs-Diffusion. Vision (VLM) and audio families are the
+next wave — see [Coming next](#coming-next).
 
 This page is the canonical landing for:
 
@@ -20,7 +23,12 @@ For porting a new architecture, see
 | Family | File | `model_type` | `architectures` | Variants |
 |---|---|---|---|---|
 | **Llama 3.x** | [`Models/Llama.swift`](../Sources/FFAI/Models/Llama.swift) | `llama` | `LlamaForCausalLM` | `LlamaDense` |
+| **Llama-compatible zoo** | [`Models/LlamaCompatibles.swift`](../Sources/FFAI/Models/LlamaCompatibles.swift) | `smollm`, `olmo2`, `starcoder2`, `internlm2`, … | (various — all Llama-shaped) | reuses the Llama loader |
+| **Qwen 2** | [`Models/Qwen2.swift`](../Sources/FFAI/Models/Qwen2.swift) | `qwen2` | `Qwen2ForCausalLM` | reuses the Llama loader |
 | **Qwen 3** | [`Models/Qwen3.swift`](../Sources/FFAI/Models/Qwen3.swift) | `qwen3` | `Qwen3ForCausalLM` | `Qwen3Dense` |
+| **Mistral** | [`Models/Mistral.swift`](../Sources/FFAI/Models/Mistral.swift) | `mistral` | `MistralForCausalLM` | reuses the Llama loader |
+| **Phi 3** | [`Models/Phi.swift`](../Sources/FFAI/Models/Phi.swift) | `phi3` | `Phi3ForCausalLM` | `Phi3Dense` |
+| **Gemma 3** | [`Models/Gemma3.swift`](../Sources/FFAI/Models/Gemma3.swift) | `gemma3`, `gemma3_text` | `Gemma3ForCausalLM` | `Gemma3Dense` |
 | **Mamba 2** | [`Models/Mamba2.swift`](../Sources/FFAI/Models/Mamba2.swift) | `mamba2` | `Mamba2ForCausalLM` | `Mamba2Dense` |
 | **FalconH1** | [`Models/FalconH1.swift`](../Sources/FFAI/Models/FalconH1.swift) | `falcon_h1` | `FalconH1ForCausalLM` | `FalconH1Hybrid` |
 | **NemotronH** | [`Models/NemotronH.swift`](../Sources/FFAI/Models/NemotronH.swift) | `nemotron_h` | `NemotronHForCausalLM` | `NemotronHHybrid` |
@@ -283,6 +291,17 @@ Mamba+attention mixers, `FalconH1LayerCache`, the `DecoderLayer`
 protocol stack) is exercised at minimal download cost. The architecture
 is identical in shape across 0.5B / 1.5B / 3B / 7B.
 
+**Known gaps.** Only raw bf16 / f16 FalconH1 checkpoints are supported
+today — quantized (`-4bit` / `-8bit`) variants are rejected with a
+clear error (the µP scaling interacts with packed-weight dequant in a
+way that needs dedicated handling). `mamba_rms_norm=true` checkpoints
+(gated mixer RMSNorm) and `mamba_n_groups > 1` are likewise rejected;
+the shipped 90M / 0.5B / 1.5B all use `mamba_rms_norm=false` +
+`n_groups=1`. mlx-community checkpoints ship *pre-sanitized* (the
+scalar multipliers are already folded into the saved weights); the
+loader detects this via a conv1d-weight-shape probe and skips
+re-folding to avoid double-applying the multipliers.
+
 ### NemotronH
 
 | Repo | Size | Quant | Notes |
@@ -357,17 +376,6 @@ Mamba 2 `ssm_step` kernel cannot express Mamba 1's per-`(channel,
 state)` decay — which makes every Jamba mamba layer commit the command
 buffer mid-decode.
 
-**Known gaps.** Only raw bf16 / f16 FalconH1 checkpoints are supported
-today — quantized (`-4bit` / `-8bit`) variants are rejected with a
-clear error (the µP scaling interacts with packed-weight dequant in a
-way that needs dedicated handling). `mamba_rms_norm=true` checkpoints
-(gated mixer RMSNorm) and `mamba_n_groups > 1` are likewise rejected;
-the shipped 90M / 0.5B / 1.5B all use `mamba_rms_norm=false` +
-`n_groups=1`. mlx-community checkpoints ship *pre-sanitized* (the
-scalar multipliers are already folded into the saved weights); the
-loader detects this via a conv1d-weight-shape probe and skips
-re-folding to avoid double-applying the multipliers.
-
 ### Nemotron-Labs-Diffusion
 
 | Repo | Size | Quant | Notes |
@@ -417,25 +425,25 @@ variant. If the architecture isn't in the registry yet, you get a
 
 | Item | Status |
 |---|---|
-| Multi-modal (vision, audio) | Capability infrastructure in place from Phase 2; first real exercise lands in Phase 6 (Qwen 2.5/3.5-VL). |
-| Chat templates | Tokenizer's chat template is not auto-applied by `generate(...)` yet — pass the templated prompt yourself. Auto-apply lands alongside the first instruct-tuned VL model. |
-| Sampling | Greedy argmax only on the GPU path. Top-k / top-p / temperature exist as CPU helpers in `Sampling.swift`; GPU kernels for these land in Phase 5. |
-| Quantized KV cache | Raw fp16/bf16 only. Affine + AURA land in Phase 5 — see [kv-cache.md](kv-cache.md). |
-| Hybrid models | Qwen 3.5 (GDN + attention) and Mamba/Mamba 2 families need new SSM kernels; Phase 5. |
-| MoE | Qwen 3.5 MoE and similar need fused-expert kernels; Phase 5. |
-| MoE / vision-tied checkpoints | Detected as `unsupportedArchitecture` until their family files land. |
-| Prompt caching across requests | Not yet — the cache lives for one `generate(...)` call. Multi-turn cache reuse is straightforward via the lower-level API (see [quickstart.md § Lower-level API](quickstart.md#lower-level-api)). |
+| Multi-modal (vision, audio) | Capability infrastructure in place; the VLM wave is Phase 6.5, audio is Phase 7. No VL / audio family variants yet. |
+| Chat templates | The tokenizer's chat template is not auto-applied by `generate(...)` — pass the templated prompt yourself. Auto-apply lands with the first instruct-tuned VL model. |
+| GPU sampling filters | Greedy (argmax) and categorical (`temperature`) run fully on-GPU. `top-K` / `top-P` / `min-P` filters fall back to the CPU-sample path; GPU filter kernels are a follow-up. |
+| AURA performance | AURA KV schemes are correct and decode coherently, but still run the dequant-then-`sdpaDecode` path with a working-buffer mirror. Compressed-domain attention is the Phase 6.3 perf pass. |
+| Chunked prefill | Prefill walks the prompt one token per dispatch. Batched (chunked) prefill is Phase 6.6 — a large TTFT win on long prompts. |
+| Cross-request prompt caching | The KV cache lives for one `generate(...)` call. Prefix-cache reuse across requests is Phase 8.2. |
+| Quantized hybrid checkpoints | NemotronH / GraniteMoeHybrid / Jamba / FalconH1 load raw bf16/f16 only; quantized variants are rejected with a clear error. |
 
 ## Coming next
 
 Per [`planning/plan.md`](../planning/plan.md):
 
-- **Phase 5** — AURA KV cache + GDN + SSM. Unlocks Qwen 3.5
-  hybrid (GDN + attention), Qwen 3.5 MoE, NemotronH, Mamba families.
-- **Phase 6** — first multi-modal model: Qwen 2.5-VL or Qwen 3.5-VL,
-  exercising `Capability.visionIn` end-to-end.
-- **Phase 7** — autotuner over kernel parameters
-  (`tile_dims`, `threads`, `unroll`, `simd_matrix`, `async_copy`).
-- **Phase 8+** — audio, additional families (Mistral, Phi, Gemma,
-  GPT-OSS), gguf format support, dispatch-mode upgrades
-  (`.argumentBuffers`, `.icb`).
+- **Phase 6.1–6.4** — perf + infra: sliding-window SDPA fast path,
+  AURA MSL snapshot tests, AURA performance (compressed-domain
+  attention), injectable `Profile`.
+- **Phase 6.6** — chunked (batched) prefill: process the prompt N
+  tokens per dispatch instead of one — a large TTFT win.
+- **Phase 6.5** — Vision (VLM): Qwen 2.5/3.5-VL, Gemma 3/4-VL, plus
+  the `VisionEncoder` + `conv2d` / `patch_embed` / `rope_2d` kernels.
+- **Phase 7** — Audio: Whisper STT, Kokoro TTS, Qwen-Omni.
+- **Phase 8** — speculative decoding, prefix KV cache, batched /
+  continuous decode, and the serving wave (specs 013–043).
