@@ -1229,6 +1229,107 @@ public final class Qwen35GDNMixer: Module {
         }
         return result
     }
+
+    /// T-batched GDN mixer forward. Returns `[T, hidden]` flat. Requires
+    /// `FFAI_GDN_FUSED_PREP=1` (fused path) — the legacy path commits
+    /// mid-way for host gate-prep and can't compose into a single
+    /// in-flight `cmd` across the T-loop.
+    ///
+    /// Architecture:
+    ///   1. Five projections (in_proj_qkv / z / b / a / out) all fan
+    ///      `T·gemv → 1·gemm` via `AnyLinear.callMany`.
+    ///   2. Per-token: conv1d step + silu + cast-to-f32 + fused
+    ///      `gatedDeltaPrepStep` + `gatedMixerNorm` write per-row into a
+    ///      `[T, value_dim]` assembly buffer. The recurrence STAYS
+    ///      per-token — GDN state crosses tokens, so each step depends
+    ///      on the previous step's state out. Scratch tensors are
+    ///      reused across iters; Metal serialises dispatches in
+    ///      submission order inside the single `cmd`, so the
+    ///      write-then-read pattern stays correct.
+    ///   3. `outProj.callMany` on the assembled `[T, value_dim]` →
+    ///      `[T, hidden]`.
+    ///
+    /// Wins delivered: 5 batched projections × 30 GDN layers × (T-1)
+    /// gemv launches saved at prefill. The recurrence cost is unchanged
+    /// (a future `Ops.gatedDeltaChunk` rewrite of the recurrence T-loop
+    /// folds that into one kernel; `gatedDeltaChunk` is already emitted
+    /// and tested in metaltile-ffai PR #115).
+    ///
+    /// All work queued on `cmd`; no commit inside. Mirrors the fused
+    /// single-token path's cmd ownership.
+    func forwardMany(_ xNormFlat: Tensor, t: Int,
+                     cache: Qwen35GDNLayerCache,
+                     cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        precondition(fused,
+                     "Qwen35GDNMixer.forwardMany: requires FFAI_GDN_FUSED_PREP=1; legacy host-prep path can't run on a single in-flight cmd. Set the env or fall back to a per-token loop in the caller.")
+        precondition(t > 0, "Qwen35GDNMixer.forwardMany: T must be positive")
+        precondition(xNormFlat.elementCount == t * hidden,
+                     "Qwen35GDNMixer.forwardMany: xNormFlat size \(xNormFlat.elementCount) ≠ T·hidden = \(t * hidden)")
+
+        let dt = xNormFlat.dtype
+        let dtBytes = dt.byteSize
+
+        // ── Projections — five gemms, T-batched ──────────────────────────
+        let qkvAll = inProjQKV.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let zAll = inProjZ.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
+
+        // ── Per-token recurrence — scratches reused, T-loop on `cmd`. ────
+        let yGatedAll = Tensor.empty(shape: [t * valueDim], dtype: dt, device: device)
+        for r in 0..<t {
+            let qkvRow = Tensor(buffer: qkvAll.buffer,
+                                offset: qkvAll.offset + r * convDim * dtBytes,
+                                shape: [convDim], dtype: dt)
+            let zRow = Tensor(buffer: zAll.buffer,
+                              offset: zAll.offset + r * valueDim * dtBytes,
+                              shape: [valueDim], dtype: dt)
+            let bRawRow = Tensor(buffer: bRawAll.buffer,
+                                 offset: bRawAll.offset + r * numValueHeads * dtBytes,
+                                 shape: [numValueHeads], dtype: dt)
+            let aRawRow = Tensor(buffer: aRawAll.buffer,
+                                 offset: aRawAll.offset + r * numValueHeads * dtBytes,
+                                 shape: [numValueHeads], dtype: dt)
+
+            Ops.conv1dCausalStep(
+                x: qkvRow, w: convW, b: convB,
+                state: cache.conv.state, into: convOutScratch,
+                nChannels: convDim, kernelSize: convKernel, on: cmd)
+            let convActRow = Ops.silu(convOutScratch, on: cmd)
+
+            // Cast bf16 activations to fp32 for the fused step / state.
+            Ops.castToF32(convActRow, into: convActF32Scratch, on: cmd)
+            Ops.castToF32(aRawRow, into: aRawF32Scratch, on: cmd)
+            Ops.castToF32(bRawRow, into: bRawF32Scratch, on: cmd)
+
+            Ops.gatedDeltaPrepStep(
+                convOut: convActF32Scratch,
+                aLog: aLogTF32, dtBias: dtBiasTF32,
+                aRaw: aRawF32Scratch, bRaw: bRawF32Scratch,
+                qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+                stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+                y: yF32Scratch,
+                batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+                hv: numValueHeads, hk: numKeyHeads,
+                on: cmd)
+            cache.gdn.swap()
+            cache.advance()
+
+            let yGatedRow = Tensor(buffer: yGatedAll.buffer,
+                                   offset: yGatedAll.offset + r * valueDim * dtBytes,
+                                   shape: [valueDim], dtype: dt)
+            Ops.gatedMixerNorm(
+                y: yF32Scratch, z: zRow, weight: mixerNorm.weight,
+                epsBuf: epsBufFused,
+                into: yGatedRow,
+                numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
+                on: cmd)
+        }
+
+        // ── Batched output projection ────────────────────────────────────
+        let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
+        return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
+    }
 }
 
 // ─── Qwen35AttentionMixer — gated multi-head attention ───────────────
@@ -1512,6 +1613,83 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         return qwen35ApplyFFN(ffn, postMix: postMix, postNorm: postNorm,
                               position: position, cmd: ffnCmd,
                               commitCmd: true, device: device)
+    }
+
+    /// T-batched layer forward for batched prefill. Mirrors the attention
+    /// layer's `decodeMany`: pre-norm + batched mixer + residual add + FFN
+    /// per-row loop. Requires `mixer.fused == true` — the legacy host-
+    /// prep GDN path commits mid-mixer and can't compose on a single
+    /// in-flight `cmd`.
+    ///
+    /// Command-buffer ownership matches single-token `decode` for the
+    /// fused branch: mixer leaves `cmd` in-flight; residual add stays on
+    /// `cmd`; FFN per-row loop commits the per-row MoE buffers and
+    /// rotates `workCmd`. `commitsCommandBuffer = true` always (the GDN
+    /// layer's contract — MoE FFN commits inside, dense FFN ends with a
+    /// fresh fully-committed addCmd).
+    public func decodeMany(_ hFlat: Tensor, t: Int, startPosition: Int,
+                           cache: any LayerCacheProtocol,
+                           cmd: MTLCommandBuffer, device: Device) -> Tensor {
+        guard let gc = cache as? Qwen35GDNLayerCache else {
+            fatalError("Qwen35GDNLayer.decodeMany: expected Qwen35GDNLayerCache, "
+                       + "got \(type(of: cache))")
+        }
+        precondition(mixer.fused,
+                     "Qwen35GDNLayer.decodeMany: requires FFAI_GDN_FUSED_PREP=1; legacy GDN path commits cmd mid-way and can't compose into a single in-flight cmd across the T-loop.")
+        precondition(t > 0, "Qwen35GDNLayer.decodeMany: T must be positive")
+        precondition(hFlat.elementCount == t * hidden,
+                     "Qwen35GDNLayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)")
+
+        let dt = hFlat.dtype
+        let dtBytes = dt.byteSize
+
+        // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
+        let xNormFlat = Ops.rmsNormRows(
+            hFlat, weight: inputNorm.weight, eps: inputNorm.eps,
+            nRows: t, rowSize: hidden, on: cmd)
+
+        // ── Batched GDN mixer ───────────────────────────────────────────
+        let mixerOutFlat = mixer.forwardMany(
+            xNormFlat, t: t, cache: gc, cmd: cmd, device: device
+        ).reshaped(to: [t * hidden])
+
+        // ── Residual add ────────────────────────────────────────────────
+        let postMix = Ops.add(hFlat, mixerOutFlat, on: cmd)
+
+        // ── FFN half — per-row loop with the residual add writing
+        // directly into `outFlat[r]` via `Ops.add(into:)`. Same pattern
+        // as `Qwen35AttentionLayer.decodeMany`'s FFN-per-row branch.
+        let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
+        var workCmd = cmd
+        for r in 0..<t {
+            let postMixRow = Tensor(buffer: postMix.buffer,
+                                    offset: postMix.offset + r * hidden * dtBytes,
+                                    shape: [hidden], dtype: dt)
+            let outRow = Tensor(buffer: outFlat.buffer,
+                                offset: outFlat.offset + r * hidden * dtBytes,
+                                shape: [hidden], dtype: dt)
+            let ffnNorm = postNorm(postMixRow, on: workCmd)
+            switch ffn {
+            case .dense(let mlp):
+                let ffnOut = mlp.forward(ffnNorm, cmd: workCmd)
+                _ = Ops.add(postMixRow, ffnOut, on: workCmd, into: outRow)
+            case .moe(let moe):
+                let ffnOut = moe.forward(ffnNorm, position: startPosition + r,
+                                         cmd: workCmd, device: device)
+                let addCmd = device.makeCommandBuffer()
+                _ = Ops.add(postMixRow, ffnOut, on: addCmd, into: outRow)
+                addCmd.commit()
+                workCmd = device.makeCommandBuffer()
+            }
+        }
+        // For the dense FFN tail, workCmd holds the last row's writes
+        // uncommitted. The GDN layer's `commitsCommandBuffer = true`
+        // contract means the caller's model-level loop will refresh
+        // workCmd anyway; we commit here so outFlat is resident for
+        // that refresh's reads. (Mirrors the dense-path commit inside
+        // `qwen35ApplyFFN` when `commitCmd: true`.)
+        if case .dense = ffn { workCmd.commit() }
+        return outFlat
     }
 }
 
@@ -1989,8 +2167,15 @@ public final class Qwen35Model: LanguageModel {
                 if attn.commitsCommandBuffer {
                     workCmd = device.makeCommandBuffer()
                 }
+            } else if let gdn = layer as? Qwen35GDNLayer, gdn.mixer.fused {
+                h = gdn.decodeMany(h, t: t, startPosition: startPosition,
+                                   cache: caches[i],
+                                   cmd: workCmd, device: device)
+                // GDN's commitsCommandBuffer is always true; refresh.
+                workCmd = device.makeCommandBuffer()
             } else {
-                // GDN (or other) layer — per-token loop with blit-back.
+                // GDN (legacy non-fused) or other — per-token loop with
+                // blit-back.
                 // Each layer.decode is the existing single-token path;
                 // we slice `h[r]` as input, get a fresh result tensor
                 // back, and blit it into `h[r]`. All T blits queue onto
