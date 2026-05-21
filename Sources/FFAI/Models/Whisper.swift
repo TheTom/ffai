@@ -190,12 +190,18 @@ public final class WhisperModel: @unchecked Sendable {
     /// to. The waveform is resampled / framed by `AudioPreprocessing`.
     public func encodeAudio(waveform: [Float], device: Device = .shared)
         -> Tensor {
+        // The mel_spectrogram kernel only emits f32 / f16; a bf16 model
+        // gets the front-end run in f32, then the spectrogram cast to
+        // the model's activation dtype before the conv stem.
+        let melDtype: DType = dtype == .f16 ? .f16 : .f32
         let cmd = device.makeCommandBuffer()
-        let mel = AudioPreprocessing.logMelSpectrogram(
-            waveform: waveform, cfg: config.frontEnd, dtype: dtype,
+        let melRaw = AudioPreprocessing.logMelSpectrogram(
+            waveform: waveform, cfg: config.frontEnd, dtype: melDtype,
             device: device, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
+        let mel = AudioPreprocessing.castTensor(melRaw, to: dtype,
+                                                device: device)
         return encoder.encode(mel: mel, melFrameMajor: true, device: device)
     }
 
@@ -232,7 +238,9 @@ public final class WhisperModel: @unchecked Sendable {
                                    nRows: L, rowSize: H, on: cmdN)
         cmdN.commit()
         cmdN.waitUntilCompleted()
+        // gemv requires a 1D input — drop the leading singleton row.
         let lastHidden = normed.slicedRows(start: L - 1, count: 1)
+            .reshaped(to: [H])
 
         let cmdL = device.makeCommandBuffer()
         let logits = Ops.gemv(weight: tokenEmbedding, input: lastHidden,

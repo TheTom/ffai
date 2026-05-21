@@ -129,6 +129,36 @@ public enum AudioPreprocessing {
         return bank
     }
 
+    // ─── Sinusoidal position table ───────────────────────────────────
+
+    /// Build a `[length, dim]` sinusoidal position-embedding table —
+    /// the fixed (non-learned) positional encoding Whisper bakes into
+    /// its checkpoint as `embed_positions.weight` and Qwen-Omni's audio
+    /// encoder computes at runtime. `dim` must be even.
+    ///
+    /// Row `p`, even index `2i`: `sin(p / 10000^(2i/dim))`; odd index
+    /// `2i+1`: `cos(...)` — the original Transformer formulation, which
+    /// is also what Whisper / Qwen-Omni use for the audio encoder.
+    public static func sinusoidalPositions(length: Int, dim: Int)
+        -> [Float] {
+        precondition(dim % 2 == 0,
+                     "sinusoidalPositions: dim must be even, got \(dim)")
+        var table = [Float](repeating: 0, count: length * dim)
+        let half = dim / 2
+        // log-spaced inverse frequencies, matching Whisper's
+        // `log(10000) / (half - 1)` increment.
+        let logTimescale = log(10_000.0) / Double(max(half - 1, 1))
+        for p in 0..<length {
+            for i in 0..<half {
+                let invFreq = exp(-logTimescale * Double(i))
+                let angle = Double(p) * invFreq
+                table[p * dim + i] = Float(sin(angle))
+                table[p * dim + half + i] = Float(cos(angle))
+            }
+        }
+        return table
+    }
+
     // ─── Reflect padding ─────────────────────────────────────────────
 
     /// Reflect-pad a mono waveform by `pad` samples on each side — the
@@ -312,8 +342,24 @@ public enum AudioPreprocessing {
             nFrames: nFrames, on: cmd)
     }
 
+    /// Convert a tensor to a different storage dtype via a CPU
+    /// round-trip through `[Float]`. Returns `source` unchanged when the
+    /// dtype already matches. Used by the audio encoders to bridge the
+    /// f32-only `mel_spectrogram` kernel output to a bf16 model: the Mel
+    /// front-end runs in f32, then the spectrogram is cast to the
+    /// model's activation dtype before the conv stem.
+    static func castTensor(_ source: Tensor, to dtype: DType,
+                           device: Device = .shared) -> Tensor {
+        guard source.dtype != dtype else { return source }
+        let values = source.toFloatArray()
+        let out = Tensor.empty(shape: source.shape, dtype: dtype,
+                               device: device)
+        copyFloats(values, into: out)
+        return out
+    }
+
     /// Copy a `[Float]` array into a tensor, converting to the tensor's
-    /// dtype (f32 / f16). Small helper used by the upload paths above.
+    /// dtype (f32 / f16 / bf16). Small helper used by the upload paths.
     static func copyFloats(_ values: [Float], into t: Tensor) {
         precondition(values.count == t.elementCount,
                      "copyFloats: count mismatch \(values.count) vs \(t.elementCount)")

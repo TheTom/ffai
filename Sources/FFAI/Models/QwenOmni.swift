@@ -57,22 +57,49 @@ public struct QwenOmniAudioConfig: Sendable {
         self.textHidden = textHidden
     }
 
+    /// The `audio_config` block in a Qwen-Omni `config.json`. Qwen2.5-
+    /// Omni nests it under `thinker_config.audio_config`; some Qwen3-
+    /// Omni / mlx conversions hoist it to the top level. Returns the
+    /// `(audio_config, text_config)` pair, looking in both places.
+    static func locateConfigs(_ config: ModelConfig)
+        -> (audio: [String: Any], text: [String: Any]?)? {
+        // Top-level (hoisted) layout.
+        if let audio = config.nested("audio_config") {
+            return (audio, config.nested("text_config"))
+        }
+        // Qwen2.5-Omni nested-under-thinker layout.
+        if let thinker = config.nested("thinker_config"),
+           let audio = thinker["audio_config"] as? [String: Any] {
+            return (audio, thinker["text_config"] as? [String: Any])
+        }
+        return nil
+    }
+
     /// Build from a decoded `config.json`. Qwen-Omni nests the audio
     /// tower under `audio_config` (a Whisper-style block) and the text
-    /// backbone under `text_config` / `thinker_config`.
+    /// backbone under `text_config`, both inside `thinker_config` for
+    /// Qwen2.5-Omni.
     public static func from(_ config: ModelConfig) -> QwenOmniAudioConfig? {
-        guard let audio = config.nested("audio_config") else { return nil }
-        func ai(_ k: String) -> Int? { audio[k] as? Int }
-        guard let encHidden = ai("d_model"),
-              let encLayers = ai("encoder_layers"),
+        guard let located = locateConfigs(config) else { return nil }
+        let audio = located.audio
+        func ai(_ k: String) -> Int? {
+            if let v = audio[k] as? Int { return v }
+            if let v = audio[k] as? Double { return Int(v) }
+            return nil
+        }
+        guard let encHidden = ai("d_model") else { return nil }
+        // Whisper-style configs name the layer count `encoder_layers`;
+        // Qwen-Omni's audio block also carries `num_hidden_layers`.
+        guard let encLayers = ai("encoder_layers") ?? ai("num_hidden_layers"),
               let encHeads = ai("encoder_attention_heads") else { return nil }
         let nMels = ai("num_mel_bins") ?? 128
         let encInter = ai("encoder_ffn_dim") ?? (4 * encHidden)
         let maxAud = ai("max_source_positions") ?? 1500
-        // The text hidden dim — try the nested text config, fall back
-        // to the top-level hidden_size.
-        let textHidden = (config.nested("text_config")?["hidden_size"] as? Int)
-            ?? (config.nested("thinker_config")?["hidden_size"] as? Int)
+        // The text hidden dim — the audio features project into it.
+        // `output_dim` on the audio block is the projection target;
+        // fall back to the text config's hidden_size.
+        let textHidden = ai("output_dim")
+            ?? (located.text?["hidden_size"] as? Int)
             ?? config.hiddenSize
             ?? encHidden
         return QwenOmniAudioConfig(
@@ -135,12 +162,18 @@ public final class QwenOmniModel: @unchecked Sendable {
     /// caller splices into a Qwen3 prompt's embedding stream.
     public func encodeAudio(waveform: [Float], device: Device = .shared)
         -> Tensor {
+        // The mel_spectrogram kernel only emits f32 / f16; a bf16 model
+        // gets the front-end run in f32, then the spectrogram cast to
+        // the model's activation dtype before the conv stem.
+        let melDtype: DType = dtype == .f16 ? .f16 : .f32
         let cmd = device.makeCommandBuffer()
-        let mel = AudioPreprocessing.logMelSpectrogram(
-            waveform: waveform, cfg: config.frontEnd, dtype: dtype,
+        let melRaw = AudioPreprocessing.logMelSpectrogram(
+            waveform: waveform, cfg: config.frontEnd, dtype: melDtype,
             device: device, on: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
+        let mel = AudioPreprocessing.castTensor(melRaw, to: dtype,
+                                                device: device)
 
         // Run the Whisper-style encoder over the log-Mel.
         var features = audioEncoder.encode(mel: mel, melFrameMajor: true,
@@ -184,8 +217,9 @@ extension QwenOmniModel {
         if let arch = config.architecture, architectures.contains(arch) {
             return true
         }
-        // Fall back to structural detection — an `audio_config` block.
-        return config.has("audio_config")
+        // Fall back to structural detection — an `audio_config` block,
+        // top-level or nested under `thinker_config`.
+        return QwenOmniAudioConfig.locateConfigs(config) != nil
     }
 
     /// Load the QwenOmni audio path from a resolved snapshot directory.
@@ -253,13 +287,30 @@ extension QwenOmniModel {
             intermediate: qc.encoderIntermediate, nLayers: qc.encoderLayers,
             nHeads: qc.encoderHeads, maxAudioCtx: qc.maxAudioCtx,
             layerNormEps: 1e-5)
+
+        // Qwen-Omni's audio encoder uses a fixed sinusoidal position
+        // encoding computed at runtime — unlike Whisper it does NOT
+        // store `embed_positions.weight` in the checkpoint. Synthesize
+        // the table when the weight is absent.
+        let posEmbedding: Tensor
+        if bundle.has(prefix + "embed_positions.weight") {
+            posEmbedding = try t("embed_positions.weight")
+        } else {
+            let table = AudioPreprocessing.sinusoidalPositions(
+                length: qc.maxAudioCtx, dim: qc.encoderHidden)
+            let pe = Tensor.empty(shape: [qc.maxAudioCtx, qc.encoderHidden],
+                                  dtype: dtype)
+            AudioPreprocessing.copyFloats(table, into: pe)
+            posEmbedding = pe
+        }
+
         let encoder = AudioEncoder(
             config: encoderConfig,
             conv1Weight: try t("conv1.weight"),
             conv1Bias: try t("conv1.bias"),
             conv2Weight: try t("conv2.weight"),
             conv2Bias: try t("conv2.bias"),
-            positionEmbedding: try t("embed_positions.weight"),
+            positionEmbedding: posEmbedding,
             layers: encLayers,
             postLayerNorm: try ln("ln_post"),
             dtype: dtype)

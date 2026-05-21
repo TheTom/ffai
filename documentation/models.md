@@ -39,6 +39,28 @@ For porting a new architecture, see
 | **Gemma 4** | [`Models/Gemma4.swift`](../Sources/FFAI/Models/Gemma4.swift) | `gemma4`, `gemma4_text` | `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration` | `Gemma4Dense`, `Gemma4E`, `Gemma4MoE` |
 | **GPT-OSS** | [`Models/GPTOSS.swift`](../Sources/FFAI/Models/GPTOSS.swift) | `gpt_oss` | `GptOssForCausalLM` | `GPTOSSMoEVariant` |
 
+### Audio families (Phase 7)
+
+The audio families do **not** route through `ModelRegistry` /
+`LanguageModel` — those describe a pure text-in / text-out causal
+decoder. An STT model is audio-in / text-out, a TTS model is text-in /
+audio-out. They load through [`AudioModelRegistry`](../Sources/FFAI/AudioModelRegistry.swift)
+instead, which inspects `config.json`, picks the family, and reports
+the audio `Capability` set.
+
+| Family | File | `model_type` | Capability | Notes |
+|---|---|---|---|---|
+| **Whisper** | [`Models/Whisper.swift`](../Sources/FFAI/Models/Whisper.swift) | `whisper` | `speechToText` | STT, tiny → large-v3 (one variant). `AudioEncoder` + a causal text decoder cross-attending to the audio features. |
+| **Kokoro** | [`Models/Kokoro.swift`](../Sources/FFAI/Models/Kokoro.swift) | `kokoro` | `textToSpeech` | TTS. Ships the GPU iSTFTNet vocoder tail (`Ops.vocoderISTFT`); the StyleTTS2 acoustic front-end is a later port. |
+| **Qwen-Omni** | [`Models/QwenOmni.swift`](../Sources/FFAI/Models/QwenOmni.swift) | `qwen2_5_omni`, `qwen3_omni` | `omniAudio` | Audio-in path: a Whisper-style encoder projecting into the text backbone hidden dim. Vision path is the Qwen-VL port. |
+
+All three share the [`AudioEncoder`](../Sources/FFAI/AudioEncoder.swift)
+module (a Whisper-style conv stem + bidirectional transformer) and the
+[`AudioPreprocessing`](../Sources/FFAI/AudioPreprocessing.swift)
+front-end (log-Mel STFT framing). The three FFAI audio kernels —
+`mel_spectrogram`, `audio_conv1d`, `vocoder_istft` — are wrapped by
+`Ops.melSpectrogram` / `Ops.audioConv1d` / `Ops.vocoderISTFT`.
+
 **GPT-OSS** is OpenAI's GPT-OSS-20B — a 24-layer mixture-of-experts
 transformer (~20B total / ~3.6B active params). Three structural
 features distinguish it from the dense families: (1) an **alternating
@@ -389,6 +411,23 @@ and linear self-speculation on the 3B checkpoint. The `-Base` repos and
 the `-VLM-8B` vision variant are untested. Self-speculation reports a
 forward-pass count (NFE) on `DiffusionResult` — the diffusion
 efficiency metric.
+
+### Audio (Phase 7)
+
+| Repo | Family | Notes |
+|---|---|---|
+| `openai/whisper-tiny` | Whisper STT | Integration-test baseline — encoder + cross-attending decoder. |
+| `hexgrad/Kokoro-82M` | Kokoro TTS | Integration-test baseline — the iSTFTNet vocoder tail. |
+| `Qwen/Qwen2.5-Omni-3B` | Qwen-Omni | Integration-test baseline — the audio-in encoder path. |
+
+The Whisper integration test verifies the audio encoder produces
+finite features, the decoder emits a non-degenerate logit distribution
+cross-attending to the audio, and greedy decode runs. The Kokoro test
+verifies the vocoder synthesizes a non-degenerate (finite, non-silent)
+waveform from a predicted spectrogram. The Qwen-Omni test verifies the
+audio tower encodes a waveform into feature tokens in the text-backbone
+hidden dim. Each suite prints a skip and passes when its checkpoint
+cannot be fetched.
 
 ## Quantization
 
