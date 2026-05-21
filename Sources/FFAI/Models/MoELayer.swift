@@ -431,6 +431,15 @@ public final class MoELayer: Module, DecoderLayer {
         let dtype = stacked.dtype
         let useBm8 = topK <= 8
             && ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_BM8"] != nil
+        // `FFAI_MOE_M1=1` routes the gather through the scalar m1
+        // kernel `mt_moe_gather_qmm_int4` — no MPP / cooperative-tensor
+        // overhead. At decode T=1 the cooperative-tensor variants
+        // (bm8 / bm16 / bm64) lose ~15 % to descriptor setup cost; the
+        // m1 path does a one-output-cell-per-TG dot-product with
+        // `simd_sum` reduction and is closer in shape to the production
+        // per-expert dequant_gemv path.
+        let useM1 = !useBm8
+            && ProcessInfo.processInfo.environment["FFAI_MOE_M1"] != nil
 
         // ── Sort topK by expert id ascending (kernel contract) ──
         // Track the original slot so we can apply the right combine
@@ -454,34 +463,87 @@ public final class MoELayer: Module, DecoderLayer {
         let indices = Tensor.empty(shape: [topK], dtype: .u32, device: device)
         indices.copyIn(from: sortedExperts)
 
+        // For the m1 path we also need CSR `expert_offsets`. Build on
+        // host (cheap: nExperts ≤ 256). `expert_offsets[e]` = first row
+        // assigned to expert e (or t_rows if expert e is unselected).
+        // The kernel does a linear walk over this on each lane.
+        var expertOffsetsT: Tensor? = nil
+        if useM1 {
+            let nExperts = stacked.numExperts
+            var csrHost = [UInt32](repeating: UInt32(topK), count: nExperts + 1)
+            var firstRowForExpert = [Int](repeating: topK, count: nExperts)
+            for (row, e) in sortedExperts.enumerated() {
+                let ei = Int(e)
+                if firstRowForExpert[ei] == topK { firstRowForExpert[ei] = row }
+            }
+            var minOffset = topK
+            for e in (0...nExperts).reversed() {
+                if e < nExperts && firstRowForExpert[e] < minOffset {
+                    minOffset = firstRowForExpert[e]
+                }
+                csrHost[e] = UInt32(minOffset)
+            }
+            let offsetsT = Tensor.empty(shape: [nExperts + 1], dtype: .u32, device: device)
+            offsetsT.copyIn(from: csrHost)
+            expertOffsetsT = offsetsT
+        }
+
         // ── Gate / up projections: [topK, moeIntermediate] ──
         let gateOut = Tensor.empty(shape: [topK, moeIntermediate], dtype: dtype, device: device)
         let upOut = Tensor.empty(shape: [topK, moeIntermediate], dtype: dtype, device: device)
-        let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
-        bgemm(
-            xGathered,
-            stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
-            indices,
-            topK, moeIntermediate, hidden,
-            groupSize, cmd, gateOut)
-        bgemm(
-            xGathered,
-            stacked.upWeight, stacked.upScales, stacked.upBiases,
-            indices,
-            topK, moeIntermediate, hidden,
-            groupSize, cmd, upOut)
 
-        // ── SwiGLU activation: silu(gate) * up, in place on [topK, M] ──
-        let inner = Ops.mul(Ops.silu(gateOut, on: cmd), upOut, on: cmd)
+        if let offsetsT = expertOffsetsT {
+            let nExperts = stacked.numExperts
+            Ops.moeGatherDequantGemmInt4M1(
+                xGathered,
+                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+                offsetsT,
+                topK, moeIntermediate, hidden,
+                nExperts, groupSize, cmd, gateOut)
+            Ops.moeGatherDequantGemmInt4M1(
+                xGathered,
+                stacked.upWeight, stacked.upScales, stacked.upBiases,
+                offsetsT,
+                topK, moeIntermediate, hidden,
+                nExperts, groupSize, cmd, upOut)
+        } else {
+            let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
+            bgemm(
+                xGathered,
+                stacked.gateWeight, stacked.gateScales, stacked.gateBiases,
+                indices,
+                topK, moeIntermediate, hidden,
+                groupSize, cmd, gateOut)
+            bgemm(
+                xGathered,
+                stacked.upWeight, stacked.upScales, stacked.upBiases,
+                indices,
+                topK, moeIntermediate, hidden,
+                groupSize, cmd, upOut)
+        }
+
+        // ── SwiGLU activation: silu(gate) * up — fused into one dispatch ──
+        let inner = Ops.swiglu(gate: gateOut, up: upOut, on: cmd)
 
         // ── Down projection: [topK, hidden] ──
         let downOut = Tensor.empty(shape: [topK, hidden], dtype: dtype, device: device)
-        bgemm(
-            inner,
-            stacked.downWeight, stacked.downScales, stacked.downBiases,
-            indices,
-            topK, hidden, moeIntermediate,
-            groupSize, cmd, downOut)
+        if let offsetsT = expertOffsetsT {
+            let nExperts = stacked.numExperts
+            Ops.moeGatherDequantGemmInt4M1(
+                inner,
+                stacked.downWeight, stacked.downScales, stacked.downBiases,
+                offsetsT,
+                topK, hidden, moeIntermediate,
+                nExperts, groupSize, cmd, downOut)
+        } else {
+            let bgemm = useBm8 ? Ops.moeGatherDequantGemmInt4Bm8 : Ops.moeGatherDequantGemmInt4
+            bgemm(
+                inner,
+                stacked.downWeight, stacked.downScales, stacked.downBiases,
+                indices,
+                topK, hidden, moeIntermediate,
+                groupSize, cmd, downOut)
+        }
 
         // ── Weighted scatter-sum back to a single [hidden] vector ──
         // For each routed slot, scale the corresponding row of downOut

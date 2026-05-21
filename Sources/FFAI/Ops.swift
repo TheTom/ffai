@@ -3267,4 +3267,86 @@ public enum Ops {
         }
         return result
     }
+
+    // ─── MoE gather quantised matmul, scalar m1 ────────────────────────
+    //
+    // Wraps `mt_moe_gather_qmm_int4_{f32,f16,bf16}`. One TG per
+    // (output column m, input row t). Each TG resolves the row's
+    // expert via the CSR `expert_offsets` and computes one scalar
+    // dot-product with `simd_sum` reduction. No cooperative-tensor
+    // (MPP) overhead — at decode T=1 the cooperative variants
+    // (bm8 / bm16 / bm64) regress because the descriptor + tensor
+    // setup dominates the tiny compute. This kernel skips that
+    // overhead and walks K with the same per-lane stride pattern as
+    // `mt_dequant_gemv_int4`.
+    //
+    // Inputs:
+    //   x              [T_rows, k_in]                 T  — sorted by expert (caller responsibility)
+    //   weight         [n_experts, m_out, k_in/8]     u32 (int4 packed)
+    //   scales         [n_experts, m_out, k_in/group] T
+    //   biases         [n_experts, m_out, k_in/group] T
+    //   expertOffsets  [n_experts + 1]                u32 — CSR row offsets
+    //   out            [T_rows, m_out]                T
+    //
+    // Constexpr: k_in, m_out, n_experts, group_size.
+    public static func moeGatherDequantGemmInt4M1(
+        _ x: Tensor, _ weight: Tensor, _ scales: Tensor, _ biases: Tensor,
+        _ expertOffsets: Tensor,
+        _ tRows: Int, _ mOut: Int, _ kIn: Int,
+        _ nExperts: Int, _ groupSize: Int,
+        _ cmd: MTLCommandBuffer, _ out: Tensor
+    ) {
+        precondition(weight.dtype == .u32, "moeGatherDequantGemmInt4M1: weight must be u32 packed")
+        precondition(expertOffsets.dtype == .u32, "moeGatherDequantGemmInt4M1: expertOffsets must be u32")
+        precondition(scales.dtype == x.dtype && biases.dtype == x.dtype && out.dtype == x.dtype,
+                     "moeGatherDequantGemmInt4M1: dtype mismatch")
+        precondition(kIn.isMultiple(of: 32), "moeGatherDequantGemmInt4M1: k_in must be multiple of 32")
+        precondition(kIn.isMultiple(of: groupSize), "moeGatherDequantGemmInt4M1: group_size must divide k_in")
+        precondition(expertOffsets.elementCount == nExperts + 1,
+                     "moeGatherDequantGemmInt4M1: expertOffsets must have n_experts+1 entries")
+        // Swift binding uses dispatchThreads — total-thread semantics.
+        // Kernel wants ONE TG per (output col m, input row t). With TG
+        // width 32, grid.x = mOut * 32 gives mOut threadgroups in x; the
+        // y axis maps one TG per row.
+        let grid = MTLSize(width: mOut * 32, height: tRows, depth: 1)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let kInU = UInt32(kIn)
+        let mOutU = UInt32(mOut)
+        let nExpertsU = UInt32(nExperts)
+        let groupSizeU = UInt32(groupSize)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_gather_qmm_int4_f32(
+                x: x.buffer, xOffset: x.offset,
+                weight_packed: weight.buffer, weight_packedOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                expert_offsets: expertOffsets.buffer, expert_offsetsOffset: expertOffsets.offset,
+                out: out.buffer, outOffset: out.offset,
+                k_in: kInU, m_out: mOutU, n_experts: nExpertsU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_gather_qmm_int4_f16(
+                x: x.buffer, xOffset: x.offset,
+                weight_packed: weight.buffer, weight_packedOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                expert_offsets: expertOffsets.buffer, expert_offsetsOffset: expertOffsets.offset,
+                out: out.buffer, outOffset: out.offset,
+                k_in: kInU, m_out: mOutU, n_experts: nExpertsU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_gather_qmm_int4_bf16(
+                x: x.buffer, xOffset: x.offset,
+                weight_packed: weight.buffer, weight_packedOffset: weight.offset,
+                scales: scales.buffer, scalesOffset: scales.offset,
+                biases: biases.buffer, biasesOffset: biases.offset,
+                expert_offsets: expertOffsets.buffer, expert_offsetsOffset: expertOffsets.offset,
+                out: out.buffer, outOffset: out.offset,
+                k_in: kInU, m_out: mOutU, n_experts: nExpertsU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeGatherDequantGemmInt4M1: unsupported dtype \(x.dtype)")
+        }
+    }
 }
