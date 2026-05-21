@@ -967,6 +967,13 @@ public final class Qwen35GDNMixer: Module {
     /// allocation per token.
     let epsBufFused: Tensor
 
+    /// `FFAI_GDN_FUSED_PREP=1` route through `mt_gated_delta_prep_step`
+    /// + `mt_gated_mixer_norm`. Cached at init so per-token env lookups
+    /// disappear and the GDN *layer* (not just the mixer) can branch on
+    /// it — when fused, the mixer keeps `cmd` in-flight so the residual
+    /// add + FFN chain onto the same command buffer.
+    let fused: Bool
+
     init(inProjQKV: AnyLinear, inProjZ: AnyLinear,
          inProjB: AnyLinear, inProjA: AnyLinear, outProj: AnyLinear,
          convW: Tensor, convB: Tensor, mixerNorm: RMSNorm,
@@ -1001,6 +1008,7 @@ public final class Qwen35GDNMixer: Module {
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
+        self.fused = ProcessInfo.processInfo.environment["FFAI_GDN_FUSED_PREP"] != nil
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -1064,7 +1072,6 @@ public final class Qwen35GDNMixer: Module {
         // kernel so the kernel runs fp32 against a bf16 model) is
         // tracked on the roadmap.
         let yT: Tensor
-        let fused = ProcessInfo.processInfo.environment["FFAI_GDN_FUSED_PREP"] != nil
         if fused {
             // GPU casts: bf16 activations → fp32 scratch, all on the
             // same command buffer as phase 1. No host round-trip; the
@@ -1186,7 +1193,14 @@ public final class Qwen35GDNMixer: Module {
                 numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
                 on: cmd)
             result = outProj(yGatedT, on: cmd)
-            cmd.commit()
+            // NOTE: no commit here. The fused path keeps `cmd` in-flight
+            // so `Qwen35GDNLayer.decode` can chain the residual add +
+            // FFN onto the same command buffer. The FFN (MoE branch)
+            // commits `cmd` itself when it needs the gate logits on the
+            // CPU; the dense branch commits at the end of
+            // `qwen35ApplyFFN`. Net effect for Qwen3.6-A3B: one commit
+            // per GDN layer instead of two (mixer + FFN), saving ~30
+            // commits per decode token.
         } else {
             let yHost = yT.toFloatArray()              // [value_dim] fp32
             let zHost = z.toFloatArray()               // [value_dim] activation
@@ -1364,12 +1378,14 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
         }
         // ── Mixer half — pre-norm + GDN mixer + residual add ──────────
         let xNorm = inputNorm(h, on: cmd)
-        // mixer.forward commits `cmd` and returns a resident tensor.
+        // In fused mode `mixer.forward` leaves `cmd` in-flight and the
+        // residual add + FFN ride the same command buffer. In legacy
+        // mode `mixer.forward` commits `cmd` (host needs to read
+        // intermediate buffers for the phase-2 norm loop) and the FFN
+        // runs on a fresh `ffnCmd`.
         let mixerOut = mixer.forward(xNorm, cache: gc, cmd: cmd, device: device)
 
-        // `h` was produced on the now-committed `cmd`; it is resident.
-        // The residual add + FFN run on a fresh command buffer.
-        let ffnCmd = device.makeCommandBuffer()
+        let ffnCmd = mixer.fused ? cmd : device.makeCommandBuffer()
         let postMix = Ops.add(h, mixerOut, on: ffnCmd)
         return qwen35ApplyFFN(ffn, postMix: postMix, postNorm: postNorm,
                               position: position, cmd: ffnCmd,
