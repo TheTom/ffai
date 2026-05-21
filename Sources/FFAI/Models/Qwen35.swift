@@ -1829,3 +1829,44 @@ private func sliceHeadHalves35(_ q2: Tensor, nHeads: Int, headDim: Int,
     let gathered = Ops.gather(table: table, tokenIds: idx, on: cmd)
     return gathered.reshaped(to: [nHeads * headDim])
 }
+
+/// T-batched variant of `sliceHeadHalves35`. Input `q2T` is
+/// `[T, nHeads, 2·headDim]` — each of T rows has its own
+/// `[nHeads, 2·headDim]` block. Returns `[T · nHeads · headDim]` flat
+/// (caller reshapes), gathered in ONE dispatch.
+///
+/// The single-token helper builds a per-row idx buffer + dispatches
+/// `Ops.gather`. The T-batched version builds one flat `[T · nHeads]`
+/// index buffer (each entry points into the flattened
+/// `[T · nHeads · 2, headDim]` table) and runs the same gather kernel
+/// once. Saves T launch boundaries vs the per-row loop and avoids the
+/// in-flight-cmd dependency-ordering problem the loop would surface.
+///
+/// Unblocks `Qwen35AttentionMixer.forwardMany` for the
+/// `attnOutputGate=true` path (every shipped Qwen3.6-A3B config).
+private func sliceHeadHalvesMany35(_ q2T: Tensor, t: Int,
+                                   nHeads: Int, headDim: Int,
+                                   takeFirst: Bool,
+                                   on cmd: MTLCommandBuffer,
+                                   device: Device) -> Tensor {
+    precondition(q2T.elementCount == t * nHeads * 2 * headDim,
+                 "sliceHeadHalvesMany35: q2T must be [T, nHeads, 2·headDim] (got elements=\(q2T.elementCount), expected \(t * nHeads * 2 * headDim))")
+    let table = q2T.reshaped(to: [t * nHeads * 2, headDim])
+    let nIdx = t * nHeads
+    var rows = [UInt32](repeating: 0, count: nIdx)
+    let half: UInt32 = takeFirst ? 0 : 1
+    for r in 0..<t {
+        let base = UInt32(r * 2 * nHeads)
+        let rowBase = r * nHeads
+        for h in 0..<nHeads {
+            rows[rowBase + h] = base + UInt32(2 * h) + half
+        }
+    }
+    let idxBuf = device.makeBuffer(length: nIdx * 4)
+    rows.withUnsafeBytes { _ = memcpy(idxBuf.contents(), $0.baseAddress!, nIdx * 4) }
+    let idx = Tensor(buffer: idxBuf, offset: 0, shape: [nIdx], dtype: .u32)
+    let gathered = Ops.gather(table: table, tokenIds: idx, on: cmd)
+    // gathered shape: [nIdx, headDim] = [T*nHeads, headDim], row-major.
+    // Flatten for caller convenience.
+    return gathered.reshaped(to: [nIdx * headDim])
+}
