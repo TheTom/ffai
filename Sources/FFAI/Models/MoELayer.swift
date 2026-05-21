@@ -391,8 +391,11 @@ public final class MoELayer: Module, DecoderLayer {
 
         // topK ≥ 1 so `accumulator` is always non-nil here.
         let result = accumulator!
+        // Commit without wait: `result` is on the in-flight `work`
+        // buffer; the caller's residual-add cmd will hazard-track the
+        // read against this write. Saves ~0.5-1 ms host-stall per
+        // MoE layer per token (Qwen3.6-A3B = 40 layers).
         work.commit()
-        work.waitUntilCompleted()
         return result
     }
 

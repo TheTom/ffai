@@ -1465,20 +1465,25 @@ private func qwen35ApplyFFN(_ ffn: Qwen35FFN, postMix: Tensor, postNorm: RMSNorm
         let ffnOut = mlp.forward(ffnNorm, cmd: cmd)
         let result = Ops.add(postMix, ffnOut, on: cmd)
         if commitCmd {
+            // NOTE: commit without waitUntilCompleted. The returned
+            // `result` tensor is on the in-flight cmd; the engine spins
+            // a fresh `workCmd` for the next layer and Metal's default
+            // hazard tracking serialises reads against the prior write.
+            // Pipelining up to maxCommandBufferCount buffers in flight
+            // recovers the per-layer host stall (~1-2 ms × 40 layers).
             cmd.commit()
-            cmd.waitUntilCompleted()
         }
         return result
     case .moe(let moe):
         // Qwen35MoEFFN.forward commits `cmd`; run the residual add on a
-        // fresh buffer so the returned tensor does not depend on a dead
-        // command buffer.
+        // fresh buffer. We commit without waiting: the residual add
+        // tensor is the layer's output; the next layer queues onto a
+        // fresh workCmd and Metal hazard-tracks the read.
         let ffnOut = moe.forward(ffnNorm, position: position,
                                  cmd: cmd, device: device)
         let addCmd = device.makeCommandBuffer()
         let result = Ops.add(postMix, ffnOut, on: addCmd)
         addCmd.commit()
-        addCmd.waitUntilCompleted()
         return result
     }
 }
