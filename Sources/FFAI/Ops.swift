@@ -3216,4 +3216,55 @@ public enum Ops {
             fatalError("Ops.dequantGemvIndirect: unsupported input dtype \(input.dtype)")
         }
     }
+
+    // ─── Fused SwiGLU ─────────────────────────────────────────────────
+    //
+    // Wraps `mt_swiglu_{f32,f16,bf16}`. Computes `out[i] = silu(gate[i]) * up[i]`
+    // in one element-wise dispatch — replaces the two-launch `silu` +
+    // `mul` chain (`Ops.silu(gate) → Ops.mul(_, up)`). Half the bandwidth
+    // on the activation tensor (the intermediate `silu(gate)` stays in
+    // registers) plus one fewer commit/encode round-trip per call.
+    //
+    // Used by FFAI's per-expert MoE SwiGLU + Qwen3 dense MLPs. fp32 path
+    // is the canonical reference; f16 / bf16 narrow on store, accumulate
+    // in fp32.
+    public static func swiglu(
+        gate: Tensor, up: Tensor, on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        precondition(gate.dtype == up.dtype,
+                     "Ops.swiglu: gate / up dtype mismatch")
+        precondition(gate.elementCount == up.elementCount,
+                     "Ops.swiglu: gate / up size mismatch")
+        let result = out ?? Tensor.empty(shape: gate.shape, dtype: gate.dtype)
+        precondition(result.dtype == gate.dtype && result.elementCount == gate.elementCount,
+                     "Ops.swiglu: out dtype / size mismatch")
+        let n = gate.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch gate.dtype {
+        case .f32:
+            MetalTileKernels.mt_swiglu_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                up: up.buffer, upOffset: up.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_swiglu_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                up: up.buffer, upOffset: up.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_swiglu_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                up: up.buffer, upOffset: up.offset,
+                out: result.buffer, outOffset: result.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.swiglu: unsupported dtype \(gate.dtype)")
+        }
+        return result
+    }
 }

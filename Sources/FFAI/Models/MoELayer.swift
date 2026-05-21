@@ -504,12 +504,19 @@ public final class MoELayer: Module, DecoderLayer {
     }
 
     /// One SwiGLU FFN: down(silu(gate(x)) * up(x)).
+    ///
+    /// `silu(gate) * up` runs as a single fused `mt_swiglu` dispatch
+    /// instead of two launches (silu → mul). Saves one elementwise
+    /// kernel + one full-tensor RMW per call. At Qwen3.6-A3B decode T=1
+    /// the per-expert intermediate is [moeIntermediate=768] so the win
+    /// is small per dispatch, but the loop runs 8 experts × ≤40 MoE
+    /// layers per token, so the per-token saving compounds.
     private func swiGLU(_ x: Tensor,
                         gateProj: AnyLinear, upProj: AnyLinear, downProj: AnyLinear,
                         on cmd: MTLCommandBuffer) -> Tensor {
         let g = gateProj(x, on: cmd)
         let u = upProj(x, on: cmd)
-        let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
+        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj(inner, on: cmd)
     }
 }
