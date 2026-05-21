@@ -322,6 +322,16 @@ public final class MoELayer: Module, DecoderLayer {
     }
     public let stackedInt4Experts: StackedInt4Experts?
 
+    /// Env-flag cache — read once at init so the decode loop doesn't
+    /// pay 3 × `ProcessInfo.processInfo.environment[...]` dictionary
+    /// lookups per MoE layer per token. At Qwen3.6-A3B that's 120
+    /// lookups / token saved (40 layers × 3 envs). Each lookup is
+    /// ~100 ns on Foundation, so the total is sub-noise (~12 µs / token)
+    /// — shipped for cleanliness more than the µbench delta.
+    public let enableBGEMM: Bool
+    public let useBm8Env: Bool
+    public let useM1Env: Bool
+
     /// - gate: hidden → nExperts router projection.
     /// - gateProj/upProj/downProj: `nExperts`-long arrays of per-expert
     ///   SwiGLU projections, index-aligned with the expert id.
@@ -366,6 +376,10 @@ public final class MoELayer: Module, DecoderLayer {
                          "MoELayer: stackedInt4Experts shape (moeIntermediate=\(s.moeIntermediate), hidden=\(hidden)) violates bm16 N%32 / K%32 tile contract")
         }
         self.stackedInt4Experts = stackedInt4Experts
+        let env = ProcessInfo.processInfo.environment
+        self.enableBGEMM = env["FFAI_MOE_BGEMM"] != nil
+        self.useBm8Env = env["FFAI_MOE_BGEMM_BM8"] != nil
+        self.useM1Env = env["FFAI_MOE_M1"] != nil
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -435,7 +449,6 @@ public final class MoELayer: Module, DecoderLayer {
         // the m_total<16 regression is closed (likely via either a
         // dedicated bm8 kernel emit or by promoting prefill to use
         // this path first).
-        let enableBGEMM = ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM"] != nil
         if let stacked = stackedInt4Experts, stacked.dtype == h.dtype, enableBGEMM {
             // Fast path: one batched gather BGEMM per projection. The
             // kernel expects rows of activations sorted by expert id; we
@@ -508,8 +521,7 @@ public final class MoELayer: Module, DecoderLayer {
         let moeIntermediate = stacked.moeIntermediate
         let groupSize = stacked.groupSize
         let dtype = stacked.dtype
-        let useBm8 = topK <= 8
-            && ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_BM8"] != nil
+        let useBm8 = topK <= 8 && useBm8Env
         // `FFAI_MOE_M1=1` routes the gather through the scalar m1
         // kernel `mt_moe_gather_qmm_int4` — no MPP / cooperative-tensor
         // overhead. At decode T=1 the cooperative-tensor variants
@@ -517,8 +529,7 @@ public final class MoELayer: Module, DecoderLayer {
         // m1 path does a one-output-cell-per-TG dot-product with
         // `simd_sum` reduction and is closer in shape to the production
         // per-expert dequant_gemv path.
-        let useM1 = !useBm8
-            && ProcessInfo.processInfo.environment["FFAI_MOE_M1"] != nil
+        let useM1 = !useBm8 && useM1Env
 
         // ── Sort topK by expert id ascending (kernel contract) ──
         // Track the original slot so we can apply the right combine
