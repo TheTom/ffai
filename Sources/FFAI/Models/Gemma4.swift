@@ -485,12 +485,15 @@ enum Gemma4Loader {
         let lmHead: AnyLinear
         if !p.tieEmbed, weights.has("lm_head.weight") {
             lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
-        } else if let q = quant, [3, 4, 5, 6, 8].contains(q.bits),
-                  weights.isQuantized("\(prefix)embed_tokens") {
+        } else if let q = quant, weights.isQuantized("\(prefix)embed_tokens") {
             let t = try weights.quantizedTriplet("\(prefix)embed_tokens")
+            let bits = deriveAffineQuantBits(
+                weightPackedCols: t.weight.shape[t.weight.shape.count - 1],
+                scaleCols: t.scales.shape[t.scales.shape.count - 1],
+                groupSize: q.groupSize)
             lmHead = AnyLinear(QuantizedLinear(
                 weight: t.weight, scales: t.scales, biases: t.biases,
-                bits: q.bits, groupSize: q.groupSize))
+                bits: bits, groupSize: q.groupSize))
         } else {
             lmHead = AnyLinear(Linear(weight: embedTokens.weight))
         }
@@ -596,13 +599,20 @@ enum Gemma4Loader {
     ) throws -> [AnyLinear] {
         var out: [AnyLinear] = []
         out.reserveCapacity(numExperts)
-        if let q = quant, [3, 4, 5, 6, 8].contains(q.bits),
-           weights.isQuantized(base) {
+        if let q = quant, weights.isQuantized(base) {
             let w = try weights.tensor(named: "\(base).weight")
             let s = try weights.tensor(named: "\(base).scales")
             let b = try weights.tensor(named: "\(base).biases")
             let packedCols = w.shape[w.shape.count - 1]
             let groupCols = s.shape[s.shape.count - 1]
+            // The stacked tensor is one shape for all experts, so the
+            // derived bit-width is uniform across the stack.
+            let bits = deriveAffineQuantBits(
+                weightPackedCols: packedCols, scaleCols: groupCols,
+                groupSize: q.groupSize)
+            precondition([3, 4, 5, 6, 8].contains(bits),
+                         "sliceStacked: derived \(bits)-bit for \(base) — "
+                         + "unsupported quantization bit-width")
             for e in 0..<numExperts {
                 out.append(AnyLinear(QuantizedLinear(
                     weight: w.slicedRows(start: e, count: 1)
@@ -611,7 +621,7 @@ enum Gemma4Loader {
                         .reshaped(to: [outDim, groupCols]),
                     biases: b.slicedRows(start: e, count: 1)
                         .reshaped(to: [outDim, groupCols]),
-                    bits: q.bits, groupSize: q.groupSize)))
+                    bits: bits, groupSize: q.groupSize)))
             }
         } else {
             let stacked = try weights.tensor(named: "\(base).weight")

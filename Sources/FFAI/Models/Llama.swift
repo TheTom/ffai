@@ -145,12 +145,15 @@ public struct LlamaDense: LlamaVariant {
         let lmHead: AnyLinear
         if !tieEmbed, weights.has("lm_head.weight") {
             lmHead = try loadLinear(base: "lm_head", in: weights, quantization: quant)
-        } else if let q = quant, [3, 4, 5, 6, 8].contains(q.bits),
-                  weights.isQuantized("model.embed_tokens") {
+        } else if let q = quant, weights.isQuantized("model.embed_tokens") {
             let t = try weights.quantizedTriplet("model.embed_tokens")
+            let bits = deriveAffineQuantBits(
+                weightPackedCols: t.weight.shape[t.weight.shape.count - 1],
+                scaleCols: t.scales.shape[t.scales.shape.count - 1],
+                groupSize: q.groupSize)
             lmHead = AnyLinear(QuantizedLinear(
                 weight: t.weight, scales: t.scales, biases: t.biases,
-                bits: q.bits, groupSize: q.groupSize
+                bits: bits, groupSize: q.groupSize
             ))
         } else {
             lmHead = AnyLinear(Linear(weight: embedTokens.weight))

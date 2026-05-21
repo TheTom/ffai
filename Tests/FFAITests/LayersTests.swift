@@ -60,6 +60,24 @@ struct LayersTests {
         }
     }
 
+    @Test("deriveAffineQuantBits — recovers per-tensor bit-width from packed shapes")
+    func deriveAffineQuantBitsFromShapes() {
+        // MLX affine quantization: a linear with `inFeatures` inputs
+        // packs `weight` to `inFeatures * bits / 32` columns and
+        // `scales` to `inFeatures / groupSize` columns.
+        let groupSize = 64
+        for (inFeatures, bits) in [(256, 4), (256, 8), (4096, 4), (4096, 8),
+                                   (1024, 3), (1024, 6)] {
+            let weightCols = inFeatures * bits / 32
+            let scaleCols = inFeatures / groupSize
+            let derived = deriveAffineQuantBits(
+                weightPackedCols: weightCols, scaleCols: scaleCols,
+                groupSize: groupSize)
+            #expect(derived == bits,
+                    "in=\(inFeatures) bits=\(bits): derived \(derived)")
+        }
+    }
+
     @Test("RMSNorm forward — y = x / rms(x) * weight")
     func rmsNormForward() {
         autoreleasepool {

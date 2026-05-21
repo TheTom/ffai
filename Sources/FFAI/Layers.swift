@@ -109,22 +109,62 @@ public final class AnyLinear: Module {
     }
 }
 
+/// Derive the affine-quantization bit-width of one mlx-quantized tensor
+/// from its packed shapes, instead of trusting the global `bits` in
+/// `config.json`.
+///
+/// MLX affine quantization packs `32 / bits` weight values into each
+/// uint32 lane, so a linear with `inFeatures` inputs stores its packed
+/// `weight` with `inFeatures * bits / 32` columns and its `scales` with
+/// `inFeatures / groupSize` columns. Eliminating `inFeatures` gives
+///
+///     bits = 32 * weightPackedCols / (scaleCols * groupSize)
+///
+/// Mixed-precision checkpoints (e.g. `mlx-community/gemma-4-26b-a4b-it-4bit`)
+/// carry a single global `bits` plus per-tensor overrides in `config.json`;
+/// the global value is wrong for every overridden tensor, which would
+/// dequantize as garbage. Deriving from the shapes is exact and
+/// per-tensor, so the load path needs no per-key config plumbing.
+/// `groupSize` is assumed uniform across the checkpoint — the global
+/// `quantization.group_size` — which holds for every published mlx
+/// affine conversion.
+public func deriveAffineQuantBits(
+    weightPackedCols: Int, scaleCols: Int, groupSize: Int
+) -> Int {
+    let inFeatures = scaleCols * groupSize
+    precondition(inFeatures > 0,
+                 "deriveAffineQuantBits: non-positive in-features "
+                 + "(scaleCols=\(scaleCols), groupSize=\(groupSize))")
+    precondition((32 * weightPackedCols) % inFeatures == 0,
+                 "deriveAffineQuantBits: \(weightPackedCols) packed weight "
+                 + "columns are inconsistent with \(inFeatures) in-features "
+                 + "at group size \(groupSize) — shapes do not describe an "
+                 + "mlx affine-quantized tensor")
+    return (32 * weightPackedCols) / inFeatures
+}
+
 /// Build the right Linear variant for a weight at `<base>.weight` —
 /// QuantizedLinear if the bundle has matching `.scales`/`.biases` and
-/// the config quantization block specifies a supported bit-width
-/// (4 or 8), regular Linear otherwise.
+/// the per-tensor bit-width derived from the shapes is supported
+/// (3/4/5/6/8), regular Linear otherwise. The bit-width is derived per
+/// tensor — not read from the global config — so mixed-precision
+/// checkpoints load correctly (see `deriveAffineQuantBits`).
 public func loadLinear(
     base: String, in bundle: SafeTensorsBundle,
     quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyLinear {
-    if let q = quantization, [3, 4, 5, 6, 8].contains(q.bits),
-       bundle.isQuantized(base)
-    {
+    if let q = quantization, bundle.isQuantized(base) {
         let t = try bundle.quantizedTriplet(base)
-        return AnyLinear(QuantizedLinear(
-            weight: t.weight, scales: t.scales, biases: t.biases,
-            bits: q.bits, groupSize: q.groupSize
-        ))
+        let bits = deriveAffineQuantBits(
+            weightPackedCols: t.weight.shape[t.weight.shape.count - 1],
+            scaleCols: t.scales.shape[t.scales.shape.count - 1],
+            groupSize: q.groupSize)
+        if [3, 4, 5, 6, 8].contains(bits) {
+            return AnyLinear(QuantizedLinear(
+                weight: t.weight, scales: t.scales, biases: t.biases,
+                bits: bits, groupSize: q.groupSize
+            ))
+        }
     }
     let weight = try bundle.tensor(named: "\(base).weight")
     // Bias is optional — present on Qwen 2.x QKV projections, BLOOM,
@@ -223,14 +263,18 @@ public func loadEmbedding(
     base: String, in bundle: SafeTensorsBundle,
     hidden: Int, quantization: ModelConfig.QuantizationConfig?
 ) throws -> AnyEmbedding {
-    if let q = quantization, [3, 4, 5, 6, 8].contains(q.bits),
-       bundle.isQuantized(base)
-    {
+    if let q = quantization, bundle.isQuantized(base) {
         let t = try bundle.quantizedTriplet(base)
-        return AnyEmbedding(QuantizedEmbedding(
-            weight: t.weight, scales: t.scales, biases: t.biases,
-            hidden: hidden, bits: q.bits, groupSize: q.groupSize
-        ))
+        let bits = deriveAffineQuantBits(
+            weightPackedCols: t.weight.shape[t.weight.shape.count - 1],
+            scaleCols: t.scales.shape[t.scales.shape.count - 1],
+            groupSize: q.groupSize)
+        if [3, 4, 5, 6, 8].contains(bits) {
+            return AnyEmbedding(QuantizedEmbedding(
+                weight: t.weight, scales: t.scales, biases: t.biases,
+                hidden: hidden, bits: bits, groupSize: q.groupSize
+            ))
+        }
     }
     return AnyEmbedding(Embedding(weight: try bundle.tensor(named: "\(base).weight")))
 }

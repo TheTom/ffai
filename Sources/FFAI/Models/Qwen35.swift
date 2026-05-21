@@ -562,8 +562,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
         var out: [AnyLinear] = []
         out.reserveCapacity(numExperts)
 
-        if let q = quant, [3, 4, 5, 6, 8].contains(q.bits),
-           weights.isQuantized(base) {
+        if let q = quant, weights.isQuantized(base) {
             // Quantized stack: weight [E, outDim, inDim/packFactor] u32,
             // scales / biases [E, outDim, inDim/groupSize].
             let stackedW = try weights.tensor(named: "\(base).weight")
@@ -571,6 +570,14 @@ public struct Qwen35Hybrid: Qwen35Variant {
             let stackedB = try weights.tensor(named: "\(base).biases")
             let packedCols = stackedW.shape[stackedW.shape.count - 1]
             let groupCols = stackedS.shape[stackedS.shape.count - 1]
+            // The stacked tensor is one shape for all experts, so the
+            // derived bit-width is uniform across the stack.
+            let bits = deriveAffineQuantBits(
+                weightPackedCols: packedCols, scaleCols: groupCols,
+                groupSize: q.groupSize)
+            precondition([3, 4, 5, 6, 8].contains(bits),
+                         "sliceStackedExperts: derived \(bits)-bit for "
+                         + "\(base) — unsupported quantization bit-width")
             for e in 0..<numExperts {
                 let w = stackedW.slicedRows(start: e, count: 1)
                     .reshaped(to: [outDim, packedCols])
@@ -580,7 +587,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
                     .reshaped(to: [outDim, groupCols])
                 out.append(AnyLinear(QuantizedLinear(
                     weight: w, scales: s, biases: b,
-                    bits: q.bits, groupSize: q.groupSize)))
+                    bits: bits, groupSize: q.groupSize)))
             }
         } else {
             // Raw stack: weight [E, outDim, inDim].
