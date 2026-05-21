@@ -3080,4 +3080,64 @@ public enum Ops {
             fatalError("Ops.gatedMixerNorm: unsupported out dtype \(out.dtype)")
         }
     }
+
+    // ─── Fused scalar-sigmoid fan-out + FMA ───────────────────────────
+    //
+    // Wraps `mt_sigmoid_scalar_fma_{f32,f16,bf16}`. Computes
+    //   `out[i] = base[i] + sigmoid(gate[0]) * value[i]`
+    // for `i in 0..hidden`, broadcasting the scalar `gate` across the
+    // `[hidden]` vectors. Used by `Qwen35MoEFFN.forward` to fuse the
+    // shared-expert gate's sigmoid + broadcast-mul + residual add into
+    // one GPU dispatch, eliminating the `gateLogit.toFloatArray()` host
+    // detour and the `commit + wait` that comes with it.
+    //
+    // Tensor contracts (matching the kernel sig):
+    //   gate    [1]       T — scalar logit (raw, not yet sigmoided)
+    //   value   [hidden]  T — shared-expert output
+    //   base    [hidden]  T — running combine (routed-expert sum)
+    //   out     [hidden]  T — gated + accumulated result
+    // Dispatch:
+    //   grid = [hidden, 1, 1] threads (one per element)
+    //   tg   = [tgWidth, 1, 1] threads
+    public static func sigmoidScalarFMA(
+        gate: Tensor, value: Tensor, base: Tensor,
+        into out: Tensor, on cmd: MTLCommandBuffer
+    ) {
+        precondition(gate.dtype == value.dtype && value.dtype == base.dtype && base.dtype == out.dtype,
+                     "Ops.sigmoidScalarFMA: all tensors must share dtype")
+        precondition(gate.elementCount == 1,
+                     "Ops.sigmoidScalarFMA: gate must be [1] (got \(gate.elementCount))")
+        precondition(value.elementCount == base.elementCount && base.elementCount == out.elementCount,
+                     "Ops.sigmoidScalarFMA: value / base / out must have matching elementCount")
+
+        let n = value.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_sigmoid_scalar_fma_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_sigmoid_scalar_fma_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_sigmoid_scalar_fma_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoidScalarFMA: unsupported dtype \(out.dtype)")
+        }
+    }
 }

@@ -815,22 +815,28 @@ public final class Qwen35MoEFFN: Module {
                                 cache: StatelessLayerCache(),
                                 cmd: cmd, device: device)
         // Shared expert on a fresh buffer: SwiGLU + scalar gate logit.
+        // The fused-sigmoid kernel keeps the scalar on the GPU, so this
+        // buffer no longer needs a `waitUntilCompleted` — it just needs
+        // to be in flight so the FMA can hazard-track its dependencies.
         let work = device.makeCommandBuffer()
         let sg = sharedGateProj(xNorm, on: work)
         let su = sharedUpProj(xNorm, on: work)
         let sharedInner = Ops.mul(Ops.silu(sg, on: work), su, on: work)
         let sharedOut = sharedDownProj(sharedInner, on: work)
-        // shared_expert_gate → [1] logit. Commit so the host can read it.
         let gateLogit = sharedExpertGate(xNorm, on: work)
         work.commit()
-        work.waitUntilCompleted()
 
-        // Host: sigmoid(gateLogit) is a scalar; broadcast-scale the shared
-        // expert output, then add to the routed combine. `sharedY =
-        // sigmoid(shared_expert_gate(x)) * shared_expert(x)`.
-        let result = scaleBySigmoidGate35(
-            sharedOut, gateLogit: gateLogit,
-            addTo: routed, hidden: hidden, device: device)
+        // GPU fan-out: `out = routed + sigmoid(gateLogit) * sharedOut`
+        // in one dispatch. Replaces the prior host detour
+        // (`gateLogit.toFloatArray()` + host sigmoid + `Tensor.filled`
+        // broadcast + mul + add + commit + wait) — saves one host stall
+        // per MoE layer per token. Fires on all 40 Qwen3.6-A3B layers.
+        let fmaCmd = device.makeCommandBuffer()
+        let result = Tensor.empty(shape: [hidden], dtype: routed.dtype, device: device)
+        Ops.sigmoidScalarFMA(
+            gate: gateLogit, value: sharedOut, base: routed,
+            into: result, on: fmaCmd)
+        fmaCmd.commit()
         return result
     }
 }
