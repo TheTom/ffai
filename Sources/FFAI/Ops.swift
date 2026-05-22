@@ -3192,6 +3192,37 @@ public enum Ops {
     // consumer — it runs against the fp32 recurrence state to avoid the
     // 7-bit-mantissa drift that bf16 state would accumulate). f32→f32 is
     // a memory copy on the GPU, retained for dispatch-table uniformity.
+    /// Fused silu + bf16/f16 → fp32 cast in one dispatch. Collapses the
+    /// `Ops.silu(...) → Ops.castToF32(...)` two-dispatch chain used in
+    /// FFAI's batched-prefill GDN inner loop into one. At Qwen3.6-A3B
+    /// T=512 × 30 GDN layers = 15360 dispatches removed per prefill.
+    /// Input is bf16 or f16; output must be f32.
+    public static func siluCastToF32(_ input: Tensor, into output: Tensor,
+                                     on cmd: MTLCommandBuffer) {
+        precondition(output.dtype == .f32,
+                     "Ops.siluCastToF32: output dtype must be f32, got \(output.dtype)")
+        precondition(input.elementCount == output.elementCount,
+                     "Ops.siluCastToF32: element count mismatch (\(input.elementCount) vs \(output.elementCount))")
+        let n = input.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch input.dtype {
+        case .f16:
+            MetalTileKernels.mt_silu_cast_to_f32_f16(
+                input: input.buffer, inputOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_silu_cast_to_f32_bf16(
+                input: input.buffer, inputOffset: input.offset,
+                out: output.buffer, outOffset: output.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.siluCastToF32: unsupported input dtype \(input.dtype) — bf16 / f16 only")
+        }
+    }
+
     public static func castToF32(_ input: Tensor, into output: Tensor,
                                  on cmd: MTLCommandBuffer) {
         precondition(output.dtype == .f32,

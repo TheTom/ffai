@@ -1363,14 +1363,18 @@ public final class Qwen35GDNMixer: Module {
                 x: qkvRow, w: convW, b: convB,
                 state: cache.conv.state, into: convOutScratch,
                 nChannels: convDim, kernelSize: convKernel, on: cmd)
-            // In-place silu: read + write the same buffer. Safe for the
-            // elementwise kernel (each thread does one load + one store
-            // at the same offset). Saves T·30 `Tensor.empty` allocations
-            // per prefill at Qwen3.6-A3B GDN layers.
-            _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
-
-            // Cast bf16 activations to fp32 for the fused step / state.
-            Ops.castToF32(convOutScratch, into: convActF32Scratch, on: cmd)
+            // Fused silu + cast-to-f32. Replaces the prior two-dispatch
+            // chain `silu(convOutScratch) → castToF32(...)` with one
+            // dispatch reading bf16/f16 conv output, applying silu at
+            // fp32 precision, writing fp32 directly into the prep
+            // scratch. Saves T·30 dispatches per Qwen3.6-A3B prefill.
+            if convOutScratch.dtype == .f32 {
+                // f32 conv → silu in place, no cast needed.
+                _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
+                Ops.castToF32(convOutScratch, into: convActF32Scratch, on: cmd)
+            } else {
+                Ops.siluCastToF32(convOutScratch, into: convActF32Scratch, on: cmd)
+            }
             Ops.castToF32(aRawRow, into: aRawF32Scratch, on: cmd)
             Ops.castToF32(bRawRow, into: bRawF32Scratch, on: cmd)
 
