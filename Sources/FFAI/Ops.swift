@@ -2785,6 +2785,78 @@ public enum Ops {
         }
     }
 
+    /// Fused MoE unpermute + weighted scatter-sum back to per-token
+    /// outputs. Replaces the per-row `mTotal·2` scalar mul+add loop
+    /// (`Tensor.filled([hidden])` × mTotal) on the FFAI batched-prefill
+    /// MoE path — one dispatch over T·hidden elements vs the
+    /// `mTotal × 2` separate dispatches.
+    ///
+    /// Layout (per `metaltile-std/src/ffai/moe.rs`):
+    ///   - `expertOutputs`: `[k·B·T, hidden]` per-expert dense outputs at
+    ///     expert-sorted positions
+    ///   - `invPerm`: `[B·T, k]` u32 — where (token, slot) was placed in
+    ///     `expertOutputs` (caller's sort step)
+    ///   - `topKWeights`: `[B·T, k]` routing weights in `out.dtype`
+    ///   - `out`: `[B·T, hidden]` weighted sum across `k` experts
+    ///
+    /// Geometry: TG=`[128, 1, 1]`, grid=`[B·T, 1, 1]` TGs. Reduction
+    /// mode — one TG per token. Bandwidth-bound.
+    public static func moeUnpermute(
+        expertOutputs: Tensor,
+        invPerm: Tensor,
+        topKWeights: Tensor,
+        into out: Tensor,
+        nRows: Int, hidden: Int, k: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(invPerm.dtype == .u32,
+                     "Ops.moeUnpermute: invPerm must be u32 (got \(invPerm.dtype))")
+        precondition(expertOutputs.dtype == topKWeights.dtype && topKWeights.dtype == out.dtype,
+                     "Ops.moeUnpermute: expertOutputs/topKWeights/out must share dtype")
+        precondition(expertOutputs.elementCount == nRows * k * hidden,
+                     "Ops.moeUnpermute: expertOutputs has \(expertOutputs.elementCount) elements, expected nRows·k·hidden = \(nRows * k * hidden)")
+        precondition(invPerm.elementCount == nRows * k,
+                     "Ops.moeUnpermute: invPerm has \(invPerm.elementCount) elements, expected nRows·k = \(nRows * k)")
+        precondition(topKWeights.elementCount == nRows * k,
+                     "Ops.moeUnpermute: topKWeights has \(topKWeights.elementCount) elements, expected nRows·k = \(nRows * k)")
+        precondition(out.elementCount == nRows * hidden,
+                     "Ops.moeUnpermute: out has \(out.elementCount) elements, expected nRows·hidden = \(nRows * hidden)")
+
+        let tgWidth = 128
+        let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let hiddenU = UInt32(hidden)
+        let kU = UInt32(k)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_unpermute_f32(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_unpermute_f16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_unpermute_bf16(
+                expert_outputs: expertOutputs.buffer, expert_outputsOffset: expertOutputs.offset,
+                inv_perm: invPerm.buffer, inv_permOffset: invPerm.offset,
+                top_k_weights: topKWeights.buffer, top_k_weightsOffset: topKWeights.offset,
+                out: out.buffer, outOffset: out.offset,
+                hidden: hiddenU, k: kU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.moeUnpermute: unsupported dtype \(out.dtype)")
+        }
+    }
+
     public static func moeGatherDequantGemmInt4Bm8(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,

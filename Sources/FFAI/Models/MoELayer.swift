@@ -581,6 +581,23 @@ public final class MoELayer: Module, DecoderLayer {
             sourceTokensHost.append(UInt32(tuple.1))
             sortedWeightsHost.append(tuple.3)
         }
+        // ── 4b. Build inv_perm + per-token-order weights for the
+        // mt_moe_unpermute fused scatter-sum kernel. `invPermHost[r·k+s]`
+        // = sortedIdx where (token r, slot s) landed in `downOut`.
+        // `weightsTokenOrderHost[r·k+s]` = routings[r].weights[s]
+        // (unsorted, matches the kernel's per-token lookup).
+        var invPermHost = [UInt32](repeating: 0, count: mTotal)
+        for (sortedIdx, tuple) in planTuples.enumerated() {
+            let r = tuple.1
+            let slot = tuple.2
+            invPermHost[r * topK + slot] = UInt32(sortedIdx)
+        }
+        var weightsTokenOrderHost = [Float](); weightsTokenOrderHost.reserveCapacity(mTotal)
+        for r in 0..<t {
+            for slot in 0..<topK {
+                weightsTokenOrderHost.append(routings[r].weights[slot])
+            }
+        }
 
         // ── 5. Fall back to per-token decode if no stacked-int4 weights ──
         guard let stacked = stackedInt4Experts, stacked.dtype == dt else {
@@ -676,28 +693,41 @@ public final class MoELayer: Module, DecoderLayer {
               stacked.downWeight, stacked.downScales, stacked.downBiases,
               indices, mTotal, hidden, moeIntermediate, groupSize, work, downOut)
 
-        // ── 12. Weighted scatter-sum back to [T, hidden] ─────────────────
-        // mTotal dispatches of `mul + add`. Each row's weight is scalar
-        // broadcast via `Tensor.filled([hidden])` — matches the existing
-        // single-token batchedSwiGLU pattern. Future optimisation: a
-        // `mt_moe_scatter_scale_add` kernel collapses mTotal·2 dispatches
-        // into one.
+        // ── 12. Weighted scatter-sum back to [T, hidden] via fused
+        // `mt_moe_unpermute` kernel — ONE dispatch over T·hidden
+        // elements instead of mTotal·2 small `Tensor.filled([hidden])`
+        // + mul + add per row. At Qwen3.6-A3B T=32 topK=8 mTotal=256
+        // that's 512 dispatches → 1 per gate/up/down stage.
         let dtBytes = dt.byteSize
         let outFlat = Tensor.empty(shape: [t * hidden], dtype: dt, device: device)
-        outFlat.zero()
-        for m in 0..<mTotal {
-            let sortedRow = Tensor(buffer: downOut.buffer,
-                                   offset: downOut.offset + m * hidden * dtBytes,
-                                   shape: [hidden], dtype: dt)
-            let destToken = Int(sourceTokensHost[m])
-            let outRow = Tensor(buffer: outFlat.buffer,
-                                offset: outFlat.offset + destToken * hidden * dtBytes,
-                                shape: [hidden], dtype: dt)
-            let w = Tensor.filled(sortedWeightsHost[m],
-                                  shape: [hidden], dtype: dt, device: device)
-            let scaled = Ops.mul(sortedRow, w, on: work)
-            _ = Ops.add(outRow, scaled, on: work, into: outRow)
+        // invPerm + weights buffers (built on host in the plan loop).
+        let invPermBuf = device.makeBuffer(length: mTotal * 4)
+        invPermHost.withUnsafeBytes {
+            _ = memcpy(invPermBuf.contents(), $0.baseAddress!, mTotal * 4)
         }
+        let invPermTensor = Tensor(buffer: invPermBuf, offset: 0,
+                                   shape: [mTotal], dtype: .u32)
+        let weightsTensor = Tensor.empty(shape: [mTotal], dtype: dt, device: device)
+        // Host → GPU weights in dtype.
+        switch dt {
+        case .f32:
+            weightsTensor.copyIn(from: weightsTokenOrderHost)
+        case .bf16:
+            weightsTensor.copyIn(from: weightsTokenOrderHost.map { v -> UInt16 in
+                let bits = v.bitPattern
+                let rounded = bits &+ 0x7FFF &+ ((bits >> 16) & 1)
+                return UInt16(rounded >> 16)
+            })
+        case .f16:
+            weightsTensor.copyIn(from: weightsTokenOrderHost.map { Float16($0) })
+        default:
+            fatalError("MoELayer.decodeMany: unsupported dtype \(dt) for unpermute weights")
+        }
+        Ops.moeUnpermute(
+            expertOutputs: downOut, invPerm: invPermTensor,
+            topKWeights: weightsTensor, into: outFlat,
+            nRows: t, hidden: hidden, k: topK, on: work)
+        let _ = dtBytes  // retained for the shared-expert fan-out below
 
         // ── 13. Optional shared expert — per-row T-loop ─────────────────
         // Shared expert is one always-on per-token SwiGLU. Looping T
