@@ -2684,13 +2684,26 @@ public enum Ops {
     /// counterpart of the Bm16 default — fills `ceil(m/64)` tiles
     /// instead of `ceil(m/16)`. Sweet spot for the batched-prefill
     /// regime where `mTotal = T·topK ≥ 64`: at Qwen3.6-A3B T=32 topK=8
-    /// mTotal=256 = exactly 4 BM=64 tiles, no boundary waste. Falls back
-    /// to the regular Bm16 path under `mTotal < 64` (the caller should
-    /// gate selection).
+    /// mTotal=256 = exactly 4 BM=64 tiles, no boundary waste.
     ///
     /// Requires macOS 26.2+ on Apple10+ GPU (M5 Max) — the MPP path
     /// uses the cooperative-tensor `mpp::tensor_ops::matmul2d` per the
     /// metaltile MPP NAX primitive landing.
+    ///
+    /// WARNING — KNOWN CORRECTNESS ISSUE (2026-05-21). Dispatch shape
+    /// matches the metaltile-std `moe_gather_qmm_mpp_bm64_correctness`
+    /// test
+    /// (grid = `[ceil(N/64), ceil(M/64), 1]` threadgroups,
+    /// tg = `[128, 1, 1]` for 4 SGs WM=WN=2), but `forwardManyEquivalence`
+    /// at T=8 mTotal=64 produces top-1 argmax 279 with logit 12.25 vs
+    /// reference argmax 52290 logit 17.125 — the tokens are present in
+    /// both top-5 lists but with a ~5-logit scale drift. Suspected
+    /// bf16-output-scale or buffer-binding mismatch between the
+    /// Swift-side wrapper and the kernel's expected layout. Cosine
+    /// ≥ 0.999 in the upstream test (f32 output) — bf16 output path
+    /// may need its own verification. Use **only** behind
+    /// `FFAI_MOE_BGEMM_BM64=1` after re-verifying against the kernel
+    /// source. Bm16 default ships the 2.69× T=32 win.
     public static func moeGatherDequantGemmInt4Bm64Mpp(
         input: Tensor,
         weight: Tensor, scales: Tensor, biases: Tensor,
@@ -2714,14 +2727,17 @@ public enum Ops {
                      "moeGatherDequantGemmInt4Bm64Mpp: out elements \(out.elementCount) ≠ mTotal·nOut \(mTotal * nOut)")
         precondition(indices.elementCount == mTotal,
                      "moeGatherDequantGemmInt4Bm64Mpp: indices elements \(indices.elementCount) ≠ mTotal \(mTotal)")
-        precondition(nOut % 32 == 0,
-                     "moeGatherDequantGemmInt4Bm64Mpp: nOut (\(nOut)) must be multiple of 32")
+        precondition(nOut % 64 == 0,
+                     "moeGatherDequantGemmInt4Bm64Mpp: nOut (\(nOut)) must be multiple of 64 (BN tile)")
         precondition(kIn % 32 == 0,
-                     "moeGatherDequantGemmInt4Bm64Mpp: kIn (\(kIn)) must be multiple of 32")
+                     "moeGatherDequantGemmInt4Bm64Mpp: kIn (\(kIn)) must be multiple of 32 (BK tile)")
 
-        // 1 simdgroup per TG, BM=64 → grid Y = ceil(m/64).
-        let tgWidth = 32
-        let grid = MTLSize(width: (nOut / 32) * tgWidth,
+        // Per `metaltile-std/src/ffai/moe_mpp_bm64.rs`:
+        //   BM = BN = 64, BK = 32. 4 SGs per TG, WM = WN = 2.
+        //   Threadgroup size [128, 1, 1]. Grid [N/64, ceil(M/64), 1].
+        // dispatchThreads (total threads): width = (N/64)·128.
+        let tgWidth = 128
+        let grid = MTLSize(width: (nOut / 64) * tgWidth,
                            height: (mTotal + 63) / 64,
                            depth: 1)
         let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
