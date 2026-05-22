@@ -143,6 +143,11 @@ struct Qwen36SmokeTests {
         try await runForwardManyBench(targetT: 128)
     }
 
+    @Test("Qwen3.6-35B-A3B forwardMany bench — T=512 long-context scaling")
+    func forwardManyBench512() async throws {
+        try await runForwardManyBench(targetT: 512)
+    }
+
     private func runForwardManyBench(targetT: Int) async throws {
         let path = "/Users/tom/models/Qwen3.6-35B-A3B-4bit"
         guard FileManager.default.fileExists(atPath: path) else {
