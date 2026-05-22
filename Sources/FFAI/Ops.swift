@@ -1860,6 +1860,14 @@ public enum Ops {
                 sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        // NOTE: the d64/d256 specialized kernels in metaltile-std
+        // don't accept `sink_end` / `window_start` parameters — they're
+        // perf-tuned for dense full attention. Callers needing sliding-
+        // window / attention-sink at these head_dims must precondition
+        // `sinkEnd == 0 && windowStart == 0` (validated upstream by
+        // OpsValidation.validateSdpaDecode). The d128 / d512 cases use
+        // the generic `ffai_sdpa_decode_*` kernel with constexpr
+        // head_dim which DOES carry both params.
         case (64, .f32):
             MetalTileKernels.ffai_sdpa_decode_d64_f32(
                 q: q.buffer, qOffset: q.offset,
@@ -1869,7 +1877,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .f16):
@@ -1881,7 +1888,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (64, .bf16):
@@ -1893,7 +1899,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f32):
@@ -1905,7 +1910,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .f16):
@@ -1917,7 +1921,6 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (256, .bf16):
@@ -1929,11 +1932,16 @@ public enum Ops {
                 head_dim: UInt32(headDim), n_kv: UInt32(nKV),
                 kv_stride: UInt32(kvStride),
                 heads_per_group: UInt32(headsPerGroup),
-                sink_end: UInt32(sinkEnd), window_start: UInt32(windowStart),
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .f32):
-            MetalTileKernels.ffai_sdpa_decode_d512_f32(
+            // d512 had a dedicated `ffai_sdpa_decode_d512_*` kernel under
+            // the old `metaltile-emit/main.rs` manual allowlist; the new
+            // `tile build --emit all` auto-discovery doesn't synthesize
+            // it (no per-head-dim file in `crates/metaltile-std/src/ffai/`).
+            // Route through the generic kernel with constexpr head_dim
+            // — same code path d128 already uses.
+            MetalTileKernels.ffai_sdpa_decode_f32(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -1945,7 +1953,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .f16):
-            MetalTileKernels.ffai_sdpa_decode_d512_f16(
+            MetalTileKernels.ffai_sdpa_decode_f16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,
@@ -1957,7 +1965,7 @@ public enum Ops {
                 scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         case (512, .bf16):
-            MetalTileKernels.ffai_sdpa_decode_d512_bf16(
+            MetalTileKernels.ffai_sdpa_decode_bf16(
                 q: q.buffer, qOffset: q.offset,
                 k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset,

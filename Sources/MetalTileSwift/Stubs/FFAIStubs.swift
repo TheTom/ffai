@@ -1,288 +1,28 @@
 import Metal
 
-// Stub dispatch functions for kernels that FFAI references but
-// metaltile-emit does not currently emit (no Rust kernel source in
-// metaltile-ffai). These let the FFAI package compile; calling any
-// of them at runtime traps with a clear message pointing back to
-// task #93 / the metaltile-ffai emitter.
+// Stub dispatch functions for kernels that FFAI references but the
+// `tile build --emit all` auto-discovery (via `inventory::iter` over
+// `crates/metaltile-std/`) does not currently produce. They let the
+// FFAI package compile; calling any of them at runtime traps.
 //
 // To remove a stub: (a) implement the kernel in
-// `crates/metaltile-std/src/...`, (b) register it in
-// `crates/metaltile-emit/src/main.rs::register_kernels`, (c)
-// re-emit, then drop the matching stub func below.
+// `crates/metaltile-std/src/...` with an `inventory::submit!` block,
+// (b) re-run `tile build --emit all --out
+// /Users/tom/dev/ffai/Sources/MetalTileSwift`, (c) drop the matching
+// stub func below.
+//
+// The `aura_dequant_rotated_*` and `aura_encode_*` stub families that
+// used to live here were dropped once Eric's auto-discovery emit picked
+// up the full `int{2,3,4,8} × {f32,f16,bf16}` matrix on
+// metaltile-ffai `feat/ffai-kernel-pack` (commit `e219d05`+). The
+// surviving stubs below (`ffai_gemm`, `ffai_rope_yarn`,
+// `ffai_sdpa_multi`, `mt_rms_norm_wide`) still lack canonical
+// `metaltile-std` sources + inventory blocks.
 
 extension MetalTileKernels {
-    // MARK: - aura_dequant_rotated (codebook product-quantized dequant)
-
     @inline(never) private static func unimplemented(_ name: String) -> Never {
-        fatalError("\(name): kernel not currently emitted by metaltile-emit. See task #93 — needs Rust kernel source in crates/metaltile-std/ + registration in crates/metaltile-emit/src/main.rs.")
+        fatalError("\(name): kernel not currently emitted. Add a Rust source under `crates/metaltile-std/` with an `inventory::submit!` block; `tile build --emit all` picks them up via inventory::iter.")
     }
-
-    public static func aura_dequant_rotated_int2_f32(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int2_f16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int2_bf16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int3_f32(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int3_f16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int3_bf16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int4_f32(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int4_f16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int4_bf16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int8_f32(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int8_f16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_dequant_rotated_int8_bf16(
-        packed: MTLBuffer, packedOffset: Int = 0,
-        norms: MTLBuffer, normsOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        out: MTLBuffer, outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32, tokens: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    // MARK: - aura_encode (codebook product-quantized encode)
-
-    public static func aura_encode_int2_f32(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int2_f16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int2_bf16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int3_f32(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int3_f16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int3_bf16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int4_f32(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int4_f16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int4_bf16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int8_f32(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int8_f16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
-
-    public static func aura_encode_int8_bf16(
-        input: MTLBuffer, inputOffset: Int = 0,
-        rotation: MTLBuffer, rotationOffset: Int = 0,
-        boundaries: MTLBuffer, boundariesOffset: Int = 0,
-        codebook: MTLBuffer, codebookOffset: Int = 0,
-        packed_out: MTLBuffer, packed_outOffset: Int = 0,
-        norms_out: MTLBuffer, norms_outOffset: Int = 0,
-        dim: UInt32, packed_width: UInt32,
-        gridSize: MTLSize, threadgroupSize: MTLSize,
-        on commandBuffer: MTLCommandBuffer
-    ) { unimplemented(#function) }
 
     // MARK: - ffai_gemm (naive matmul fallback)
 
@@ -378,6 +118,42 @@ extension MetalTileKernels {
         causal: UInt32, scale: Float,
         gridSize: MTLSize, threadgroupSize: MTLSize,
         on commandBuffer: MTLCommandBuffer
+    ) { unimplemented(#function) }
+
+    // MARK: - dequant_gemv_int4_*_indirect (Day-1 GPU-router plumbing)
+    //
+    // Indirect-dispatch variants of dequant_gemv_int4 — same PSO + args
+    // as the direct kernels but dispatch shape comes from an
+    // `MTLBuffer` instead of `MTLSize`. The old `metaltile-emit/main.rs`
+    // produced these via a custom Swift wrapper generator (commit
+    // `b2eadca` on `feat/ffai-kernel-pack`); the new `tile build --emit
+    // all` auto-discovery path doesn't carry that custom logic.
+    // `Ops.dequantGemvIndirect` references these but is **not** wired
+    // into the production decode / prefill path today (the GPU router
+    // is still host-side). These stubs unblock compile; restoring the
+    // indirect path needs the wrapper logic ported into `tile build`
+    // or a hand-written wrapper here.
+
+    public static func dequant_gemv_int4_f16_indirect(
+        weight: MTLBuffer, weightOffset: Int = 0,
+        scales: MTLBuffer, scalesOffset: Int = 0,
+        biases: MTLBuffer, biasesOffset: Int = 0,
+        input: MTLBuffer, inputOffset: Int = 0,
+        output: MTLBuffer, outputOffset: Int = 0,
+        in_dim: UInt32, group_size: UInt32,
+        indirectBuffer: MTLBuffer, indirectBufferOffset: Int,
+        threadgroupSize: MTLSize, on commandBuffer: MTLCommandBuffer
+    ) { unimplemented(#function) }
+
+    public static func dequant_gemv_int4_bf16_indirect(
+        weight: MTLBuffer, weightOffset: Int = 0,
+        scales: MTLBuffer, scalesOffset: Int = 0,
+        biases: MTLBuffer, biasesOffset: Int = 0,
+        input: MTLBuffer, inputOffset: Int = 0,
+        output: MTLBuffer, outputOffset: Int = 0,
+        in_dim: UInt32, group_size: UInt32,
+        indirectBuffer: MTLBuffer, indirectBufferOffset: Int,
+        threadgroupSize: MTLSize, on commandBuffer: MTLCommandBuffer
     ) { unimplemented(#function) }
 
     // MARK: - mt_rms_norm_wide (wide-hidden RMSNorm)
