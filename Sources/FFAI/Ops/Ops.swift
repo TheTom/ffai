@@ -562,6 +562,99 @@ public enum Ops {
         return result
     }
 
+    /// Two `rmsNormRows` dispatches in ONE compute encoder. Used by
+    /// the Qwen3 attention mixer's pre-RoPE Q-norm + K-norm pair: both
+    /// run the fast `mt_rms_norm_*` kernel (TPG = rowSize / 4), share
+    /// the same eps when set from the same model config, and there's
+    /// no data dependency between them.
+    ///
+    /// `rowSize1` and `rowSize2` must both clear the fast-path bounds
+    /// (`≤ 4096` and a multiple of 128 — checked via
+    /// `OpsValidation.validateRmsNorm`). For wider rows the caller
+    /// must fall back to two `rmsNormRows` calls so the wide kernel is
+    /// picked individually.
+    ///
+    /// `eps` is forwarded via 1-element f32 buffers. If both eps
+    /// values are equal we share a single alloc, otherwise two are
+    /// allocated.
+    public static func rmsNormRowsTwo(
+        _ x1: Tensor, weight w1: Tensor, eps1: Float,
+        nRows1: Int, rowSize1: Int, into out1: Tensor,
+        _ x2: Tensor, weight w2: Tensor, eps2: Float,
+        nRows2: Int, rowSize2: Int, into out2: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            x1.dtype == w1.dtype && x2.dtype == w2.dtype && x1.dtype == x2.dtype,
+            "Ops.rmsNormRowsTwo: dtype mismatch")
+        precondition(
+            x1.elementCount == nRows1 * rowSize1,
+            "Ops.rmsNormRowsTwo: x1 size \(x1.elementCount) ≠ nRows1·rowSize1")
+        precondition(
+            x2.elementCount == nRows2 * rowSize2,
+            "Ops.rmsNormRowsTwo: x2 size \(x2.elementCount) ≠ nRows2·rowSize2")
+        precondition(
+            w1.elementCount == rowSize1 && w2.elementCount == rowSize2,
+            "Ops.rmsNormRowsTwo: weight size must equal rowSize")
+        precondition(
+            out1.elementCount == x1.elementCount && out2.elementCount == x2.elementCount,
+            "Ops.rmsNormRowsTwo: output element-count must match input")
+        precondition(
+            out1.dtype == x1.dtype && out2.dtype == x2.dtype,
+            "Ops.rmsNormRowsTwo: output dtype must match input")
+        if let reason = OpsValidation.validateRmsNorm(n: rowSize1) {
+            preconditionFailure("Ops.rmsNormRowsTwo (#1): \(reason)")
+        }
+        if let reason = OpsValidation.validateRmsNorm(n: rowSize2) {
+            preconditionFailure("Ops.rmsNormRowsTwo (#2): \(reason)")
+        }
+        let psoName: String
+        switch x1.dtype {
+        case .f32: psoName = "mt_rms_norm_f32"
+        case .f16: psoName = "mt_rms_norm_f16"
+        case .bf16: psoName = "mt_rms_norm_bf16"
+        default: fatalError("Ops.rmsNormRowsTwo: unsupported dtype \(x1.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // Allocate one or two eps buffers depending on whether the two
+        // eps values match — RMSNorm pairs typically come from the
+        // same checkpoint config and so share a single eps in practice.
+        let epsBuf1: MTLBuffer = {
+            let b = device.makeBuffer(length: 4)
+            var v = eps1
+            memcpy(b.contents(), &v, 4)
+            return b
+        }()
+        let epsBuf2: MTLBuffer = {
+            if eps1 == eps2 { return epsBuf1 }
+            let b = device.makeBuffer(length: 4)
+            var v = eps2
+            memcpy(b.contents(), &v, 4)
+            return b
+        }()
+        @inline(__always)
+        func dispatch(
+            _ x: Tensor, _ w: Tensor, _ out: Tensor,
+            _ epsBuf: MTLBuffer, _ n: Int, _ nRows: Int
+        ) {
+            let tgWidth = n / 4
+            let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+            let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+            enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+            enc.setBuffer(w.buffer, offset: w.offset, index: 1)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 2)
+            enc.setBuffer(epsBuf, offset: 0, index: 3)
+            var nU = UInt32(n)
+            enc.setBytes(&nU, length: 4, index: 4)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(x1, w1, out1, epsBuf1, rowSize1, nRows1)
+        dispatch(x2, w2, out2, epsBuf2, rowSize2, nRows2)
+        enc.endEncoding()
+    }
+
     /// Fused (residual `a + b`) + RMSNorm. Returns **both** outputs:
     /// `residual` = `a + b` (the next layer's residual stream) and
     /// `normed` = `RMSNorm(a + b, weight)` (the input to the next

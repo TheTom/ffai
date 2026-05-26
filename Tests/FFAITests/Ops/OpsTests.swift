@@ -419,6 +419,67 @@ struct OpsTests {
         }
     }
 
+    @Test("rmsNormRowsTwo f32 — matches two sequential rmsNormRows calls")
+    func rmsNormRowsTwoMatchesSequential() {
+        autoreleasepool {
+            let n1 = 128
+            let n2 = 256
+            let rows = 1
+            let xs1: [Float] = (0 ..< n1 * rows).map { Float($0 + 1) }
+            let ws1: [Float] = (0 ..< n1).map { 1.0 + Float($0 % 7) * 0.05 }
+            let xs2: [Float] = (0 ..< n2 * rows).map { Float($0 + 1) * 0.3 }
+            let ws2: [Float] = (0 ..< n2).map { 1.0 + Float($0 % 11) * 0.03 }
+            // Reference: two sequential single-row rmsNormRows calls.
+            let x1Ref = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            x1Ref.copyIn(from: xs1)
+            let w1Ref = Tensor.empty(shape: [n1], dtype: .f32)
+            w1Ref.copyIn(from: ws1)
+            let x2Ref = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            x2Ref.copyIn(from: xs2)
+            let w2Ref = Tensor.empty(shape: [n2], dtype: .f32)
+            w2Ref.copyIn(from: ws2)
+            var ref1: Tensor!
+            var ref2: Tensor!
+            runAndWait { cb in
+                ref1 = Ops.rmsNormRows(
+                    x1Ref, weight: w1Ref, eps: 1e-6,
+                    nRows: rows, rowSize: n1, on: cb)
+                ref2 = Ops.rmsNormRows(
+                    x2Ref, weight: w2Ref, eps: 1e-6,
+                    nRows: rows, rowSize: n2, on: cb)
+            }
+            // Batched: same eps so the wrapper shares one alloc.
+            let x1 = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            x1.copyIn(from: xs1)
+            let w1 = Tensor.empty(shape: [n1], dtype: .f32)
+            w1.copyIn(from: ws1)
+            let x2 = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            x2.copyIn(from: xs2)
+            let w2 = Tensor.empty(shape: [n2], dtype: .f32)
+            w2.copyIn(from: ws2)
+            let out1 = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            let out2 = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            runAndWait { cb in
+                Ops.rmsNormRowsTwo(
+                    x1, weight: w1, eps1: 1e-6,
+                    nRows1: rows, rowSize1: n1, into: out1,
+                    x2, weight: w2, eps2: 1e-6,
+                    nRows2: rows, rowSize2: n2, into: out2,
+                    on: cb)
+            }
+            let r1Ref = ref1.toArray(as: Float.self)
+            let r2Ref = ref2.toArray(as: Float.self)
+            let r1 = out1.toArray(as: Float.self)
+            let r2 = out2.toArray(as: Float.self)
+            for i in 0 ..< n1 {
+                #expect(abs(r1[i] - r1Ref[i]) < 1e-4, "norm1[\(i)]: \(r1[i]) vs \(r1Ref[i])")
+            }
+            for i in 0 ..< n2 {
+                #expect(abs(r2[i] - r2Ref[i]) < 1e-4, "norm2[\(i)]: \(r2[i]) vs \(r2Ref[i])")
+            }
+        }
+    }
+
     @Test("rmsNorm f32 — wide row (n=5376) routes to mt_rms_norm_wide")
     func rmsNormWideF32() {
         autoreleasepool {
