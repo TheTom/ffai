@@ -2318,6 +2318,36 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
     }
 }
 
+// ─── ITER 76 (PR10): finalNorm + lmHead fused dispatch helper ───────
+//
+// Replaces the 2-dispatch chain `finalNorm(h)` + `lmHead(normed)` with
+// a single `Ops.rmsNormQgemvInt4Fast` dispatch when the lmHead's
+// underlying linear is a 4-bit `QuantizedLinear` that satisfies the
+// fast kernel's constraints (in_dim multiple of 512, out_dim multiple
+// of 8, group_size = 64). Falls back to the separate-chain form
+// otherwise (dense lmHead, int8/int3 quant, smaller vocab, etc.).
+private func qwen35FinalNormLmHead(
+    h: Tensor, finalNorm: RMSNorm, lmHead: AnyLinear,
+    on cmd: MTLCommandBuffer
+) -> Tensor {
+    if let qLm = lmHead.inner as? QuantizedLinear, qLm.bits == 4,
+        qLm.groupSize == 64,
+        h.elementCount % 512 == 0,
+        qLm.weight.shape[0] % 8 == 0
+    {
+        let outDim = qLm.weight.shape[0]
+        let logits = Tensor.empty(shape: [outDim], dtype: h.dtype)
+        Ops.rmsNormQgemvInt4Fast(
+            x: h, normWeight: finalNorm.weight, eps: finalNorm.eps,
+            qWeight: qLm.weight, qScales: qLm.scales, qBiases: qLm.biases,
+            on: cmd, into: logits)
+        return logits
+    }
+    // Fallback: separate dispatches (legacy two-step).
+    let normed = finalNorm(h, on: cmd)
+    return lmHead(normed, on: cmd)
+}
+
 // ─── Shared FFN helpers ──────────────────────────────────────────────
 
 /// Collect the `(name, tensor)` parameters of a layer's FFN half.
@@ -2590,8 +2620,10 @@ public final class Qwen35Model: LanguageModel {
         }
 
         // Final norm + lm_head queue onto the caller's pristine `cmd`.
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        // ITER 76 (PR10): fused rmsNorm+qgemv when lmHead is 4-bit
+        // QuantizedLinear with constraints; falls back otherwise.
+        return qwen35FinalNormLmHead(
+            h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
     /// LanguageModel-protocol entry point for chunked prefill. Delegates
@@ -2794,12 +2826,13 @@ public final class Qwen35Model: LanguageModel {
         }
 
         // ── Final norm + lm_head on the LAST row only ────────────────────
+        // ITER 77 (PR10): fused via qwen35FinalNormLmHead.
         let lastRow = Tensor(
             buffer: h.buffer,
             offset: h.offset + (t - 1) * hidden * dtBytes,
             shape: [hidden], dtype: dt)
-        let normed = finalNorm(lastRow, on: cmd)
-        return lmHead(normed, on: cmd)
+        return qwen35FinalNormLmHead(
+            h: lastRow, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
     // ─── VLM embedding-input path ────────────────────────────────────
@@ -2849,8 +2882,10 @@ public final class Qwen35Model: LanguageModel {
             workCmd.waitUntilCompleted()
         }
 
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        // ITER 79 (PR10): fused finalNorm+lmHead on the VLM embed-input
+        // forward path too.
+        return qwen35FinalNormLmHead(
+            h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
     /// Raw embedding-table lookup for one text token.
