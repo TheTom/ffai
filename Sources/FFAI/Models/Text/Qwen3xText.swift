@@ -1108,6 +1108,17 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     public var bytesInUse: Int {
         length == 0 ? 0 : bytesAllocated
     }
+
+    /// Composite-level length-only restore. Tensor state for conv/gdn is
+    /// restored separately by the caller via the per-cache `restore`
+    /// methods; this fixes the position counter without disturbing the
+    /// just-restored sub-cache buffers.
+    public func setLength(_ length: Int) {
+        precondition(
+            length >= 0,
+            "Qwen35GDNLayerCache.setLength: must be ≥ 0")
+        self.length = length
+    }
 }
 
 // ─── Qwen35GDNMixer — Gated Delta Net recurrent mixer ────────────────

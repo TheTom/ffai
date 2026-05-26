@@ -134,6 +134,74 @@ public final class GDNStateCache: LayerCacheProtocol, @unchecked Sendable {
     public var bytesInUse: Int {
         length == 0 ? 0 : bytesAllocated
     }
+
+    /// Cached snapshot tensor. Reused across snapshot calls so
+    /// spec-decode doesn't churn ~2 MB per layer per verify step.
+    private var cachedSnapshot: Tensor?
+
+    /// Copy `current` into a fresh (or cached) snapshot tensor. Used
+    /// by spec-decode to roll back the recurrent state on draft reject.
+    /// Returns the snapshot tensor; caller stores it until needed.
+    public func snapshot(device: Device = .shared) -> Tensor {
+        let shape = [numValueHeads, valueHeadDim, keyHeadDim]
+        if cachedSnapshot == nil {
+            cachedSnapshot = Tensor.empty(
+                shape: shape, dtype: .f32, device: device)
+        }
+        let snap = cachedSnapshot!
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "GDNStateCache.snapshot: makeBlitCommandEncoder failed")
+        }
+        let bytes =
+            numValueHeads * valueHeadDim * keyHeadDim * DType.f32.byteSize
+        blit.copy(
+            from: current.buffer, sourceOffset: current.offset,
+            to: snap.buffer, destinationOffset: snap.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return snap
+    }
+
+    /// Restore from a snapshot taken via `snapshot()`. Overwrites
+    /// `current` with the snapshot contents; leaves `next` alone (it'll
+    /// be overwritten on the next kernel dispatch). Does NOT decrement
+    /// `length` — caller must `setLength(...)` to match.
+    public func restore(from snapshot: Tensor, device: Device = .shared) {
+        let expected = numValueHeads * valueHeadDim * keyHeadDim
+        precondition(
+            snapshot.elementCount == expected,
+            "GDNStateCache.restore: snapshot has \(snapshot.elementCount) elements, expected \(expected)"
+        )
+        precondition(
+            snapshot.dtype == .f32,
+            "GDNStateCache.restore: snapshot must be f32")
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "GDNStateCache.restore: makeBlitCommandEncoder failed")
+        }
+        let bytes = expected * DType.f32.byteSize
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: current.buffer, destinationOffset: current.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
+
+    /// Set the position counter directly without zeroing buffers.
+    /// Spec-decode restore path uses this after writing the snapshot
+    /// tensor into `current`. `reset()` + `swap()` would wipe the
+    /// just-restored state.
+    public func setLength(_ length: Int) {
+        precondition(length >= 0, "GDNStateCache.setLength: must be ≥ 0")
+        self.length = length
+    }
 }
 
 extension Array where Element == GDNStateCache {

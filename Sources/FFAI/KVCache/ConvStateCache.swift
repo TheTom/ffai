@@ -62,6 +62,61 @@ public final class ConvStateCache: @unchecked Sendable {
     public var bytesAllocated: Int {
         (kernelSize - 1) * nChannels * dtype.byteSize
     }
+
+    /// Cached snapshot tensor. Reused across snapshot calls so
+    /// spec-decode doesn't churn ~30 KB per layer per verify step.
+    private var cachedSnapshot: Tensor?
+
+    /// Copy `state` into a fresh (or cached) snapshot tensor. Used by
+    /// spec-decode to roll back the conv rolling window on draft reject.
+    public func snapshot(device: Device = .shared) -> Tensor {
+        let shape = [kernelSize - 1, nChannels]
+        if cachedSnapshot == nil
+            || cachedSnapshot!.shape != shape
+            || cachedSnapshot!.dtype != dtype
+        {
+            cachedSnapshot = Tensor.empty(
+                shape: shape, dtype: dtype, device: device)
+        }
+        let snap = cachedSnapshot!
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "ConvStateCache.snapshot: makeBlitCommandEncoder failed")
+        }
+        let bytes = bytesAllocated
+        blit.copy(
+            from: state.buffer, sourceOffset: state.offset,
+            to: snap.buffer, destinationOffset: snap.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return snap
+    }
+
+    /// Restore `state` from a snapshot taken via `snapshot()`.
+    public func restore(from snapshot: Tensor, device: Device = .shared) {
+        precondition(
+            snapshot.elementCount == state.elementCount,
+            "ConvStateCache.restore: snapshot element count mismatch")
+        precondition(
+            snapshot.dtype == dtype,
+            "ConvStateCache.restore: snapshot dtype mismatch")
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "ConvStateCache.restore: makeBlitCommandEncoder failed")
+        }
+        let bytes = bytesAllocated
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: state.buffer, destinationOffset: state.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
 }
 
 extension Array where Element == ConvStateCache {
