@@ -390,6 +390,34 @@ public final class MoELayer: Module, DecoderLayer {
     public let enableBGEMM: Bool
     public let useBm8Env: Bool
     public let useM1Env: Bool
+    /// ITER 64 (PR10): additional env-flag caches.
+    let noDequantGate: Bool
+    let gpuRouterEnabled: Bool
+    let forceBGEMMAtT1: Bool
+    let noBGEMMBm64: Bool
+
+    /// ITER 15/42 (PR10): lazy dequant of the gate weight + cached output.
+    /// Skipped when `gate.inner` is not a 8-bit QuantizedLinear or env
+    /// `FFAI_MOE_NO_DEQUANT_GATE=1` is set.
+    private var dequantizedGateCache: Tensor?
+    private var dequantizedGateCacheKN: Tensor?
+    private var dequantizedGateAttempted = false
+    private var gateLogitsScratch: Tensor?
+
+    /// ITER 41 (PR10): cached scratches for the per-expert weighted-sum
+    /// loop at decode T=1.
+    private var accumulatorScratch: Tensor?
+    private var topKScalarsBuf: MTLBuffer?
+    /// ITER 32 / 36 / 38 (PR10): cached per-expert g/u/inner/down outputs.
+    private var expertGScratches: [Tensor] = []
+    private var expertUScratches: [Tensor] = []
+    private var expertInnerScratches: [Tensor] = []
+    private var expertOutScratches: [Tensor] = []
+    /// ITER 56 (PR10): GPU MoE router scratches — written once per layer
+    /// per token by `mt_moe_router_topk`, then consumed by the per-slot
+    /// indexed qmms and the scalarFMAChain8.
+    private var routerIndicesScratch: Tensor?
+    private var routerWeightsScratch: Tensor?
 
     /// - gate: hidden → nExperts router projection.
     /// - gateProj/upProj/downProj: `nExperts`-long arrays of per-expert
@@ -450,6 +478,14 @@ public final class MoELayer: Module, DecoderLayer {
         self.enableBGEMM = env["FFAI_MOE_BGEMM"] != nil
         self.useBm8Env = env["FFAI_MOE_BGEMM_BM8"] != nil
         self.useM1Env = env["FFAI_MOE_M1"] != nil
+        self.noDequantGate = env["FFAI_MOE_NO_DEQUANT_GATE"] != nil
+        // ITER 80 (PR10): default GPU router ON now that ITER 72's
+        // end-to-end correctness pinning is in place across bf16/f16/f32.
+        // Opt out with `FFAI_MOE_GPU_ROUTER=0`. The win: 40 ×
+        // `waitUntilCompleted` per decode token → 0.
+        self.gpuRouterEnabled = env["FFAI_MOE_GPU_ROUTER"] != "0"
+        self.forceBGEMMAtT1 = env["FFAI_MOE_BGEMM_FORCE_T1"] != nil
+        self.noBGEMMBm64 = env["FFAI_MOE_BGEMM_NO_BM64"] != nil
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -492,8 +528,29 @@ public final class MoELayer: Module, DecoderLayer {
             "MoELayer.decode: input has \(h.elementCount) elements, expected hidden \(hidden)")
 
         // ── 1. Gate gemv on the caller's command buffer ──────────────
-        // Queued onto `cmd` so it runs after whatever produced `h`.
         let logitsTensor = gate(h, on: cmd)
+
+        // ── 2a. ITER 56 (PR10): GPU MoE router fast path ─────────────
+        // When `FFAI_MOE_GPU_ROUTER=1` (default ON per ITER 80) AND the
+        // layer has stacked int4 expert layout AND routing matches
+        // `mt_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
+        // MoE-style renorm, topK=8), skip the CPU sync entirely. The
+        // router writes topK indices + weights to a GPU buffer; per-
+        // expert qmms read their slot's expert id from that buffer via
+        // `dequantGemvInt4ExpertIndexed`; the per-slot routing weight
+        // feeds `scalarFMAChain8`.
+        if self.gpuRouterEnabled,
+            let stacked = stackedInt4Experts,
+            stacked.dtype == h.dtype,
+            router.gatingMode == .softmaxThenTopK,
+            router.normTopKProb,
+            router.expertBias == nil,
+            router.topK == 8
+        {
+            return decodeGPURouter(
+                h: h, logitsTensor: logitsTensor,
+                stacked: stacked, cmd: cmd, device: device)
+        }
 
         // ── 2. Commit + wait so the router can read the logits ───────
         // The decode path batches a token onto one command buffer; the
@@ -1042,6 +1099,185 @@ public final class MoELayer: Module, DecoderLayer {
         let u = upProj(x, on: cmd)
         let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj(inner, on: cmd)
+    }
+
+    /// ITER 56 (PR10): GPU MoE router decode path. Replaces the
+    /// `cmd.commit + waitUntilCompleted` sync with a full-GPU pipeline:
+    /// router writes topK indices + weights to GPU buffers; per-slot
+    /// indexed qmms (gate/up phase + down phase) batch onto shared
+    /// encoders; final accumulation via `scalarFMAChain8` (or the fused
+    /// `moeDownSwigluAccumInt4Chain8` kernel when constraints allow,
+    /// ITER 94).
+    ///
+    /// Predicated by `decode` callers — the layer must have stackedInt4
+    /// experts with matching dtype, router must be softmax-then-topK
+    /// with normTopKProb=true / no expertBias / topK=8.
+    private func decodeGPURouter(
+        h: Tensor, logitsTensor: Tensor,
+        stacked: StackedInt4Experts,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        // Lazy-init per-instance scratches.
+        if routerIndicesScratch == nil
+            || routerIndicesScratch!.elementCount != router.topK
+        {
+            routerIndicesScratch = Tensor.empty(
+                shape: [router.topK], dtype: .u32, device: device)
+            routerWeightsScratch = Tensor.empty(
+                shape: [router.topK], dtype: h.dtype, device: device)
+        }
+        if accumulatorScratch == nil
+            || accumulatorScratch!.dtype != h.dtype
+            || accumulatorScratch!.elementCount != hidden
+        {
+            accumulatorScratch = Tensor.empty(
+                shape: [hidden], dtype: h.dtype, device: device)
+        }
+        let outDim = stacked.moeIntermediate
+        for slot in 0 ..< router.topK {
+            while expertGScratches.count <= slot {
+                expertGScratches.append(
+                    Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+                expertUScratches.append(
+                    Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+                expertInnerScratches.append(
+                    Tensor.empty(shape: [outDim], dtype: h.dtype, device: device))
+                expertOutScratches.append(
+                    Tensor.empty(shape: [hidden], dtype: h.dtype, device: device))
+            }
+        }
+
+        // GPU router: logits → topK indices + weights (still on cmd).
+        Ops.moeRouterTopK(
+            logits: logitsTensor,
+            indicesOut: routerIndicesScratch!,
+            weightsOut: routerWeightsScratch!,
+            nExperts: router.nExperts, k: router.topK,
+            normTopkProb: router.normTopKProb,
+            on: cmd)
+
+        // ITER 58 (PR10): batched per-expert indexed qmms on ONE encoder
+        // per phase. Gate (8 calls) + up (8 calls) share inDim/outDim/
+        // groupSize → one Many encoder. Down (8 calls) has different
+        // out_dim → second Many encoder.
+        var expertIdxScratches: [Tensor] = []
+        expertIdxScratches.reserveCapacity(router.topK)
+        for slot in 0 ..< router.topK {
+            expertIdxScratches.append(
+                Tensor(
+                    buffer: routerIndicesScratch!.buffer,
+                    offset: routerIndicesScratch!.offset + slot * 4,
+                    shape: [1], dtype: .u32))
+        }
+
+        // Phase 1a: 16 calls (8 gate + 8 up) on one encoder.
+        var ws: [Tensor] = []
+        var ss: [Tensor] = []
+        var bs: [Tensor] = []
+        var ins: [Tensor] = []
+        var idxs: [Tensor] = []
+        var outs0: [Tensor] = []
+        ws.reserveCapacity(router.topK * 2)
+        ss.reserveCapacity(router.topK * 2)
+        bs.reserveCapacity(router.topK * 2)
+        ins.reserveCapacity(router.topK * 2)
+        idxs.reserveCapacity(router.topK * 2)
+        outs0.reserveCapacity(router.topK * 2)
+        for slot in 0 ..< router.topK {
+            ws.append(stacked.gateWeight)
+            ss.append(stacked.gateScales)
+            bs.append(stacked.gateBiases)
+            ins.append(h)
+            idxs.append(expertIdxScratches[slot])
+            outs0.append(expertGScratches[slot])
+            ws.append(stacked.upWeight)
+            ss.append(stacked.upScales)
+            bs.append(stacked.upBiases)
+            ins.append(h)
+            idxs.append(expertIdxScratches[slot])
+            outs0.append(expertUScratches[slot])
+        }
+        Ops.dequantGemvInt4ExpertIndexedMany(
+            weightsStacked: ws, scalesStacked: ss, biasesStacked: bs,
+            inputs: ins, expertIndices: idxs, outputs: outs0,
+            groupSize: stacked.groupSize, on: cmd)
+
+        // ITER 94 (PR10): fuse phase 1b (swigluMany), phase 2 (8 down
+        // indexed-gemvs), and phase 3 (scalarFMAChain8) into ONE
+        // dispatch via `ffai_moe_down_swiglu_accum_int4_chain8`. Per-
+        // slot `inner` is staged in 3 KiB threadgroup memory, never
+        // spilling to global memory. Kernel constraint:
+        // moeIntermediate ≤ 768 + groupSize == 64. Qwen3.6-A3B has
+        // exactly 768 so this matches; fall back to the 3-dispatch
+        // chain (ITER 29/30/31, 38/39, ITER 47) for any larger configs.
+        let gs = Array(expertGScratches.prefix(router.topK))
+        let us = Array(expertUScratches.prefix(router.topK))
+        let acc = accumulatorScratch!
+        if router.topK == 8
+            && stacked.moeIntermediate <= 768
+            && stacked.groupSize == 64
+        {
+            Ops.moeDownSwigluAccumInt4Chain8(
+                gates: gs, ups: us,
+                expertIndices: routerIndicesScratch!,
+                slotWeights: routerWeightsScratch!,
+                weightsStacked: stacked.downWeight,
+                scalesStacked: stacked.downScales,
+                biasesStacked: stacked.downBiases,
+                output: acc,
+                inDim: stacked.moeIntermediate,
+                outDim: hidden,
+                groupSize: stacked.groupSize,
+                on: cmd)
+        } else {
+            // Legacy 3-dispatch chain (Phase 1b + 2 + 3).
+            let inners = Array(expertInnerScratches.prefix(router.topK))
+            Ops.swigluMany(gates: gs, ups: us, outs: inners, on: cmd)
+            var dws: [Tensor] = []
+            var dss: [Tensor] = []
+            var dbs: [Tensor] = []
+            var dins: [Tensor] = []
+            var didxs: [Tensor] = []
+            var douts: [Tensor] = []
+            dws.reserveCapacity(router.topK)
+            dss.reserveCapacity(router.topK)
+            dbs.reserveCapacity(router.topK)
+            dins.reserveCapacity(router.topK)
+            didxs.reserveCapacity(router.topK)
+            douts.reserveCapacity(router.topK)
+            for slot in 0 ..< router.topK {
+                dws.append(stacked.downWeight)
+                dss.append(stacked.downScales)
+                dbs.append(stacked.downBiases)
+                dins.append(expertInnerScratches[slot])
+                didxs.append(expertIdxScratches[slot])
+                douts.append(expertOutScratches[slot])
+            }
+            Ops.dequantGemvInt4ExpertIndexedMany(
+                weightsStacked: dws, scalesStacked: dss, biasesStacked: dbs,
+                inputs: dins, expertIndices: didxs, outputs: douts,
+                groupSize: stacked.groupSize, on: cmd)
+            var scalars: [Tensor] = []
+            scalars.reserveCapacity(router.topK)
+            for slot in 0 ..< router.topK {
+                scalars.append(
+                    Tensor(
+                        buffer: routerWeightsScratch!.buffer,
+                        offset: routerWeightsScratch!.offset
+                            + slot * h.dtype.byteSize,
+                        shape: [1], dtype: h.dtype))
+            }
+            let outs = Array(expertOutScratches.prefix(router.topK))
+            Ops.scalarFMAChain8(
+                scalars: scalars, values: outs, out: acc, on: cmd)
+        }
+
+        // Commit cmd without wait — preserves the caller contract
+        // (caller starts a fresh cmd for residual-add / shared expert).
+        // The win is the ABSENT `waitUntilCompleted` that the CPU-sync
+        // path needed before this branch.
+        cmd.commit()
+        return acc
     }
 }
 
