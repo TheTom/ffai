@@ -2289,6 +2289,53 @@ public enum Ops {
         }
     }
 
+    /// Append the current token's K AND V rows to their caches in ONE
+    /// compute encoder. The cache buffers, layout, and writing thread
+    /// are identical to `kvCacheUpdate` — this just amortises the
+    /// encoder begin/end across both projections (saving one pair per
+    /// attention layer per decode token).
+    public static func kvCacheUpdateKV(
+        kSrc: Tensor, kCache: Tensor,
+        vSrc: Tensor, vCache: Tensor,
+        nKVHeads: Int, headDim: Int, maxSeq: Int, position: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kSrc.dtype == kCache.dtype && vSrc.dtype == vCache.dtype
+                && kSrc.dtype == vSrc.dtype,
+            "Ops.kvCacheUpdateKV: dtype mismatch")
+        let total = nKVHeads * headDim
+        let (grid, tg) = elementwiseGrid(total)
+        let hd = UInt32(headDim)
+        let ms = UInt32(maxSeq)
+        let pos = UInt32(position)
+        let psoName: String
+        switch kSrc.dtype {
+        case .f32: psoName = "kv_cache_update_f32"
+        case .f16: psoName = "kv_cache_update_f16"
+        case .bf16: psoName = "kv_cache_update_bf16"
+        default: fatalError("Ops.kvCacheUpdateKV: unsupported dtype \(kSrc.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        @inline(__always)
+        func dispatch(_ src: Tensor, _ cache: Tensor) {
+            enc.setBuffer(src.buffer, offset: src.offset, index: 0)
+            enc.setBuffer(cache.buffer, offset: cache.offset, index: 1)
+            var headDimV = hd
+            var maxSeqV = ms
+            var positionV = pos
+            enc.setBytes(&headDimV, length: 4, index: 2)
+            enc.setBytes(&maxSeqV, length: 4, index: 3)
+            enc.setBytes(&positionV, length: 4, index: 4)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(kSrc, kCache)
+        dispatch(vSrc, vCache)
+        enc.endEncoding()
+    }
+
     /// SDPA decode. q: [n_q_heads, head_dim]. k/v cache layout:
     /// [n_kv_heads, kv_stride, head_dim] where kv_stride is the physical
     /// capacity (maxSeq) and nKV is how many positions to attend to.

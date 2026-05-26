@@ -247,6 +247,36 @@ struct OpsSpecialPathTests {
 
     // MARK: - KV cache append
 
+    @Test("kvCacheUpdateKV f32 — appends K and V rows on one encoder")
+    func kvCacheUpdateKVF32() {
+        autoreleasepool {
+            let nKV = 2
+            let headDim = 4
+            let maxSeq = 3
+            let kSrc = Tensor.empty(shape: [nKV, headDim], dtype: .f32)
+            kSrc.copyIn(from: [Float(1), 2, 3, 4, 5, 6, 7, 8])
+            let vSrc = Tensor.empty(shape: [nKV, headDim], dtype: .f32)
+            vSrc.copyIn(from: [Float(10), 20, 30, 40, 50, 60, 70, 80])
+            let kCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            kCache.zero()
+            let vCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            vCache.zero()
+            runAndWait { cb in
+                Ops.kvCacheUpdateKV(
+                    kSrc: kSrc, kCache: kCache,
+                    vSrc: vSrc, vCache: vCache,
+                    nKVHeads: nKV, headDim: headDim,
+                    maxSeq: maxSeq, position: 1, on: cb)
+            }
+            let kGot = kCache.toArray(as: Float.self)
+            #expect(Array(kGot[4 ..< 8]) == [1, 2, 3, 4])
+            #expect(Array(kGot[16 ..< 20]) == [5, 6, 7, 8])
+            let vGot = vCache.toArray(as: Float.self)
+            #expect(Array(vGot[4 ..< 8]) == [10, 20, 30, 40])
+            #expect(Array(vGot[16 ..< 20]) == [50, 60, 70, 80])
+        }
+    }
+
     @Test("kvCacheUpdate f32 — writes one row into [nKV, maxSeq, headDim]")
     func kvCacheUpdateF32() {
         autoreleasepool {
