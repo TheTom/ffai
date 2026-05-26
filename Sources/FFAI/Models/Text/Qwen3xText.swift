@@ -1088,6 +1088,28 @@ public final class Qwen35GDNMixer: Module {
     let yF32Scratch: Tensor
     let yGatedScratch: Tensor
 
+    /// ITER 23 (PR10): batched 4-projection input fast path. When all 4
+    /// inProj are QuantizedLinear int4 with same groupSize, the mixer
+    /// routes through `Ops.dequantGemvInt4Four` — 4 qmms on one shared
+    /// encoder. Saves 3 encoder begin/end pairs per GDN layer × 30 ≈
+    /// 1.5 ms/token. Allocated scratch buffers are pinned via the
+    /// residency set in init (ITER 27).
+    private var batchedInputProj:
+        (
+            qW: Tensor, qS: Tensor, qB: Tensor,
+            zW: Tensor, zS: Tensor, zB: Tensor,
+            bW: Tensor, bS: Tensor, bB: Tensor,
+            aW: Tensor, aS: Tensor, aB: Tensor,
+            groupSize: Int
+        )?
+    private var qkvScratch: Tensor?
+    private var zScratch: Tensor?
+    private var bRawScratch: Tensor?
+    private var aRawScratch: Tensor?
+    /// ITER 95 (PR10): single-dispatch `ffai_batched_4_qgemv_fast` fast
+    /// path. Constraints: in_dim%512==0, each out_dim%8==0, groupSize=64.
+    private var fused4Eligible: Bool = false
+
     init(
         inProjQKV: AnyLinear, inProjZ: AnyLinear,
         inProjB: AnyLinear, inProjA: AnyLinear, outProj: AnyLinear,
@@ -1135,13 +1157,14 @@ public final class Qwen35GDNMixer: Module {
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
-        self.fused = ProcessInfo.processInfo.environment["FFAI_GDN_FUSED_PREP"] != nil
+        // ITER 19 (PR10): fused-prep is DEFAULT ON for Qwen3.6-A3B. The
+        // legacy host-loop path lives behind `FFAI_GDN_NO_FUSED_PREP=1`
+        // for precision comparison.
+        self.fused =
+            ProcessInfo.processInfo.environment["FFAI_GDN_NO_FUSED_PREP"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
-        // See the comments next to the field declarations for the
-        // cross-token safety argument (Metal hazard tracking + the
-        // engine's per-token cmd wait).
         self.convOutScratch = Tensor.empty(shape: [convDim], dtype: dtype, device: device)
         self.convActF32Scratch = Tensor.empty(shape: [convDim], dtype: .f32, device: device)
         self.aRawF32Scratch = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
@@ -1150,6 +1173,56 @@ public final class Qwen35GDNMixer: Module {
             shape: [numValueHeads, valueHeadDim],
             dtype: .f32, device: device)
         self.yGatedScratch = Tensor.empty(shape: [valueDim], dtype: dtype, device: device)
+
+        // ITER 23 (PR10): set up the batched 4-projection input fast
+        // path when all 4 inProj are QuantizedLinear int4 with same
+        // groupSize. ITER 27: pin scratches in the residency set.
+        if let qQL = inProjQKV.inner as? QuantizedLinear,
+            let zQL = inProjZ.inner as? QuantizedLinear,
+            let bQL = inProjB.inner as? QuantizedLinear,
+            let aQL = inProjA.inner as? QuantizedLinear,
+            qQL.bits == 4 && zQL.bits == 4 && bQL.bits == 4 && aQL.bits == 4,
+            qQL.groupSize == zQL.groupSize,
+            qQL.groupSize == bQL.groupSize,
+            qQL.groupSize == aQL.groupSize
+        {
+            self.batchedInputProj = (
+                qW: qQL.weight, qS: qQL.scales, qB: qQL.biases,
+                zW: zQL.weight, zS: zQL.scales, zB: zQL.biases,
+                bW: bQL.weight, bS: bQL.scales, bB: bQL.biases,
+                aW: aQL.weight, aS: aQL.scales, aB: aQL.biases,
+                groupSize: qQL.groupSize
+            )
+            // ITER 95: single-dispatch fast path eligibility.
+            let inDim = qQL.weight.shape[1] * 8
+            if inDim % 512 == 0
+                && convDim % 8 == 0 && valueDim % 8 == 0
+                && numValueHeads % 8 == 0
+                && qQL.groupSize == 64
+                && ProcessInfo.processInfo.environment["FFAI_NO_FUSED_GDN_4"] == nil
+            {
+                self.fused4Eligible = true
+            }
+            self.qkvScratch = Tensor.empty(
+                shape: [convDim], dtype: dtype, device: device)
+            self.zScratch = Tensor.empty(
+                shape: [valueDim], dtype: dtype, device: device)
+            self.bRawScratch = Tensor.empty(
+                shape: [numValueHeads], dtype: dtype, device: device)
+            self.aRawScratch = Tensor.empty(
+                shape: [numValueHeads], dtype: dtype, device: device)
+            // ITER 27: pin scratch buffers + fused-path constants so Metal
+            // skips per-encoder residency revalidation.
+            device.markWeightsResident([
+                qkvScratch!.buffer, zScratch!.buffer,
+                bRawScratch!.buffer, aRawScratch!.buffer,
+                convOutScratch.buffer, convActF32Scratch.buffer,
+                aRawF32Scratch.buffer, bRawF32Scratch.buffer,
+                yF32Scratch.buffer, yGatedScratch.buffer,
+                qNormWeightF32.buffer, kNormWeightF32.buffer,
+                aLogTF32.buffer, dtBiasTF32.buffer, epsBufFused.buffer,
+            ])
+        }
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -1184,16 +1257,62 @@ public final class Qwen35GDNMixer: Module {
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         // ── GPU phase 1: projections + conv + SiLU ────────────────────
-        let qkv = inProjQKV(xNorm, on: cmd)  // [conv_dim]
-        let z = inProjZ(xNorm, on: cmd)  // [value_dim]
-        let bRaw = inProjB(xNorm, on: cmd)  // [num_value_heads]
-        let aRaw = inProjA(xNorm, on: cmd)  // [num_value_heads]
+        // ITER 23 (PR10): 4-projection shared-encoder fast path when all
+        // inProj are int4 QuantizedLinear with same groupSize. Saves 3
+        // encoder begin/end pairs per GDN layer × 30 ≈ 1.5 ms/token.
+        // ITER 95: single-dispatch fast path via `batched4QgemvInt4Fast`
+        // when constraints match (out_dim%8, in_dim%512, groupSize=64).
+        let qkv: Tensor
+        let z: Tensor
+        let bRaw: Tensor
+        let aRaw: Tensor
+        if let bp = batchedInputProj {
+            qkv = qkvScratch!
+            z = zScratch!
+            bRaw = bRawScratch!
+            aRaw = aRawScratch!
+            if fused4Eligible {
+                Ops.batched4QgemvInt4Fast(
+                    input: xNorm,
+                    wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkv,
+                    wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: z,
+                    wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bRaw,
+                    wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aRaw,
+                    groupSize: bp.groupSize, on: cmd)
+            } else {
+                Ops.dequantGemvInt4Four(
+                    input: xNorm,
+                    w0: bp.qW, s0: bp.qS, b0: bp.qB, out0: qkv,
+                    w1: bp.zW, s1: bp.zS, b1: bp.zB, out1: z,
+                    w2: bp.bW, s2: bp.bS, b2: bp.bB, out2: bRaw,
+                    w3: bp.aW, s3: bp.aS, b3: bp.aB, out3: aRaw,
+                    groupSize: bp.groupSize, on: cmd)
+            }
+        } else {
+            qkv = inProjQKV(xNorm, on: cmd)  // [conv_dim]
+            z = inProjZ(xNorm, on: cmd)  // [value_dim]
+            bRaw = inProjB(xNorm, on: cmd)  // [num_value_heads]
+            aRaw = inProjA(xNorm, on: cmd)  // [num_value_heads]
+        }
 
         Ops.conv1dCausalStep(
             x: qkv, w: convW, b: convB,
             state: cache.conv.state, into: convOutScratch,
             nChannels: convDim, kernelSize: convKernel, on: cmd)
-        let convAct = Ops.silu(convOutScratch, on: cmd)  // [conv_dim]
+        // ITER 81 (PR10): in the fused path the convOut silu + cast to
+        // f32 fuse with the aRaw / bRaw casts via
+        // `siluCastF32PlusCastF32Two` later on the same shared encoder.
+        // Outside the fused path the legacy host phase still needs the
+        // bf16 silu output, so compute it eagerly there.
+        let convAct: Tensor
+        if fused {
+            // Fused path: skip the silu here; the combined
+            // siluCast+cast2 dispatch below produces the f32 input
+            // directly.
+            convAct = convOutScratch
+        } else {
+            convAct = Ops.silu(convOutScratch, on: cmd)  // [conv_dim]
+        }
 
         // ── Fused GDN prep + recurrence path (opt-in) ─────────────────
         //
@@ -1220,9 +1339,15 @@ public final class Qwen35GDNMixer: Module {
             // fused step runs the recurrence in fp32 against the
             // existing fp32 state slots, matching the canonical
             // precision of the legacy path.
-            Ops.castToF32(convAct, into: convActF32Scratch, on: cmd)
-            Ops.castToF32(aRaw, into: aRawF32Scratch, on: cmd)
-            Ops.castToF32(bRaw, into: bRawF32Scratch, on: cmd)
+            // ITER 81 (PR10): collapse silu+cast (convOut → f32) AND
+            // the two plain casts (aRaw, bRaw → f32) onto ONE shared
+            // encoder. Saves 1 encoder begin/end per GDN layer × 30 ≈
+            // 30 pairs per decode token.
+            Ops.siluCastF32PlusCastF32Two(
+                siluIn: convOutScratch, into: convActF32Scratch,
+                aRaw, into: aRawF32Scratch,
+                bRaw, into: bRawF32Scratch,
+                on: cmd)
 
             Ops.gatedDeltaPrepStep(
                 convOut: convActF32Scratch,
