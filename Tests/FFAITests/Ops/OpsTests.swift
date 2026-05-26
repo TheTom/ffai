@@ -1110,6 +1110,75 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaDecode2Pass f32 — blocks=32 matches single-pass sdpaDecode")
+    func sdpaDecode2PassMatchesSinglePass() {
+        autoreleasepool {
+            // pass2 hardcodes a 32-lane block reduction, so blocks
+            // must be ≥ 32 and a multiple of 32 — anything smaller
+            // silently emits zero output.
+            let D = 128
+            let blocks = 32
+            let kvStride = 64
+            let nKV = 64
+            let nQHeads = 2
+            let nKVHeads = 1
+            let q = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            var qData = [Float](repeating: 0, count: nQHeads * D)
+            for h in 0 ..< nQHeads {
+                qData[h * D] = Float(h + 1)
+                qData[h * D + 1] = 0.5
+            }
+            q.copyIn(from: qData)
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            var kData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for p in 0 ..< nKV {
+                kData[p * D] = Float(p + 1) * 0.05
+                kData[p * D + 1] = 0.1
+            }
+            k.copyIn(from: kData)
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for p in 0 ..< nKV {
+                for d in 0 ..< D {
+                    vData[p * D + d] = Float((p + 1) * (d + 1)) * 0.01
+                }
+            }
+            v.copyIn(from: vData)
+            // Reference.
+            var refOut: Tensor!
+            runAndWait { cb in
+                refOut = Ops.sdpaDecode(
+                    q: q, k: k, v: v,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads,
+                    headDim: D, nKV: nKV, kvStride: kvStride,
+                    scale: 1.0, on: cb)
+            }
+            // 2-pass.
+            let partialO = Tensor.empty(shape: [nQHeads, blocks, D], dtype: .f32)
+            let partialM = Tensor.empty(shape: [nQHeads, blocks], dtype: .f32)
+            let partialL = Tensor.empty(shape: [nQHeads, blocks], dtype: .f32)
+            let out = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            partialO.zero()
+            partialM.zero()
+            partialL.zero()
+            out.zero()
+            runAndWait { cb in
+                Ops.sdpaDecode2Pass(
+                    q: q, k: k, v: v,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: D,
+                    nKV: nKV, kvStride: kvStride, blocks: blocks,
+                    scale: 1.0,
+                    partialO: partialO, partialM: partialM, partialL: partialL,
+                    into: out, on: cb)
+            }
+            let r = out.toArray(as: Float.self)
+            let ref = refOut.toArray(as: Float.self)
+            for i in 0 ..< nQHeads * D {
+                #expect(abs(r[i] - ref[i]) < 1e-2, "i=\(i): \(r[i]) vs \(ref[i])")
+            }
+        }
+    }
+
     @Test("sdpaMultiTreeMask — all-zero mask reproduces non-causal sdpaMulti output")
     func sdpaMultiTreeMaskAllowAll() {
         autoreleasepool {

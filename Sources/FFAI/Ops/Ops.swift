@@ -3127,6 +3127,138 @@ public enum Ops {
         return result
     }
 
+    /// Two-pass Flash-Decoding SDPA. Pass 1 partitions the KV cache
+    /// into `blocks` even tiles and writes a per-block partial
+    /// `(O, max, lse)` triple; pass 2 merges them with the log-sum-exp
+    /// trick. Wins over single-pass `sdpaDecode` at long KV (≥ 1K
+    /// typical), where the single-pass kernel starves the GPU with
+    /// one threadgroup per Q-head.
+    ///
+    /// **Block-count contract.** The pass2 kernel hardcodes a 32-wide
+    /// reduction (`bn = 32` per lane) over `blocks / 32` chunks, so
+    /// `blocks` MUST be a multiple of 32 and at least 32. Passing
+    /// `blocks < 32` causes pass2 to iterate zero chunks and emit an
+    /// all-zero output silently — the precondition below catches that.
+    /// 32 is the standard short-context tile; 64 / 96 / 128 are
+    /// reasonable for very long contexts.
+    ///
+    /// **Scratch buffer sizing.** Caller owns the partials; reuse
+    /// across decode steps is safe because the shape depends only on
+    /// `(nQHeads, headDim, blocks)`:
+    ///   - `partialO` : `[nQHeads, blocks, headDim]` matching `q.dtype`
+    ///   - `partialM` : `[nQHeads, blocks]` fp32 (running max)
+    ///   - `partialL` : `[nQHeads, blocks]` fp32 (running lse)
+    public static func sdpaDecode2Pass(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        nKV: Int, kvStride: Int, blocks: Int,
+        scale: Float,
+        partialO: Tensor, partialM: Tensor, partialL: Tensor,
+        into out: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaDecode2Pass: nQHeads must be a multiple of nKVHeads")
+        let gqaFactor = nQHeads / nKVHeads
+        precondition(
+            blocks >= 32 && blocks % 32 == 0,
+            "Ops.sdpaDecode2Pass: blocks (\(blocks)) must be a multiple of 32 "
+                + "and ≥ 32 — pass2 hardcodes a 32-lane block-merge reduction")
+        precondition(
+            partialO.elementCount == nQHeads * blocks * headDim,
+            "Ops.sdpaDecode2Pass: partialO must be [nQHeads, blocks, headDim]")
+        precondition(
+            partialM.elementCount == nQHeads * blocks && partialM.dtype == .f32,
+            "Ops.sdpaDecode2Pass: partialM must be [nQHeads, blocks] f32")
+        precondition(
+            partialL.elementCount == nQHeads * blocks && partialL.dtype == .f32,
+            "Ops.sdpaDecode2Pass: partialL must be [nQHeads, blocks] f32")
+        precondition(
+            partialO.dtype == q.dtype && out.dtype == q.dtype,
+            "Ops.sdpaDecode2Pass: partialO / out dtype must match q")
+
+        // Pass 1: per-block partial O / m / l. One TG per
+        // (kv_head, block) with `gqa_factor` simdgroups × 32 lanes,
+        // each lane owning `headDim / 32` consecutive elements.
+        let pass1TgWidth = gqaFactor * 32
+        let pass1Grid = MTLSize(
+            width: nKVHeads * pass1TgWidth, height: blocks, depth: 1)
+        let pass1Tg = MTLSize(width: pass1TgWidth, height: 1, depth: 1)
+
+        // Pass 2: merge partials across blocks. One TG per Q-head with
+        // 32 simdgroups × 32 lanes = 1024 threads.
+        let pass2TgWidth = 1024
+        let pass2Grid = MTLSize(
+            width: nQHeads * pass2TgWidth, height: 1, depth: 1)
+        let pass2Tg = MTLSize(width: pass2TgWidth, height: 1, depth: 1)
+
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.sdpa_decode_2pass_pass1_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_f32(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case .f16:
+            MetalTileKernels.sdpa_decode_2pass_pass1_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_f16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.sdpa_decode_2pass_pass1_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaDecode2Pass: unsupported dtype \(q.dtype)")
+        }
+    }
+
     /// Multi-query SDPA — attends `nQuery` query rows against a shared
     /// K/V cache in one dispatch. `q` / output are `[nQuery, nQHeads,
     /// headDim]`; `k` / `v` are the cache buffers `[nKVHeads, kvStride,
