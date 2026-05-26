@@ -221,15 +221,16 @@ public final class QuantizedLinear: Module {
     ) -> Tensor {
         let outDim = weight.shape[0]
         let inDim = scales.shape[scales.shape.count - 1] * groupSize
-        // 4-bit goes through the fast mt_qmm_mma path. Other bit-widths
-        // (commonly 8-bit on smaller projections like Qwen3.5's
-        // shared_expert_gate at hidden→1) fall back to T sequential
-        // `dequantGemv` calls on the same `cmd`. Slower than a true
-        // batched kernel but bit-identical to the per-token path, and
-        // the projections that hit this branch are tiny so the per-token
-        // launch overhead is in the noise.
+        // 4-bit goes through the fast mt_qmm_mma path when the output
+        // dimension is a multiple of 32 (the BN tile of the underlying
+        // `dequantGemmDynamicM` kernel). Anything narrower — including
+        // 4-bit shared_expert_gate at outDim=1 — falls through to the
+        // per-row dequantGemv loop. Other bit-widths (commonly 8-bit
+        // on the same narrow projections) take the same fallback. Both
+        // fallbacks are bit-identical to the per-token path; their
+        // per-token launch overhead is in the noise on hidden→1 shapes.
         let out: Tensor
-        if bits == 4 {
+        if bits == 4 && outDim % 32 == 0 {
             out = Tensor.empty(shape: [t, outDim], dtype: x.dtype, device: device)
             Ops.dequantGemmDynamicM(
                 input: x, weight: weight, scales: scales, biases: biases,
