@@ -24,7 +24,7 @@
 // lookup in `PSOCache.lookup`).
 
 import Foundation
-import Metal
+@preconcurrency import Metal
 import Testing
 
 @testable import MetalTileSwift
