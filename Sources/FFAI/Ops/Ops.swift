@@ -840,6 +840,69 @@ public enum Ops {
         }
     }
 
+    /// Partial RoPE rotation on TWO tensors (typically Q + K) in ONE
+    /// compute encoder. Both tensors share the same `(headDim,
+    /// rotaryDim, position, thetaBase, scaling)` and dtype. The
+    /// kernel writes in-place exactly like `ropePartial`, so passing
+    /// `out == qk` is required.
+    public static func ropePartialTwo(
+        _ q: Tensor, _ k: Tensor, position: Int,
+        headDim: Int, rotaryDim: Int,
+        thetaBase: Float,
+        scaling: RoPEScaling = .none,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            q.dtype == k.dtype,
+            "Ops.ropePartialTwo: dtype mismatch")
+        precondition(
+            q.elementCount % headDim == 0 && k.elementCount % headDim == 0,
+            "Ops.ropePartialTwo: sizes must be multiples of headDim")
+        precondition(
+            rotaryDim > 0 && rotaryDim <= headDim && rotaryDim % 2 == 0,
+            "Ops.ropePartialTwo: rotaryDim (\(rotaryDim)) must be even and in 1...headDim")
+        let psoName: String
+        switch q.dtype {
+        case .f32: psoName = "ffai_rope_llama_f32"
+        case .f16: psoName = "ffai_rope_llama_f16"
+        case .bf16: psoName = "ffai_rope_llama_bf16"
+        default: fatalError("Ops.ropePartialTwo: unsupported dtype \(q.dtype)")
+        }
+        let halfRotary = rotaryDim / 2
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // RoPE constants are shared across q and k — set ONCE.
+        var hd = UInt32(headDim)
+        var half = UInt32(halfRotary)
+        var pos = UInt32(position)
+        var theta = thetaBase
+        var scaleFactor = scaling.scaleFactor
+        var lowFreq = scaling.lowFreqFactor
+        var highFreq = scaling.highFreqFactor
+        var origMax = scaling.originalMaxPosition
+        enc.setBytes(&hd, length: 4, index: 2)
+        enc.setBytes(&half, length: 4, index: 3)
+        enc.setBytes(&pos, length: 4, index: 4)
+        enc.setBytes(&theta, length: 4, index: 5)
+        enc.setBytes(&scaleFactor, length: 4, index: 6)
+        enc.setBytes(&lowFreq, length: 4, index: 7)
+        enc.setBytes(&highFreq, length: 4, index: 8)
+        enc.setBytes(&origMax, length: 4, index: 9)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ t: Tensor) {
+            let nHeads = t.elementCount / headDim
+            let grid = MTLSize(width: nHeads, height: halfRotary, depth: 1)
+            enc.setBuffer(t.buffer, offset: t.offset, index: 0)
+            enc.setBuffer(t.buffer, offset: t.offset, index: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(q)
+        dispatch(k)
+        enc.endEncoding()
+    }
+
     /// YaRN RoPE parameters. `low` / `high` are the correction-range
     /// bounds — precomputed via `RoPEYaRN.from(...)` since they need a
     /// `floor`/`ceil`/`ln` computation that is constant across the

@@ -110,6 +110,45 @@ struct OpsTests {
         }
     }
 
+    @Test("ropePartialTwo f32 — same result as two sequential ropePartial calls")
+    func ropePartialTwoMatchesSequential() {
+        autoreleasepool {
+            let headDim = 4
+            let rotaryDim = 2
+            let q0 = Tensor.empty(shape: [headDim], dtype: .f32)
+            q0.copyIn(from: [Float(1), 0, 7, 9])
+            let k0 = Tensor.empty(shape: [headDim], dtype: .f32)
+            k0.copyIn(from: [Float(0), 1, -3, 4])
+            let q1 = Tensor.empty(shape: [headDim], dtype: .f32)
+            q1.copyIn(from: [Float(1), 0, 7, 9])
+            let k1 = Tensor.empty(shape: [headDim], dtype: .f32)
+            k1.copyIn(from: [Float(0), 1, -3, 4])
+            // Reference: two independent ropePartial calls.
+            runAndWait { cb in
+                Ops.ropePartial(
+                    q0, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+                Ops.ropePartial(
+                    k0, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+            }
+            // Batched: one-encoder, two dispatches.
+            runAndWait { cb in
+                Ops.ropePartialTwo(
+                    q1, k1, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+            }
+            let r0q = q0.toArray(as: Float.self)
+            let r0k = k0.toArray(as: Float.self)
+            let r1q = q1.toArray(as: Float.self)
+            let r1k = k1.toArray(as: Float.self)
+            for i in 0 ..< headDim {
+                #expect(abs(r0q[i] - r1q[i]) < 1e-5, "q[\(i)]: \(r0q[i]) vs \(r1q[i])")
+                #expect(abs(r0k[i] - r1k[i]) < 1e-5, "k[\(i)]: \(r0k[i]) vs \(r1k[i])")
+            }
+        }
+    }
+
     @Test("ropePartial f32 — rotaryDim == headDim matches full rope")
     func ropePartialFullEqualsRope() {
         autoreleasepool {
