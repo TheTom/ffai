@@ -627,7 +627,9 @@ public final class LFM2MLP: Module {
     func forward(_ x: Tensor, on cmd: MTLCommandBuffer) -> Tensor {
         let gate = w1(x, on: cmd)
         let up = w3(x, on: cmd)
-        let inner = Ops.mul(Ops.silu(gate, on: cmd), up, on: cmd)
+        // Fused silu(gate) * up — one kernel, intermediate stays in
+        // registers instead of materialising silu(gate) in DRAM.
+        let inner = Ops.swiglu(gate: gate, up: up, on: cmd)
         return w2(inner, on: cmd)
     }
 }
