@@ -31,6 +31,13 @@
 //     for the attention QKV step at decode (T=1)
 //   * `rmsNormSmall` — RMSNorm specialized for "small" row widths
 //     (n < 128) where the wide variant would be wasteful.
+//   * `scalarFMA` / `scalarFMAMany` / `scalarFMAChain8` —
+//     scalar-broadcast FMA for the MoE top-K expert accumulator path
+//     (avoids materializing a `Tensor.filled([hidden], weight)`
+//     broadcast buffer per expert).
+//   * `sigmoidScalarFMAResidual` — `sigmoidScalarFMA` with the
+//     residual add folded in for the post-MoE-FFN path (the bare
+//     `sigmoidScalarFMA` sibling lives in `Ops.swift`).
 
 import Foundation
 import Metal
@@ -332,5 +339,262 @@ extension Ops {
             fatalError("Ops.rmsNormSmall: unsupported dtype \(x.dtype)")
         }
         return result
+    }
+
+    /// `out[i] = base[i] + scalar[0] * value[i]` with `scalar` a
+    /// 1-element buffer. Replaces the MoE top-K weighted-add chain at
+    /// decode T=1, which would otherwise be `Tensor.filled([hidden],
+    /// weight)` + `Ops.mul(expertOut, broadcast)` + `Ops.add(acc,
+    /// scaled)` — collapsing 1 host alloc + 2 dispatches into 1
+    /// dispatch + a 4-byte scalar buffer. Aliasing `out == base` is
+    /// safe: the kernel reads `value[idx]` and `base[idx]` then writes
+    /// `out[idx]`.
+    public static func scalarFMA(
+        scalar: Tensor, value: Tensor, base: Tensor,
+        into out: Tensor, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            scalar.dtype == value.dtype && value.dtype == base.dtype
+                && base.dtype == out.dtype,
+            "Ops.scalarFMA: all tensors must share dtype")
+        precondition(
+            scalar.elementCount == 1,
+            "Ops.scalarFMA: scalar must be [1] (got \(scalar.elementCount))")
+        precondition(
+            value.elementCount == base.elementCount
+                && base.elementCount == out.elementCount,
+            "Ops.scalarFMA: value / base / out must have matching elementCount")
+        let n = value.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_scalar_fma_f32(
+                scalar: scalar.buffer, scalarOffset: scalar.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_scalar_fma_f16(
+                scalar: scalar.buffer, scalarOffset: scalar.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_scalar_fma_bf16(
+                scalar: scalar.buffer, scalarOffset: scalar.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.scalarFMA: unsupported dtype \(out.dtype)")
+        }
+    }
+
+    /// N back-to-back `scalarFMA` dispatches accumulating into the same
+    /// `acc` tensor on ONE compute encoder. Saves N-1 encoder
+    /// begin/end pairs versus N independent `scalarFMA` calls. Used by
+    /// the MoE top-K accumulator path (N=topK, ×nMoELayers per decode
+    /// token). Metal's in-order execution within a single encoder makes
+    /// the serial accumulation safe.
+    public static func scalarFMAMany(
+        scalars: [Tensor], values: [Tensor], acc: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            scalars.count == values.count, "Ops.scalarFMAMany: count mismatch")
+        precondition(!scalars.isEmpty, "Ops.scalarFMAMany: empty")
+        let dt = acc.dtype
+        for (i, s) in scalars.enumerated() {
+            precondition(
+                s.elementCount == 1,
+                "Ops.scalarFMAMany: scalar[\(i)] must be [1]")
+            precondition(
+                s.dtype == dt && values[i].dtype == dt,
+                "Ops.scalarFMAMany: dtype mismatch at \(i)")
+            precondition(
+                values[i].elementCount == acc.elementCount,
+                "Ops.scalarFMAMany: value[\(i)] / acc size mismatch")
+        }
+        let n = acc.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        let psoName: String
+        switch dt {
+        case .f32: psoName = "mt_scalar_fma_f32"
+        case .f16: psoName = "mt_scalar_fma_f16"
+        case .bf16: psoName = "mt_scalar_fma_bf16"
+        default: fatalError("Ops.scalarFMAMany: unsupported dtype \(dt)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        enc.setComputePipelineState(pso)
+        // Kernel buffer bindings: 0 scalar, 1 value, 2 base, 3 out.
+        // Base and out are always `acc`; only scalar/value rotate per
+        // dispatch within this encoder.
+        enc.setBuffer(acc.buffer, offset: acc.offset, index: 2)
+        enc.setBuffer(acc.buffer, offset: acc.offset, index: 3)
+        for i in 0 ..< scalars.count {
+            enc.setBuffer(scalars[i].buffer, offset: scalars[i].offset, index: 0)
+            enc.setBuffer(values[i].buffer, offset: values[i].offset, index: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        enc.endEncoding()
+    }
+
+    /// 8-way fused scalarFMA chain. Computes
+    /// `out[i] = sum_{k=0..8} scalars[k][0] * values[k][i]` in ONE
+    /// kernel dispatch. Collapses the topK=8 expert accumulator chain
+    /// (8 sequential `mt_scalar_fma` dispatches + 1 zero-fill of `acc`)
+    /// into a single dispatch with 16 input buffers, saving 7 read +
+    /// 7 write roundtrips of `acc` per MoE layer.
+    public static func scalarFMAChain8(
+        scalars: [Tensor], values: [Tensor], out: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            scalars.count == 8 && values.count == 8,
+            "Ops.scalarFMAChain8: requires exactly 8 of each")
+        let dt = out.dtype
+        for i in 0 ..< 8 {
+            precondition(
+                scalars[i].elementCount == 1,
+                "Ops.scalarFMAChain8: scalar[\(i)] must be [1]")
+            precondition(
+                scalars[i].dtype == dt && values[i].dtype == dt,
+                "Ops.scalarFMAChain8: dtype mismatch at \(i)")
+            precondition(
+                values[i].elementCount == out.elementCount,
+                "Ops.scalarFMAChain8: value[\(i)] / out size mismatch")
+        }
+        let n = out.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch dt {
+        case .f32:
+            MetalTileKernels.mt_scalar_fma_chain8_f32(
+                scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
+                value0: values[0].buffer, value0Offset: values[0].offset,
+                scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
+                value1: values[1].buffer, value1Offset: values[1].offset,
+                scalar2: scalars[2].buffer, scalar2Offset: scalars[2].offset,
+                value2: values[2].buffer, value2Offset: values[2].offset,
+                scalar3: scalars[3].buffer, scalar3Offset: scalars[3].offset,
+                value3: values[3].buffer, value3Offset: values[3].offset,
+                scalar4: scalars[4].buffer, scalar4Offset: scalars[4].offset,
+                value4: values[4].buffer, value4Offset: values[4].offset,
+                scalar5: scalars[5].buffer, scalar5Offset: scalars[5].offset,
+                value5: values[5].buffer, value5Offset: values[5].offset,
+                scalar6: scalars[6].buffer, scalar6Offset: scalars[6].offset,
+                value6: values[6].buffer, value6Offset: values[6].offset,
+                scalar7: scalars[7].buffer, scalar7Offset: scalars[7].offset,
+                value7: values[7].buffer, value7Offset: values[7].offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_scalar_fma_chain8_f16(
+                scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
+                value0: values[0].buffer, value0Offset: values[0].offset,
+                scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
+                value1: values[1].buffer, value1Offset: values[1].offset,
+                scalar2: scalars[2].buffer, scalar2Offset: scalars[2].offset,
+                value2: values[2].buffer, value2Offset: values[2].offset,
+                scalar3: scalars[3].buffer, scalar3Offset: scalars[3].offset,
+                value3: values[3].buffer, value3Offset: values[3].offset,
+                scalar4: scalars[4].buffer, scalar4Offset: scalars[4].offset,
+                value4: values[4].buffer, value4Offset: values[4].offset,
+                scalar5: scalars[5].buffer, scalar5Offset: scalars[5].offset,
+                value5: values[5].buffer, value5Offset: values[5].offset,
+                scalar6: scalars[6].buffer, scalar6Offset: scalars[6].offset,
+                value6: values[6].buffer, value6Offset: values[6].offset,
+                scalar7: scalars[7].buffer, scalar7Offset: scalars[7].offset,
+                value7: values[7].buffer, value7Offset: values[7].offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_scalar_fma_chain8_bf16(
+                scalar0: scalars[0].buffer, scalar0Offset: scalars[0].offset,
+                value0: values[0].buffer, value0Offset: values[0].offset,
+                scalar1: scalars[1].buffer, scalar1Offset: scalars[1].offset,
+                value1: values[1].buffer, value1Offset: values[1].offset,
+                scalar2: scalars[2].buffer, scalar2Offset: scalars[2].offset,
+                value2: values[2].buffer, value2Offset: values[2].offset,
+                scalar3: scalars[3].buffer, scalar3Offset: scalars[3].offset,
+                value3: values[3].buffer, value3Offset: values[3].offset,
+                scalar4: scalars[4].buffer, scalar4Offset: scalars[4].offset,
+                value4: values[4].buffer, value4Offset: values[4].offset,
+                scalar5: scalars[5].buffer, scalar5Offset: scalars[5].offset,
+                value5: values[5].buffer, value5Offset: values[5].offset,
+                scalar6: scalars[6].buffer, scalar6Offset: scalars[6].offset,
+                value6: values[6].buffer, value6Offset: values[6].offset,
+                scalar7: scalars[7].buffer, scalar7Offset: scalars[7].offset,
+                value7: values[7].buffer, value7Offset: values[7].offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.scalarFMAChain8: unsupported dtype \(dt)")
+        }
+    }
+
+    /// `sigmoidScalarFMA` with an extra residual term folded in:
+    /// `out[i] = residual[i] + base[i] + sigmoid(gate[0]) * value[i]`.
+    /// Collapses the MoE post-FFN two-step chain
+    /// `sigmoidScalarFMA(gate, sharedOut, routed) -> ffnOut` followed
+    /// by `Ops.add(postMix, ffnOut)` into one kernel, saving a
+    /// `[hidden]` DRAM roundtrip per MoE layer per decode token.
+    public static func sigmoidScalarFMAResidual(
+        gate: Tensor, value: Tensor, base: Tensor, residual: Tensor,
+        into out: Tensor, on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            gate.dtype == value.dtype && value.dtype == base.dtype
+                && base.dtype == residual.dtype && residual.dtype == out.dtype,
+            "Ops.sigmoidScalarFMAResidual: all tensors must share dtype")
+        precondition(
+            gate.elementCount == 1,
+            "Ops.sigmoidScalarFMAResidual: gate must be [1] (got \(gate.elementCount))")
+        precondition(
+            value.elementCount == base.elementCount
+                && base.elementCount == residual.elementCount
+                && residual.elementCount == out.elementCount,
+            "Ops.sigmoidScalarFMAResidual: value/base/residual/out must match elementCount")
+        let n = value.elementCount
+        let tgWidth = min(n, 256)
+        let grid = MTLSize(width: n, height: 1, depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_sigmoid_scalar_fma_residual_f32(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_sigmoid_scalar_fma_residual_f16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_sigmoid_scalar_fma_residual_bf16(
+                gate: gate.buffer, gateOffset: gate.offset,
+                value: value.buffer, valueOffset: value.offset,
+                base: base.buffer, baseOffset: base.offset,
+                residual: residual.buffer, residualOffset: residual.offset,
+                out: out.buffer, outOffset: out.offset,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sigmoidScalarFMAResidual: unsupported dtype \(out.dtype)")
+        }
     }
 }

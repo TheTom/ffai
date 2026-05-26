@@ -128,6 +128,123 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("sigmoidScalarFMAResidual f32 — out = residual + base + sigmoid(gate) * value")
+    func sigmoidScalarFMAResidualF32() {
+        autoreleasepool {
+            let gate = Tensor.empty(shape: [1], dtype: .f32)
+            gate.copyIn(from: [Float(0)])  // sigmoid(0) = 0.5
+            let value = Tensor.empty(shape: [4], dtype: .f32)
+            value.copyIn(from: [Float(2), 4, 6, 8])
+            let base = Tensor.empty(shape: [4], dtype: .f32)
+            base.copyIn(from: [Float(10), 20, 30, 40])
+            let residual = Tensor.empty(shape: [4], dtype: .f32)
+            residual.copyIn(from: [Float(100), 200, 300, 400])
+            let out = Tensor.empty(shape: [4], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.sigmoidScalarFMAResidual(
+                    gate: gate, value: value, base: base, residual: residual,
+                    into: out, on: cb)
+            }
+            // out[i] = residual[i] + base[i] + 0.5 * value[i]
+            let r = out.toArray(as: Float.self)
+            #expect(abs(r[0] - 111) < 1e-4)
+            #expect(abs(r[1] - 222) < 1e-4)
+            #expect(abs(r[2] - 333) < 1e-4)
+            #expect(abs(r[3] - 444) < 1e-4)
+        }
+    }
+
+    @Test("scalarFMA f32 — out = base + scalar * value")
+    func scalarFMAF32() {
+        autoreleasepool {
+            let scalar = Tensor.empty(shape: [1], dtype: .f32)
+            scalar.copyIn(from: [Float(0.25)])
+            let value = Tensor.empty(shape: [4], dtype: .f32)
+            value.copyIn(from: [Float(4), 8, 12, 16])
+            let base = Tensor.empty(shape: [4], dtype: .f32)
+            base.copyIn(from: [Float(10), 20, 30, 40])
+            let out = Tensor.empty(shape: [4], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.scalarFMA(
+                    scalar: scalar, value: value, base: base,
+                    into: out, on: cb)
+            }
+            // 0.25 * [4,8,12,16] = [1,2,3,4]; + base = [11,22,33,44]
+            let r = out.toArray(as: Float.self)
+            #expect(abs(r[0] - 11) < 1e-4)
+            #expect(abs(r[1] - 22) < 1e-4)
+            #expect(abs(r[2] - 33) < 1e-4)
+            #expect(abs(r[3] - 44) < 1e-4)
+        }
+    }
+
+    @Test("scalarFMAMany f32 — N=3 serial accumulate into acc on one encoder")
+    func scalarFMAManyF32() {
+        autoreleasepool {
+            let n = 4
+            // Three (scalar, value) pairs accumulating into acc starting
+            // from initial values. Final acc[i] = acc0[i] + sum_k s_k * v_k[i].
+            let scalars: [Tensor] = (0 ..< 3).map { _ in
+                Tensor.empty(shape: [1], dtype: .f32)
+            }
+            scalars[0].copyIn(from: [Float(1.0)])
+            scalars[1].copyIn(from: [Float(2.0)])
+            scalars[2].copyIn(from: [Float(0.5)])
+            let values: [Tensor] = (0 ..< 3).map { _ in
+                Tensor.empty(shape: [n], dtype: .f32)
+            }
+            values[0].copyIn(from: [Float(1), 2, 3, 4])
+            values[1].copyIn(from: [Float(10), 20, 30, 40])
+            values[2].copyIn(from: [Float(100), 200, 300, 400])
+            let acc = Tensor.empty(shape: [n], dtype: .f32)
+            acc.copyIn(from: [Float(1000), 1000, 1000, 1000])
+            runAndWait { cb in
+                Ops.scalarFMAMany(scalars: scalars, values: values, acc: acc, on: cb)
+            }
+            // acc[i] = 1000 + 1·v0[i] + 2·v1[i] + 0.5·v2[i]
+            // i=0: 1000 + 1 + 20 + 50 = 1071
+            // i=1: 1000 + 2 + 40 + 100 = 1142
+            // i=2: 1000 + 3 + 60 + 150 = 1213
+            // i=3: 1000 + 4 + 80 + 200 = 1284
+            let r = acc.toArray(as: Float.self)
+            #expect(abs(r[0] - 1071) < 1e-3)
+            #expect(abs(r[1] - 1142) < 1e-3)
+            #expect(abs(r[2] - 1213) < 1e-3)
+            #expect(abs(r[3] - 1284) < 1e-3)
+        }
+    }
+
+    @Test("scalarFMAChain8 f32 — out = sum_{k=0..8} scalar_k * value_k")
+    func scalarFMAChain8F32() {
+        autoreleasepool {
+            let n = 4
+            let scalars: [Tensor] = (0 ..< 8).map { i in
+                let t = Tensor.empty(shape: [1], dtype: .f32)
+                t.copyIn(from: [Float(i + 1)])  // 1, 2, 3, ..., 8
+                return t
+            }
+            let values: [Tensor] = (0 ..< 8).map { i in
+                let t = Tensor.empty(shape: [n], dtype: .f32)
+                t.copyIn(from: (0 ..< n).map { Float((i + 1) * ($0 + 1)) })
+                return t
+            }
+            let out = Tensor.empty(shape: [n], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.scalarFMAChain8(scalars: scalars, values: values, out: out, on: cb)
+            }
+            // value_k[j] = (k+1)·(j+1); scalar_k = k+1
+            // out[j] = sum_{k=0..7} (k+1)^2 · (j+1) = (j+1) · sum k^2 (k=1..8) = (j+1) · 204
+            let r = out.toArray(as: Float.self)
+            for j in 0 ..< n {
+                let expected = Float((j + 1) * 204)
+                #expect(abs(r[j] - expected) < 1e-3)
+            }
+        }
+    }
+
     // MARK: - KV cache append
 
     @Test("kvCacheUpdate f32 — writes one row into [nKV, maxSeq, headDim]")
