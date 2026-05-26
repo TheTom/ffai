@@ -1533,6 +1533,15 @@ public final class Qwen35GDNMixer: Module {
             "Qwen35GDNMixer.forwardMany: xNormFlat size \(xNormFlat.elementCount) ≠ T·hidden = \(t * hidden)"
         )
 
+        // PR10: chunked prep+recurrence is the default route. Replaces
+        // the per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
+        // dispatch — state register-resident across the full T-sweep.
+        // Opt out via FFAI_GDN_NO_PREP_CHUNK=1 for A/B benching.
+        if ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK"] == nil {
+            return forwardManyChunked(
+                xNormFlat, t: t, cache: cache, cmd: cmd, device: device)
+        }
+
         let dt = xNormFlat.dtype
         let dtBytes = dt.byteSize
 
@@ -1542,8 +1551,21 @@ public final class Qwen35GDNMixer: Module {
         let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
         let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
 
+        // ITER 87 (PR10) preview: a_raw / b_raw → f32 once via
+        // shared-encoder `castToF32Two`, then per-row slices alias into
+        // the pre-cast f32 storage.
+        let aRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        let bRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        Ops.castToF32Two(
+            aRawAll, into: aRawF32All,
+            bRawAll, into: bRawF32All,
+            on: cmd)
+
         // ── Per-token recurrence — scratches reused, T-loop on `cmd`. ────
         let yGatedAll = Tensor.empty(shape: [t * valueDim], dtype: dt, device: device)
+        let f32Bytes = DType.f32.byteSize
         for r in 0 ..< t {
             let qkvRow = Tensor(
                 buffer: qkvAll.buffer,
@@ -1553,38 +1575,30 @@ public final class Qwen35GDNMixer: Module {
                 buffer: zAll.buffer,
                 offset: zAll.offset + r * valueDim * dtBytes,
                 shape: [valueDim], dtype: dt)
-            let bRawRow = Tensor(
-                buffer: bRawAll.buffer,
-                offset: bRawAll.offset + r * numValueHeads * dtBytes,
-                shape: [numValueHeads], dtype: dt)
-            let aRawRow = Tensor(
-                buffer: aRawAll.buffer,
-                offset: aRawAll.offset + r * numValueHeads * dtBytes,
-                shape: [numValueHeads], dtype: dt)
+            let aRawF32Row = Tensor(
+                buffer: aRawF32All.buffer,
+                offset: aRawF32All.offset + r * numValueHeads * f32Bytes,
+                shape: [numValueHeads], dtype: .f32)
+            let bRawF32Row = Tensor(
+                buffer: bRawF32All.buffer,
+                offset: bRawF32All.offset + r * numValueHeads * f32Bytes,
+                shape: [numValueHeads], dtype: .f32)
 
             Ops.conv1dCausalStep(
                 x: qkvRow, w: convW, b: convB,
                 state: cache.conv.state, into: convOutScratch,
                 nChannels: convDim, kernelSize: convKernel, on: cmd)
-            // Fused silu + cast-to-f32. Replaces the prior two-dispatch
-            // chain `silu(convOutScratch) → castToF32(...)` with one
-            // dispatch reading bf16/f16 conv output, applying silu at
-            // fp32 precision, writing fp32 directly into the prep
-            // scratch. Saves T·30 dispatches per Qwen3.6-A3B prefill.
             if convOutScratch.dtype == .f32 {
-                // f32 conv → silu in place, no cast needed.
                 _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
                 Ops.castToF32(convOutScratch, into: convActF32Scratch, on: cmd)
             } else {
                 Ops.siluCastToF32(convOutScratch, into: convActF32Scratch, on: cmd)
             }
-            Ops.castToF32(aRawRow, into: aRawF32Scratch, on: cmd)
-            Ops.castToF32(bRawRow, into: bRawF32Scratch, on: cmd)
 
             Ops.gatedDeltaPrepStep(
                 convOut: convActF32Scratch,
                 aLog: aLogTF32, dtBias: dtBiasTF32,
-                aRaw: aRawF32Scratch, bRaw: bRawF32Scratch,
+                aRaw: aRawF32Row, bRaw: bRawF32Row,
                 qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32Scratch,
@@ -1607,6 +1621,135 @@ public final class Qwen35GDNMixer: Module {
         }
 
         // ── Batched output projection ────────────────────────────────────
+        let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
+        return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
+    }
+
+    /// Chunked GDN forward — replaces the per-token T-loop body with one
+    /// `Ops.gatedDeltaPrepChunk` dispatch. The recurrence state stays in
+    /// per-lane registers across all T tokens; the kernel loads state
+    /// once, sweeps T tokens, stores state once. State traffic per layer
+    /// drops from `T × (load + store)` to `1 × (load + store)`.
+    ///
+    /// Conv1d still loops T times unless ITER 99's batched
+    /// `conv1dCausalStepSiluCastMany` kernel applies (convKernel == 4),
+    /// in which case all T conv1d_steps fuse with silu+cast into ONE
+    /// dispatch and conv state stays in per-channel registers.
+    ///
+    /// Mixer norm runs once over T·Hv rows via `gatedMixerNormMany`.
+    /// Output projection fans through a batched qmm. Gated by the
+    /// `forwardMany` dispatcher; opt out via `FFAI_GDN_NO_PREP_CHUNK=1`.
+    func forwardManyChunked(
+        _ xNormFlat: Tensor, t: Int,
+        cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let dt = xNormFlat.dtype
+        let dtBytes = dt.byteSize
+        let f32Bytes = DType.f32.byteSize
+        let _ = f32Bytes  // silence unused warning when conv-many path used
+
+        // ── Five T-batched projections (same as forwardMany) ─────────────
+        let qkvAll = inProjQKV.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let zAll = inProjZ.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
+
+        // ITER 87 (PR10): a_raw / b_raw → f32 once on ONE shared encoder
+        // via `castToF32Two`. Saves one encoder begin/end pair per GDN
+        // layer × 30 = 30 pairs/prefill.
+        let aRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        let bRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        Ops.castToF32Two(
+            aRawAll, into: aRawF32All,
+            bRawAll, into: bRawF32All,
+            on: cmd)
+
+        // ── Conv1d + silu+cast → `[T, convDim]` f32 staging buffer ──────
+        // ITER 99 (PR10): when conv_kernel = 4, the batched
+        // `conv1dCausalStepSiluCastMany` kernel sweeps all T tokens in
+        // ONE dispatch with the conv state held in per-channel registers
+        // across the sweep — state read once at start, written once at
+        // end. Saves T-1 dispatches per layer × 30 ≈ 15K dispatches at
+        // T=512, and state DRAM traffic drops to 1·(load+store). Gate
+        // via FFAI_NO_CONV1D_MANY=1.
+        let convOutAllF32 = Tensor.empty(
+            shape: [t * convDim], dtype: .f32, device: device)
+        if convKernel == 4
+            && ProcessInfo.processInfo.environment["FFAI_NO_CONV1D_MANY"] == nil
+        {
+            Ops.conv1dCausalStepSiluCastMany(
+                src: qkvAll.reshaped(to: [t, convDim]),
+                w: convW, b: convB,
+                stateIn: cache.conv.state,
+                outF32: convOutAllF32,
+                stateOut: cache.conv.state,
+                t: t, convDim: convDim, convKernel: convKernel,
+                on: cmd)
+        } else {
+            for r in 0 ..< t {
+                let qkvRow = Tensor(
+                    buffer: qkvAll.buffer,
+                    offset: qkvAll.offset + r * convDim * dtBytes,
+                    shape: [convDim], dtype: dt)
+                Ops.conv1dCausalStep(
+                    x: qkvRow, w: convW, b: convB,
+                    state: cache.conv.state, into: convOutScratch,
+                    nChannels: convDim, kernelSize: convKernel, on: cmd)
+                let convOutRowF32 = Tensor(
+                    buffer: convOutAllF32.buffer,
+                    offset: convOutAllF32.offset + r * convDim * f32Bytes,
+                    shape: [convDim], dtype: .f32)
+                if convOutScratch.dtype == .f32 {
+                    _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
+                    Ops.castToF32(convOutScratch, into: convOutRowF32, on: cmd)
+                } else {
+                    Ops.siluCastToF32(
+                        convOutScratch, into: convOutRowF32, on: cmd)
+                }
+            }
+        }
+
+        // ── ONE chunked prep+recurrence dispatch over all T tokens ──────
+        let tLenBuf = device.makeBuffer(length: 4)
+        var tLenU32 = UInt32(t)
+        memcpy(tLenBuf.contents(), &tLenU32, 4)
+        let tLenScalar = Tensor(
+            buffer: tLenBuf, offset: 0, shape: [1], dtype: .u32)
+
+        let yF32All = Tensor.empty(
+            shape: [t * numValueHeads * valueHeadDim],
+            dtype: .f32, device: device)
+
+        Ops.gatedDeltaPrepChunk(
+            convOut: convOutAllF32,
+            aLog: aLogTF32, dtBias: dtBiasTF32,
+            aRaw: aRawF32All, bRaw: bRawF32All,
+            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+            stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+            y: yF32All,
+            tLen: tLenScalar,
+            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+            hv: numValueHeads, hk: numKeyHeads,
+            on: cmd)
+        cache.gdn.swap()
+        for _ in 0 ..< t { cache.advance() }
+
+        // ── Mixer norm T-batched (one dispatch across T·Hv rows) ────────
+        // ITER (PR10): `gatedMixerNormMany` collapses T per-row
+        // dispatches into one shared-encoder dispatch.
+        let yGatedAll = Tensor.empty(
+            shape: [t * valueDim], dtype: dt, device: device)
+        Ops.gatedMixerNormMany(
+            y: yF32All, z: zAll, weight: mixerNorm.weight,
+            epsBuf: epsBufFused,
+            into: yGatedAll,
+            t: t, numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
+            on: cmd)
+
+        // ── Batched output projection ───────────────────────────────────
         let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
         return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
     }
