@@ -817,6 +817,16 @@ public final class Qwen35MoEFFN: Module {
     let sharedExpertGate: AnyLinear
     let hidden: Int
 
+    /// ITER 26/82 (PR10): cached shared-expert scratches. The single-
+    /// token forward fans gate+up + expert-gate qmms through one shared
+    /// encoder; pre-allocating the outputs at instance level avoids per-
+    /// token Tensor.empty allocations.
+    private var sharedSgScratch: Tensor?
+    private var sharedSuScratch: Tensor?
+    private var sharedGateLogitScratch: Tensor?
+    /// ITER 34: cached `result` output for the GPU fan-out.
+    private var sharedResultScratch: Tensor?
+
     init(
         moe: MoELayer,
         sharedGateProj: AnyLinear, sharedUpProj: AnyLinear,
@@ -853,38 +863,122 @@ public final class Qwen35MoEFFN: Module {
     /// Run the MoE FFN. `MoELayer.decode` commits the passed `cmd`; the
     /// shared expert + the final add run on fresh private buffers, so
     /// the returned tensor never depends on the now-dead `cmd`.
+    ///
+    /// ITER 66 (PR10): optional `residual` parameter folds the post-FFN
+    /// residual add into the final `sigmoidScalarFMA` dispatch (becomes
+    /// `sigmoidScalarFMAResidual`). When `residual != nil`, the returned
+    /// tensor already includes `residual + routed + sigmoid(gate)·sharedOut`
+    /// and the caller MUST NOT do its own `Ops.add(residual, ffnOut)`.
     func forward(
         _ xNorm: Tensor, position: Int,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil
     ) -> Tensor {
         // Routed top-K experts — commits `cmd`.
         let routed = moe.decode(
             xNorm, position: position,
             cache: StatelessLayerCache(),
             cmd: cmd, device: device)
-        // Shared expert on a fresh buffer: SwiGLU + scalar gate logit.
-        // The fused-sigmoid kernel keeps the scalar on the GPU, so this
-        // buffer no longer needs a `waitUntilCompleted` — it just needs
-        // to be in flight so the FMA can hazard-track its dependencies.
+        // Shared expert on a fresh buffer.
         let work = device.makeCommandBuffer()
-        let sg = sharedGateProj(xNorm, on: work)
-        let su = sharedUpProj(xNorm, on: work)
+        // ITER 26: batch sharedGate + sharedUp qmms onto one shared
+        // encoder via dequantGemvInt4Two when both are int4.
+        // ITER 82: also fold sharedExpertGate (an int4 qmm producing a
+        // single scalar from the same `xNorm`) into the SAME shared
+        // encoder via dequantGemvInt4Three. Saves another encoder
+        // begin/end per MoE layer × 40 ≈ 40 pairs / decode token.
+        let sg: Tensor
+        let su: Tensor
+        let gateLogit: Tensor
+        let qg = sharedGateProj.inner as? QuantizedLinear
+        let qu = sharedUpProj.inner as? QuantizedLinear
+        let qgate = sharedExpertGate.inner as? QuantizedLinear
+        if let qg = qg, let qu = qu, let qgate = qgate,
+            qg.bits == 4, qu.bits == 4, qgate.bits == 4,
+            qg.groupSize == qu.groupSize, qu.groupSize == qgate.groupSize
+        {
+            let outDim = qg.weight.shape[0]
+            let gateOutDim = qgate.weight.shape[0]
+            if sharedSgScratch == nil
+                || sharedSgScratch!.dtype != xNorm.dtype
+                || sharedSgScratch!.elementCount != outDim
+            {
+                sharedSgScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+                sharedSuScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+            }
+            if sharedGateLogitScratch == nil
+                || sharedGateLogitScratch!.dtype != xNorm.dtype
+                || sharedGateLogitScratch!.elementCount != gateOutDim
+            {
+                sharedGateLogitScratch = Tensor.empty(
+                    shape: [gateOutDim], dtype: xNorm.dtype, device: device)
+            }
+            sg = sharedSgScratch!
+            su = sharedSuScratch!
+            gateLogit = sharedGateLogitScratch!
+            Ops.dequantGemvInt4Three(
+                input: xNorm,
+                w0: qg.weight, s0: qg.scales, b0: qg.biases, out0: sg,
+                w1: qu.weight, s1: qu.scales, b1: qu.biases, out1: su,
+                w2: qgate.weight, s2: qgate.scales, b2: qgate.biases,
+                out2: gateLogit,
+                groupSize: qg.groupSize, on: work)
+        } else if let qg = qg, let qu = qu,
+            qg.bits == 4, qu.bits == 4, qg.groupSize == qu.groupSize
+        {
+            let outDim = qg.weight.shape[0]
+            if sharedSgScratch == nil
+                || sharedSgScratch!.dtype != xNorm.dtype
+                || sharedSgScratch!.elementCount != outDim
+            {
+                sharedSgScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+                sharedSuScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+            }
+            sg = sharedSgScratch!
+            su = sharedSuScratch!
+            Ops.dequantGemvInt4Two(
+                input: xNorm,
+                w0: qg.weight, s0: qg.scales, b0: qg.biases, out0: sg,
+                w1: qu.weight, s1: qu.scales, b1: qu.biases, out1: su,
+                groupSize: qg.groupSize, on: work)
+            gateLogit = sharedExpertGate(xNorm, on: work)
+        } else {
+            sg = sharedGateProj(xNorm, on: work)
+            su = sharedUpProj(xNorm, on: work)
+            gateLogit = sharedExpertGate(xNorm, on: work)
+        }
         // ITER 16: fused SwiGLU.
         let sharedInner = Ops.swiglu(gate: sg, up: su, on: work)
         let sharedOut = sharedDownProj(sharedInner, on: work)
-        let gateLogit = sharedExpertGate(xNorm, on: work)
         work.commit()
 
         // GPU fan-out: `out = routed + sigmoid(gateLogit) * sharedOut`
-        // in one dispatch. Replaces the prior host detour
-        // (`gateLogit.toFloatArray()` + host sigmoid + `Tensor.filled`
-        // broadcast + mul + add + commit + wait) — saves one host stall
-        // per MoE layer per token. Fires on all 40 Qwen3.6-A3B layers.
+        // (+ residual when ITER 66 is in play) in one dispatch.
         let fmaCmd = device.makeCommandBuffer()
-        let result = Tensor.empty(shape: [hidden], dtype: routed.dtype, device: device)
-        Ops.sigmoidScalarFMA(
-            gate: gateLogit, value: sharedOut, base: routed,
-            into: result, on: fmaCmd)
+        if sharedResultScratch == nil
+            || sharedResultScratch!.dtype != routed.dtype
+            || sharedResultScratch!.elementCount != hidden
+        {
+            sharedResultScratch = Tensor.empty(
+                shape: [hidden], dtype: routed.dtype, device: device)
+        }
+        let result = sharedResultScratch!
+        if let residual = residual {
+            // ITER 66: fused 4-input. result = residual + routed +
+            // sigmoid(gateLogit) · sharedOut. Saves 1 dispatch + 1
+            // [hidden] DRAM roundtrip vs sigmoidScalarFMA then Ops.add.
+            Ops.sigmoidScalarFMAResidual(
+                gate: gateLogit, value: sharedOut, base: routed,
+                residual: residual, into: result, on: fmaCmd)
+        } else {
+            Ops.sigmoidScalarFMA(
+                gate: gateLogit, value: sharedOut, base: routed,
+                into: result, on: fmaCmd)
+        }
         fmaCmd.commit()
         return result
     }
@@ -2705,17 +2799,14 @@ private func qwen35ApplyFFN(
         }
         return result
     case .moe(let moe):
-        // Qwen35MoEFFN.forward commits `cmd`; run the residual add on a
-        // fresh buffer. We commit without waiting: the residual add
-        // tensor is the layer's output; the next layer queues onto a
-        // fresh workCmd and Metal hazard-tracks the read.
-        let ffnOut = moe.forward(
+        // Qwen35MoEFFN.forward commits `cmd`. ITER 66 (PR10): fold the
+        // post-FFN residual add into the final sigmoidScalarFMA via
+        // `sigmoidScalarFMAResidual` — when this is taken the returned
+        // tensor already includes `postMix + routed + sigmoid·shared`.
+        return moe.forward(
             ffnNorm, position: position,
-            cmd: cmd, device: device)
-        let addCmd = device.makeCommandBuffer()
-        let result = Ops.add(postMix, ffnOut, on: addCmd)
-        addCmd.commit()
-        return result
+            cmd: cmd, device: device,
+            residual: postMix)
     }
 }
 
