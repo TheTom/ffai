@@ -85,6 +85,50 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("siluCastF32PlusCastF32Two f16 — same as sequential silu+two casts")
+    func siluCastF32PlusCastF32TwoFromF16() {
+        autoreleasepool {
+            let n = 4
+            // Reference: three separate dispatches.
+            let s = Tensor.empty(shape: [n], dtype: .f16)
+            s.copyIn(from: [Float16(0), 1, -1, 2])
+            let a = Tensor.empty(shape: [n], dtype: .f16)
+            a.copyIn(from: [Float16(0.5), 2, -2, 4])
+            let b = Tensor.empty(shape: [n], dtype: .f16)
+            b.copyIn(from: [Float16(-1), 0, 1, 0.25])
+            let refSilu = Tensor.empty(shape: [n], dtype: .f32)
+            let refA = Tensor.empty(shape: [n], dtype: .f32)
+            let refB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.siluCastToF32(s, into: refSilu, on: cb)
+                Ops.castToF32(a, into: refA, on: cb)
+                Ops.castToF32(b, into: refB, on: cb)
+            }
+            // Batched: one encoder, switches PSO between silu+cast and plain cast.
+            let outSilu = Tensor.empty(shape: [n], dtype: .f32)
+            let outA = Tensor.empty(shape: [n], dtype: .f32)
+            let outB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.siluCastF32PlusCastF32Two(
+                    siluIn: s, into: outSilu,
+                    a, into: outA,
+                    b, into: outB,
+                    on: cb)
+            }
+            let rRef = refSilu.toArray(as: Float.self)
+            let rGot = outSilu.toArray(as: Float.self)
+            let aRef = refA.toArray(as: Float.self)
+            let aGot = outA.toArray(as: Float.self)
+            let bRef = refB.toArray(as: Float.self)
+            let bGot = outB.toArray(as: Float.self)
+            for i in 0 ..< n {
+                #expect(abs(rGot[i] - rRef[i]) < 1e-5, "silu[\(i)]")
+                #expect(abs(aGot[i] - aRef[i]) < 1e-5, "a[\(i)]")
+                #expect(abs(bGot[i] - bRef[i]) < 1e-5, "b[\(i)]")
+            }
+        }
+    }
+
     @Test("swiglu f32 — out[i] = silu(gate[i]) * up[i]")
     func swigluF32() {
         autoreleasepool {

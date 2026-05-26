@@ -4188,6 +4188,67 @@ public enum Ops {
         }
     }
 
+    /// One silu-cast plus two plain casts to f32 on the SAME compute
+    /// encoder. Used inside the Qwen3.5 GDN T-loop where, every token,
+    /// the input goes through `siluCastToF32` while `aRaw` / `bRaw`
+    /// (the gate scalars) go through plain `castToF32`. The wrapper
+    /// sets the silu PSO once, dispatches the silu, then switches to
+    /// the plain-cast PSO and dispatches the two raw casts. Saves the
+    /// encoder begin/end pair between dispatches that would otherwise
+    /// fire on every GDN token.
+    public static func siluCastF32PlusCastF32Two(
+        siluIn: Tensor, into siluOut: Tensor,
+        _ a: Tensor, into outA: Tensor,
+        _ b: Tensor, into outB: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            siluIn.dtype == a.dtype && a.dtype == b.dtype,
+            "Ops.siluCastF32PlusCastF32Two: all inputs must share dtype")
+        precondition(
+            siluOut.dtype == .f32 && outA.dtype == .f32 && outB.dtype == .f32,
+            "Ops.siluCastF32PlusCastF32Two: outputs must be f32")
+        precondition(
+            siluIn.elementCount == siluOut.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: silu in/out count mismatch")
+        precondition(
+            a.elementCount == outA.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: a/outA count mismatch")
+        precondition(
+            b.elementCount == outB.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: b/outB count mismatch")
+        let siluPso: String
+        let castPso: String
+        switch siluIn.dtype {
+        case .f16:
+            siluPso = "mt_silu_cast_to_f32_f16"
+            castPso = "mt_cast_to_f32_f16"
+        case .bf16:
+            siluPso = "mt_silu_cast_to_f32_bf16"
+            castPso = "mt_cast_to_f32_bf16"
+        default:
+            fatalError(
+                "Ops.siluCastF32PlusCastF32Two: unsupported dtype \(siluIn.dtype)")
+        }
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        @inline(__always)
+        func dispatch(_ input: Tensor, _ out: Tensor) {
+            enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+            let n = input.elementCount
+            let tgWidth = min(n, 256)
+            enc.dispatchThreads(
+                MTLSize(width: n, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        enc.setComputePipelineState(PSOCache.shared.pipelineState(for: siluPso))
+        dispatch(siluIn, siluOut)
+        enc.setComputePipelineState(PSOCache.shared.pipelineState(for: castPso))
+        dispatch(a, outA)
+        dispatch(b, outB)
+        enc.endEncoding()
+    }
+
     // ─── Fused gated mixer norm ───────────────────────────────────────
     //
     // Wraps `mt_gated_mixer_norm_{f32,f16,bf16}`. Computes
