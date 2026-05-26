@@ -681,20 +681,56 @@ public final class MoELayer: Module, DecoderLayer {
         let gateLogitsAll = gate.callMany(hRows, t: t, on: cmd, device: device)
         // gateLogitsAll shape: [T, nExperts]
 
-        // ── 2. Commit + wait so the router can read logits ───────────────
-        cmd.commit()
-        cmd.waitUntilCompleted()
-
-        // ── 3. Per-token routing on host ─────────────────────────────────
+        // ── 2. Routing — GPU fast path or CPU sync ──────────────────────
+        // ITER 92 (PR10): when router config matches `mt_moe_router_topk`'s
+        // semantic envelope (softmax → topK + Qwen-MoE renorm, no expert
+        // bias, k=8), run the T-batched router on GPU via
+        // `Ops.moeRouterTopKMany`. Eliminates the T-parallel host
+        // `router.route` loop (~50 ms of CPU work per prefill at T=512 ×
+        // 40 MoE layers). One commit+wait still needed to read indices +
+        // weights for the host-side sort plan.
         let nExperts = router.nExperts
         let topK = router.topK
-        let logitsHost = gateLogitsAll.toFloatArray()  // [T·nExperts]
-        var routings: [MoERouter.Routing] = []
-        routings.reserveCapacity(t)
-        for r in 0 ..< t {
-            let start = r * nExperts
-            let rowLogits = Array(logitsHost[start ..< (start + nExperts)])
-            routings.append(router.route(logits: rowLogits))
+        var routings = [MoERouter.Routing](
+            repeating: MoERouter.Routing(indices: [], weights: []),
+            count: t)
+        let useGPURouter =
+            self.gpuRouterEnabled
+            && router.gatingMode == .softmaxThenTopK
+            && router.normTopKProb
+            && router.expertBias == nil
+            && router.topK == 8
+        if useGPURouter {
+            let indicesBuf = Tensor.empty(
+                shape: [t, topK], dtype: .u32, device: device)
+            let weightsBuf = Tensor.empty(
+                shape: [t, topK], dtype: gateLogitsAll.dtype, device: device)
+            Ops.moeRouterTopKMany(
+                logits: gateLogitsAll, indicesOut: indicesBuf,
+                weightsOut: weightsBuf,
+                t: t, nExperts: nExperts, k: topK,
+                normTopkProb: router.normTopKProb, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            let indicesHost: [UInt32] = indicesBuf.toArray(as: UInt32.self)
+            let weightsHost: [Float] = weightsBuf.toFloatArray()
+            for r in 0 ..< t {
+                let base = r * topK
+                let idxs = (0 ..< topK).map { Int(indicesHost[base + $0]) }
+                let wts = Array(weightsHost[base ..< (base + topK)])
+                routings[r] = MoERouter.Routing(indices: idxs, weights: wts)
+            }
+        } else {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            let logitsHost = gateLogitsAll.toFloatArray()
+            routings.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: t) { r in
+                    let start = r * nExperts
+                    let rowLogits = Array(logitsHost[start ..< (start + nExperts)])
+                    buf[r] = router.route(logits: rowLogits)
+                }
+            }
         }
 
         // ── 4. Build sorted plan over T·topK rows ────────────────────────
@@ -813,9 +849,10 @@ public final class MoELayer: Module, DecoderLayer {
         //     2.69× T=32 win.
         //   - mTotal ≤ 8 + `FFAI_MOE_BGEMM_BM8=1` → bm8 (decode T=1
         //     fallback).
-        let useBm64 =
-            mTotal >= 64
-            && ProcessInfo.processInfo.environment["FFAI_MOE_BGEMM_BM64"] != nil
+        // ITER 73 (PR10): bm64_mpp default-on for mTotal ≥ 1024 (refreshed
+        // bench: crossover sits between mTotal=512 bm16 +19% and
+        // mTotal=1024 bm64 +18%). Opt out via FFAI_MOE_BGEMM_NO_BM64=1.
+        let useBm64 = mTotal >= 1024 && !self.noBGEMMBm64
         let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
         let bgemm:
             (Tensor, Tensor, Tensor, Tensor, Tensor, Int, Int, Int, Int, MTLCommandBuffer, Tensor)
