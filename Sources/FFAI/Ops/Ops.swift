@@ -1319,6 +1319,162 @@ public enum Ops {
             on: cmd, into: out)
     }
 
+    /// Batched int4 dequantGemv on TWO projections sharing one input
+    /// in ONE compute encoder. Used by `Qwen35MoEFFN.forward` for the
+    /// per-expert gate + up pair: both projections read the same
+    /// `[hidden]` post-norm activation, so we set the `input` binding
+    /// once and rotate `(weight, scales, biases, output)` per dispatch.
+    /// Saves one encoder begin/end pair per call.
+    ///
+    /// All outputs must share dtype with `input`; `groupSize` and the
+    /// 4-bit packing are identical across the two projections.
+    public static func dequantGemvInt4Two(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype && input.dtype == out1.dtype,
+            "Ops.dequantGemvInt4Two: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Two: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        // `inDim` derives from the packed-row width: 4-bit packs 8
+        // weights per u32 word and `weight.shape[1]` counts words.
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        enc.endEncoding()
+    }
+
+    /// Batched int4 dequantGemv on THREE projections sharing one input
+    /// in ONE compute encoder. Used by the Qwen3.5/3.6 attention mixer
+    /// for the q/k/v projection triplet.
+    public static func dequantGemvInt4Three(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        w2: Tensor, s2: Tensor, b2: Tensor, out2: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype,
+            "Ops.dequantGemvInt4Three: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Three: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        dispatch(w2, s2, b2, out2)
+        enc.endEncoding()
+    }
+
+    /// Batched int4 dequantGemv on FOUR projections sharing one input
+    /// in ONE compute encoder. Used by the Qwen3.5/3.6 GDN mixer where
+    /// the four input projections (qkv, z, b, a) all read the same
+    /// xNorm output.
+    public static func dequantGemvInt4Four(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        w2: Tensor, s2: Tensor, b2: Tensor, out2: Tensor,
+        w3: Tensor, s3: Tensor, b3: Tensor, out3: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype,
+            "Ops.dequantGemvInt4Four: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Four: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        dispatch(w2, s2, b2, out2)
+        dispatch(w3, s3, b3, out3)
+        enc.endEncoding()
+    }
+
     /// GPU argmax over a 1D logits tensor. Caller supplies a 1-element
     /// u32 output buffer. Uses the cooperative 256-thread Reduction
     /// kernel — one threadgroup, ~80-300 KB / vocab logits in registers.
