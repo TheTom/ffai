@@ -179,6 +179,11 @@ struct Qwen36TextIntegrationTests {
         try await runForwardManyBench(targetT: 512)
     }
 
+    @Test("Qwen3.6-35B-A3B forwardMany bench — T=2048 long-context scaling")
+    func forwardManyBench2K() async throws {
+        try await runForwardManyBench(targetT: 2048)
+    }
+
     private func runForwardManyBench(targetT: Int) async throws {
         let path = qwen36LocalPath
         var optsBuilder = LoadOptions()
