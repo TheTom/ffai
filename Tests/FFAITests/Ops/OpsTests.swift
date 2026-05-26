@@ -1062,6 +1062,51 @@ struct OpsTests {
         }
     }
 
+    @Test("sdpaMulti — head_dim 256 routes to d256 kernel (uniform K → mean V)")
+    func sdpaMultiHeadDim256UniformKMeansV() {
+        autoreleasepool {
+            // Identical to the d=128 uniform-K test but at head_dim=256
+            // (Qwen3.6-A3B full-attention layers). Verifies the d256
+            // routing exists and the kernel produces the same uniform-
+            // attention result as the d128 path.
+            let headDim = 256
+            let nQHeads = 2
+            let nKVHeads = 1
+            let baseKV = 0
+            let nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0 ..< nQuery * nQHeads * headDim).map { Float($0 % 7) * 0.1 })
+
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0 ..< kvStride {
+                for d in 0 ..< headDim { vData[t * headDim + d] = Float(t) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+
+            let cmd = Device.shared.makeCommandBuffer()
+            let out = Ops.sdpaMulti(
+                q: q, k: k, v: v,
+                nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                causal: false, scale: scale, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let result = out.toArray(as: Float.self)
+            #expect(result.count == nQuery * nQHeads * headDim)
+            for value in result {
+                #expect(abs(value - 1.5) < 1e-3, "expected mean V = 1.5, got \(value)")
+            }
+        }
+    }
+
     @Test("sdpaMulti — causal mode: query r attends V rows 0...r")
     func sdpaMultiCausalPrefixMeans() {
         autoreleasepool {

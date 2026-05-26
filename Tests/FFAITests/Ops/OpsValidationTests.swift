@@ -255,17 +255,25 @@ struct OpsValidationTests {
                 baseKV: 8, nQuery: 8, kvStride: 4096) == nil)
     }
 
-    @Test("sdpaMulti rejects head_dim != 128")
+    @Test("sdpaMulti rejects head_dim outside {128, 256}")
     func sdpaMultiRejectsBadHeadDim() {
-        // The kernel hardcodes 4 elements/lane (128/32); other head
-        // dims OOB-read.
-        for hd in [32, 64, 96, 256] {
+        // d=128 hardcodes 4 elements/lane (128/32); d=256 has its own
+        // d256 kernel variant with a 2-phase output reduction. Anything
+        // else OOB-reads.
+        for hd in [32, 64, 96, 192, 384, 512] {
             #expect(
                 OpsValidation.validateSdpaMulti(
                     headDim: hd, nQHeads: 8, nKVHeads: 8,
                     baseKV: 0, nQuery: 8, kvStride: 8) != nil,
                 "head_dim \(hd) should be rejected")
         }
+        // headDim=256 must now be ACCEPTED by the validator — d256
+        // routing was missing on the dev branch and is restored here.
+        #expect(
+            OpsValidation.validateSdpaMulti(
+                headDim: 256, nQHeads: 8, nKVHeads: 8,
+                baseKV: 0, nQuery: 8, kvStride: 8) == nil,
+            "head_dim 256 must be accepted (d256 kernel exists)")
     }
 
     @Test("sdpaMulti rejects non-integer GQA fan-out")

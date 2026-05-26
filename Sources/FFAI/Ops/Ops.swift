@@ -2848,8 +2848,15 @@ public enum Ops {
         let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
-        switch q.dtype {
-        case .f32:
+        // Route by (dtype, headDim). d=128 → `ffai_sdpa_multi_*`; d=256
+        // → `ffai_sdpa_multi_d256_*`, the variant added for Qwen3.6-A3B
+        // full-attention layers (head_dim=256). Both kernels share the
+        // same Swift wrapper shape; the dispatch grid / TPG / online
+        // softmax / causal mask / GQA fan-out semantics are identical.
+        // The d=256 kernel uses a 2-phase output reduction internally
+        // to stay under Apple's 32 KB threadgroup-memory cap.
+        switch (q.dtype, headDim) {
+        case (.f32, 128):
             MetalTileKernels.ffai_sdpa_multi_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2858,7 +2865,7 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .f16:
+        case (.f16, 128):
             MetalTileKernels.ffai_sdpa_multi_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2867,7 +2874,7 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .bf16:
+        case (.bf16, 128):
             MetalTileKernels.ffai_sdpa_multi_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2876,8 +2883,37 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f32, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bf16, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
-            fatalError("Ops.sdpaMulti: unsupported dtype \(q.dtype)")
+            fatalError(
+                "Ops.sdpaMulti: unsupported dtype \(q.dtype) at headDim \(headDim) "
+                    + "— only (f32/f16/bf16) × (128, 256) are emitted")
         }
         return result
     }
