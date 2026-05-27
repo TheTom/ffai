@@ -2492,9 +2492,6 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             "Qwen35GDNLayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)"
         )
 
-        let dt = hFlat.dtype
-        let dtBytes = dt.byteSize
-
         // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
         let xNormFlat = Ops.rmsNormRows(
             hFlat, weight: inputNorm.weight, eps: inputNorm.eps,
@@ -2646,9 +2643,6 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             "Qwen35AttentionLayer.decodeMany: hFlat size \(hFlat.elementCount) "
                 + "≠ T·hidden = \(t * hidden)")
 
-        let dt = hFlat.dtype
-        let dtBytes = dt.byteSize
-
         // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
         let xNormFlat = Ops.rmsNormRows(
             hFlat, weight: inputNorm.weight, eps: inputNorm.eps,
@@ -2771,7 +2765,6 @@ private func qwen35ApplyFFNMany(
         let addCmd = device.makeCommandBuffer()
         let resultFlat = Ops.add(postMix, ffnOut, on: addCmd)
         addCmd.commit()
-        let _ = resultFlat
         return resultFlat
     }
 }
