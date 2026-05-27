@@ -810,6 +810,13 @@ public final class Qwen35DenseMLP: Module {
 // `MoELayer.decode` commits the command buffer; this wrapper therefore
 // also commits, and runs the shared expert + the routed-combine add on
 // fresh private buffers so the returned tensor is fully resident.
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` / `forwardMany` mutate per-instance shared-expert scratch
+// buffers (`sharedSgScratch`, `sharedSuScratch`,
+// `sharedGateLogitScratch`, `sharedResultScratch`) without internal
+// synchronisation. Callers must serialise inference on a given
+// instance.
 
 public final class Qwen35MoEFFN: Module {
     let moe: MoELayer
@@ -1130,6 +1137,12 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 // Because the prep needs a CPU sync, `forward` commits the command
 // buffer it is handed and returns a resident tensor on a fresh buffer
 // (the Jamba mamba-mixer pattern).
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` / `forwardMany` / `forwardManyChunked` mutate per-instance
+// scratch buffers and reuse them across calls without internal
+// synchronisation. Callers must serialise inference on a given
+// instance.
 
 public final class Qwen35GDNMixer: Module {
     let inProjQKV, inProjZ, inProjB, inProjA, outProj: AnyLinear
@@ -1866,6 +1879,13 @@ public final class Qwen35GDNMixer: Module {
 // gate); the attention output is multiplied by `sigmoid(gate)` before
 // `o_proj`. `q_norm` / `k_norm` are per-head RMSNorm. RoPE is partial
 // (`partial_rotary_factor`): only the first `rotaryDim` dims rotate.
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` reuses ~12 per-instance scratch tensors (`qOutScratch`,
+// `qNormedScratch`, `attnOutScratch`, `partialOScratch`, …) across
+// calls without internal synchronisation. `forwardMany` allocates
+// fresh per-call tensors and does not touch the single-token
+// scratches. Callers must serialise inference on a given instance.
 
 public final class Qwen35AttentionMixer: Module {
     let qProj, kProj, vProj, oProj: AnyLinear

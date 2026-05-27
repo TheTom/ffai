@@ -307,6 +307,15 @@ public struct MoERouter: Sendable {
 /// `decode` runs: gate gemv → CPU route → per-expert SwiGLU on the
 /// selected experts → combine. See the command-buffer contract note in
 /// the file header — `decode` commits the passed `cmd`.
+///
+/// Threading contract: instances are NOT safe for concurrent calls.
+/// `decode` / `decodeMany` mutate per-instance scratch buffers
+/// (`routerIndicesScratch`, `accumulatorScratch`, `expertGScratches`,
+/// `dequantizedGateCache`, …) without internal synchronisation. Callers
+/// must serialise inference on a given instance — typical model loops
+/// already do this since a token can't fan out across MoE layers in
+/// parallel. The class is `final` for closed-world dispatch, not for
+/// concurrency.
 public final class MoELayer: Module, DecoderLayer {
     /// Router projection: hidden → nExperts logits.
     public let gate: AnyLinear
@@ -1313,6 +1322,15 @@ public final class MoELayer: Module, DecoderLayer {
         // (caller starts a fresh cmd for residual-add / shared expert).
         // The win is the ABSENT `waitUntilCompleted` that the CPU-sync
         // path needed before this branch.
+        //
+        // Contract: the returned tensor aliases `accumulatorScratch`,
+        // which the GPU is still writing through the in-flight `cmd`.
+        // Callers MUST not re-invoke `decode` on this layer until that
+        // cmd completes — a second call would re-enter `decodeGPURouter`
+        // and start overwriting the scratch while the GPU is still
+        // reading from it. Per-token serial dispatch in the model loop
+        // satisfies this; concurrent decodes on a shared MoELayer
+        // instance do not.
         cmd.commit()
         return acc
     }
