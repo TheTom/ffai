@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,23 @@
 
 import FFAI
 import Foundation
+import Metal
+
+// MARK: - MTLCommandBuffer async-friendly wait
+
+/// SDK-portable replacement for `await cmd.completed()` (Xcode 26+
+/// only) and `cmd.waitUntilCompleted()` (now flagged unavailable from
+/// async contexts in Xcode 26.5). Uses the long-standing
+/// `addCompletedHandler` callback bridged through
+/// `withCheckedContinuation`, which works on every Metal SDK from
+/// macOS 10.11 onward.
+extension MTLCommandBuffer {
+    public func awaitCompletion() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            self.addCompletedHandler { _ in cont.resume() }
+        }
+    }
+}
 
 // MARK: - ModelLoadLock
 

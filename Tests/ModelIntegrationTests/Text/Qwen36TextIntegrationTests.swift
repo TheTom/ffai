@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -179,6 +179,11 @@ struct Qwen36TextIntegrationTests {
         try await runForwardManyBench(targetT: 512)
     }
 
+    @Test("Qwen3.6-35B-A3B forwardMany bench — T=2048 long-context scaling")
+    func forwardManyBench2K() async throws {
+        try await runForwardManyBench(targetT: 2048)
+    }
+
     private func runForwardManyBench(targetT: Int) async throws {
         let path = qwen36LocalPath
         var optsBuilder = LoadOptions()
@@ -215,7 +220,7 @@ struct Qwen36TextIntegrationTests {
                 tokenIds: encoded, startPosition: 0,
                 caches: warmCachesB, on: warmCmd, device: Device.shared)
             warmCmd.commit()
-            await warmCmd.completed()
+            await warmCmd.awaitCompletion()
             _ = warmIter  // silence
         }
 
@@ -245,7 +250,7 @@ struct Qwen36TextIntegrationTests {
                 tokenIds: encoded, startPosition: 0,
                 caches: caches, on: bCmd, device: Device.shared)
             bCmd.commit()
-            await bCmd.completed()
+            await bCmd.awaitCompletion()
             batchedSecs.append(Date().timeIntervalSince(t0))
         }
         batchedSecs.sort()
@@ -292,7 +297,7 @@ struct Qwen36TextIntegrationTests {
             tokenIds: encoded, startPosition: 0,
             caches: manyCaches, on: manyCmd, device: Device.shared)
         manyCmd.commit()
-        await manyCmd.completed()
+        await manyCmd.awaitCompletion()
         let manyLogits = manyLogitsTensor.toFloatArray()
         let manyArgmax = manyLogits.enumerated().max(by: { $0.element < $1.element })!.offset
 

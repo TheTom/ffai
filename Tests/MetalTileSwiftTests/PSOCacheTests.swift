@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 // lookup in `PSOCache.lookup`).
 
 import Foundation
-import Metal
+@preconcurrency import Metal
 import Testing
 
 @testable import MetalTileSwift

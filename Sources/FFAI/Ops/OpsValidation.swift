@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -173,8 +173,9 @@ public enum OpsValidation {
         headDim: Int, nQHeads: Int, nKVHeads: Int,
         baseKV: Int, nQuery: Int, kvStride: Int
     ) -> String? {
-        if headDim != 128 {
-            return "head_dim must be 128 (got \(headDim)); ffai_sdpa_multi is head_dim-128 only"
+        if headDim != 128 && headDim != 256 {
+            return "head_dim must be 128 or 256 (got \(headDim)); "
+                + "ffai_sdpa_multi has dedicated d128 / d256 kernel variants only"
         }
         if nQHeads <= 0 {
             return "nQHeads must be positive (got \(nQHeads))"

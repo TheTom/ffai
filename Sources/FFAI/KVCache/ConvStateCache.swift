@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,6 +48,10 @@ public final class ConvStateCache: @unchecked Sendable {
             shape: [kernelSize - 1, nChannels],
             dtype: dtype, device: device)
         self.state.zero()
+        // Conv rolling window persists across every decode step; pin it
+        // in the residency set so the driver skips per-dispatch
+        // residency validation on the read+shift that fires each token.
+        device.markWeightsResident([self.state.buffer])
     }
 
     /// Reset to zero. Used between sessions; cheap (small fp16/bf16 buffer).
@@ -57,6 +61,66 @@ public final class ConvStateCache: @unchecked Sendable {
     /// length — that's the streaming-decode design.
     public var bytesAllocated: Int {
         (kernelSize - 1) * nChannels * dtype.byteSize
+    }
+
+    /// Cached snapshot tensor. Reused across snapshot calls so
+    /// spec-decode doesn't churn ~30 KB per layer per verify step.
+    private var cachedSnapshot: Tensor?
+
+    /// Copy `state` into a fresh (or cached) snapshot tensor. Used by
+    /// spec-decode to roll back the conv rolling window on draft reject.
+    ///
+    /// Reuse contract: this method returns a single per-instance
+    /// scratch tensor. Calling `snapshot()` a second time before
+    /// `restore(from:)` will overwrite the prior snapshot. Nested or
+    /// concurrent snapshot usage on the same cache is not supported.
+    public func snapshot(device: Device = .shared) -> Tensor {
+        let shape = [kernelSize - 1, nChannels]
+        if cachedSnapshot == nil
+            || cachedSnapshot!.shape != shape
+            || cachedSnapshot!.dtype != dtype
+        {
+            cachedSnapshot = Tensor.empty(
+                shape: shape, dtype: dtype, device: device)
+        }
+        let snap = cachedSnapshot!
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "ConvStateCache.snapshot: makeBlitCommandEncoder failed")
+        }
+        let bytes = bytesAllocated
+        blit.copy(
+            from: state.buffer, sourceOffset: state.offset,
+            to: snap.buffer, destinationOffset: snap.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        return snap
+    }
+
+    /// Restore `state` from a snapshot taken via `snapshot()`.
+    public func restore(from snapshot: Tensor, device: Device = .shared) {
+        precondition(
+            snapshot.elementCount == state.elementCount,
+            "ConvStateCache.restore: snapshot element count mismatch")
+        precondition(
+            snapshot.dtype == dtype,
+            "ConvStateCache.restore: snapshot dtype mismatch")
+        let cmd = device.makeCommandBuffer()
+        guard let blit = cmd.makeBlitCommandEncoder() else {
+            preconditionFailure(
+                "ConvStateCache.restore: makeBlitCommandEncoder failed")
+        }
+        let bytes = bytesAllocated
+        blit.copy(
+            from: snapshot.buffer, sourceOffset: snapshot.offset,
+            to: state.buffer, destinationOffset: state.offset,
+            size: bytes)
+        blit.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
     }
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -633,7 +633,9 @@ public final class JambaDenseMLP: Module {
     func forward(_ xNorm: Tensor, cmd: MTLCommandBuffer) -> Tensor {
         let g = gateProj(xNorm, on: cmd)
         let u = upProj(xNorm, on: cmd)
-        let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
+        // Fused silu(gate) * up — one kernel, intermediate silu(g)
+        // stays in registers instead of round-tripping to DRAM.
+        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj(inner, on: cmd)
     }
 }

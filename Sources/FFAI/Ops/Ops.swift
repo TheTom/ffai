@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -345,6 +345,54 @@ public enum Ops {
         return result
     }
 
+    /// Two embedding lookups against the SAME `table` on one compute
+    /// encoder. Used when two parallel id streams need to read the
+    /// same embedding (or, in Qwen3 attention, when a single linear
+    /// projection result is split into two head-half slices via
+    /// `ids = [0..nHeads]` + `ids = [nHeads..2·nHeads]`). The table
+    /// binding + `dim` constant are set once and the per-call
+    /// `(ids, out)` pair rotates per dispatch.
+    public static func gatherTwo(
+        table: Tensor,
+        ids1: Tensor, into out1: Tensor,
+        ids2: Tensor, into out2: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(table.shape.count == 2, "Ops.gatherTwo: table must be 2D")
+        precondition(
+            ids1.dtype == .u32 && ids2.dtype == .u32,
+            "Ops.gatherTwo: ids must be u32")
+        precondition(
+            out1.dtype == table.dtype && out2.dtype == table.dtype,
+            "Ops.gatherTwo: out dtype must match table")
+        let dim = table.shape[1]
+        let psoName: String
+        switch table.dtype {
+        case .f32: psoName = "ffai_gather_f32"
+        case .f16: psoName = "ffai_gather_f16"
+        case .bf16: psoName = "ffai_gather_bf16"
+        default: fatalError("Ops.gatherTwo: unsupported dtype \(table.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        var dimV = UInt32(dim)
+        enc.setBytes(&dimV, length: 4, index: 3)
+        enc.setBuffer(table.buffer, offset: table.offset, index: 0)
+        @inline(__always)
+        func dispatch(_ ids: Tensor, _ out: Tensor) {
+            let n = ids.elementCount
+            let totalThreads = n * dim
+            let (grid, tg) = elementwiseGrid(totalThreads)
+            enc.setBuffer(ids.buffer, offset: ids.offset, index: 1)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 2)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(ids1, out1)
+        dispatch(ids2, out2)
+        enc.endEncoding()
+    }
+
     /// Cooperative-thread matrix-vector multiply. weight: [out_dim, in_dim],
     /// input: [in_dim], output: [out_dim]. One threadgroup per output row;
     /// threads cooperate on the dot-product reduction.
@@ -512,6 +560,99 @@ public enum Ops {
             x: x, weight: weight, result: result,
             eps: eps, n: rowSize, nRows: nRows, on: cmd)
         return result
+    }
+
+    /// Two `rmsNormRows` dispatches in ONE compute encoder. Used by
+    /// the Qwen3 attention mixer's pre-RoPE Q-norm + K-norm pair: both
+    /// run the fast `mt_rms_norm_*` kernel (TPG = rowSize / 4), share
+    /// the same eps when set from the same model config, and there's
+    /// no data dependency between them.
+    ///
+    /// `rowSize1` and `rowSize2` must both clear the fast-path bounds
+    /// (`≤ 4096` and a multiple of 128 — checked via
+    /// `OpsValidation.validateRmsNorm`). For wider rows the caller
+    /// must fall back to two `rmsNormRows` calls so the wide kernel is
+    /// picked individually.
+    ///
+    /// `eps` is forwarded via 1-element f32 buffers. If both eps
+    /// values are equal we share a single alloc, otherwise two are
+    /// allocated.
+    public static func rmsNormRowsTwo(
+        _ x1: Tensor, weight w1: Tensor, eps1: Float,
+        nRows1: Int, rowSize1: Int, into out1: Tensor,
+        _ x2: Tensor, weight w2: Tensor, eps2: Float,
+        nRows2: Int, rowSize2: Int, into out2: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            x1.dtype == w1.dtype && x2.dtype == w2.dtype && x1.dtype == x2.dtype,
+            "Ops.rmsNormRowsTwo: dtype mismatch")
+        precondition(
+            x1.elementCount == nRows1 * rowSize1,
+            "Ops.rmsNormRowsTwo: x1 size \(x1.elementCount) ≠ nRows1·rowSize1")
+        precondition(
+            x2.elementCount == nRows2 * rowSize2,
+            "Ops.rmsNormRowsTwo: x2 size \(x2.elementCount) ≠ nRows2·rowSize2")
+        precondition(
+            w1.elementCount == rowSize1 && w2.elementCount == rowSize2,
+            "Ops.rmsNormRowsTwo: weight size must equal rowSize")
+        precondition(
+            out1.elementCount == x1.elementCount && out2.elementCount == x2.elementCount,
+            "Ops.rmsNormRowsTwo: output element-count must match input")
+        precondition(
+            out1.dtype == x1.dtype && out2.dtype == x2.dtype,
+            "Ops.rmsNormRowsTwo: output dtype must match input")
+        if let reason = OpsValidation.validateRmsNorm(n: rowSize1) {
+            preconditionFailure("Ops.rmsNormRowsTwo (#1): \(reason)")
+        }
+        if let reason = OpsValidation.validateRmsNorm(n: rowSize2) {
+            preconditionFailure("Ops.rmsNormRowsTwo (#2): \(reason)")
+        }
+        let psoName: String
+        switch x1.dtype {
+        case .f32: psoName = "mt_rms_norm_f32"
+        case .f16: psoName = "mt_rms_norm_f16"
+        case .bf16: psoName = "mt_rms_norm_bf16"
+        default: fatalError("Ops.rmsNormRowsTwo: unsupported dtype \(x1.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // Allocate one or two eps buffers depending on whether the two
+        // eps values match — RMSNorm pairs typically come from the
+        // same checkpoint config and so share a single eps in practice.
+        let epsBuf1: MTLBuffer = {
+            let b = device.makeBuffer(length: 4)
+            var v = eps1
+            memcpy(b.contents(), &v, 4)
+            return b
+        }()
+        let epsBuf2: MTLBuffer = {
+            if eps1 == eps2 { return epsBuf1 }
+            let b = device.makeBuffer(length: 4)
+            var v = eps2
+            memcpy(b.contents(), &v, 4)
+            return b
+        }()
+        @inline(__always)
+        func dispatch(
+            _ x: Tensor, _ w: Tensor, _ out: Tensor,
+            _ epsBuf: MTLBuffer, _ n: Int, _ nRows: Int
+        ) {
+            let tgWidth = n / 4
+            let grid = MTLSize(width: nRows * tgWidth, height: 1, depth: 1)
+            let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+            enc.setBuffer(x.buffer, offset: x.offset, index: 0)
+            enc.setBuffer(w.buffer, offset: w.offset, index: 1)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 2)
+            enc.setBuffer(epsBuf, offset: 0, index: 3)
+            var nU = UInt32(n)
+            enc.setBytes(&nU, length: 4, index: 4)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(x1, w1, out1, epsBuf1, rowSize1, nRows1)
+        dispatch(x2, w2, out2, epsBuf2, rowSize2, nRows2)
+        enc.endEncoding()
     }
 
     /// Fused (residual `a + b`) + RMSNorm. Returns **both** outputs:
@@ -838,6 +979,197 @@ public enum Ops {
         default:
             fatalError("Ops.ropePartial: unsupported dtype \(qk.dtype)")
         }
+    }
+
+    /// Partial RoPE rotation on TWO tensors (typically Q + K) in ONE
+    /// compute encoder. Both tensors share the same `(headDim,
+    /// rotaryDim, position, thetaBase, scaling)` and dtype. The
+    /// kernel writes in-place exactly like `ropePartial`, so passing
+    /// `out == qk` is required.
+    public static func ropePartialTwo(
+        _ q: Tensor, _ k: Tensor, position: Int,
+        headDim: Int, rotaryDim: Int,
+        thetaBase: Float,
+        scaling: RoPEScaling = .none,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            q.dtype == k.dtype,
+            "Ops.ropePartialTwo: dtype mismatch")
+        precondition(
+            q.elementCount % headDim == 0 && k.elementCount % headDim == 0,
+            "Ops.ropePartialTwo: sizes must be multiples of headDim")
+        precondition(
+            rotaryDim > 0 && rotaryDim <= headDim && rotaryDim % 2 == 0,
+            "Ops.ropePartialTwo: rotaryDim (\(rotaryDim)) must be even and in 1...headDim")
+        let psoName: String
+        switch q.dtype {
+        case .f32: psoName = "ffai_rope_llama_f32"
+        case .f16: psoName = "ffai_rope_llama_f16"
+        case .bf16: psoName = "ffai_rope_llama_bf16"
+        default: fatalError("Ops.ropePartialTwo: unsupported dtype \(q.dtype)")
+        }
+        let halfRotary = rotaryDim / 2
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // RoPE constants are shared across q and k — set ONCE.
+        var hd = UInt32(headDim)
+        var half = UInt32(halfRotary)
+        var pos = UInt32(position)
+        var theta = thetaBase
+        var scaleFactor = scaling.scaleFactor
+        var lowFreq = scaling.lowFreqFactor
+        var highFreq = scaling.highFreqFactor
+        var origMax = scaling.originalMaxPosition
+        enc.setBytes(&hd, length: 4, index: 2)
+        enc.setBytes(&half, length: 4, index: 3)
+        enc.setBytes(&pos, length: 4, index: 4)
+        enc.setBytes(&theta, length: 4, index: 5)
+        enc.setBytes(&scaleFactor, length: 4, index: 6)
+        enc.setBytes(&lowFreq, length: 4, index: 7)
+        enc.setBytes(&highFreq, length: 4, index: 8)
+        enc.setBytes(&origMax, length: 4, index: 9)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ t: Tensor) {
+            let nHeads = t.elementCount / headDim
+            let grid = MTLSize(width: nHeads, height: halfRotary, depth: 1)
+            enc.setBuffer(t.buffer, offset: t.offset, index: 0)
+            enc.setBuffer(t.buffer, offset: t.offset, index: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(q)
+        dispatch(k)
+        enc.endEncoding()
+    }
+
+    /// Batched per-row RoPE: applies position-dependent rotation to T
+    /// rows of `qk` in ONE dispatch. `positions` is a `[T]` u32 buffer
+    /// (per-row physical slot index). In-place rotation. Saves T-1
+    /// encoder begin/end pairs versus a per-row `ropePartial` T-loop;
+    /// at Qwen3.6-A3B prefill T=512 × 10 attn layers that's ≈ 5100
+    /// fewer dispatches per prefill call.
+    public static func ropePartialMany(
+        _ qk: Tensor, positions: Tensor,
+        t: Int, nHeads: Int,
+        headDim: Int, rotaryDim: Int,
+        rowStride: Int,
+        thetaBase: Float,
+        scaling: RoPEScaling = .none,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            positions.dtype == .u32,
+            "Ops.ropePartialMany: positions must be .u32")
+        precondition(
+            positions.elementCount == t,
+            "Ops.ropePartialMany: positions count must equal T")
+        precondition(
+            qk.elementCount == t * rowStride,
+            "Ops.ropePartialMany: qk size \(qk.elementCount) ≠ T·rowStride = \(t * rowStride)")
+        precondition(
+            rotaryDim > 0 && rotaryDim <= headDim && rotaryDim % 2 == 0,
+            "Ops.ropePartialMany: rotaryDim must be even and in 1...headDim")
+        let halfRotary = rotaryDim / 2
+        let psoName: String
+        switch qk.dtype {
+        case .f32: psoName = "ffai_rope_llama_many_f32"
+        case .f16: psoName = "ffai_rope_llama_many_f16"
+        case .bf16: psoName = "ffai_rope_llama_many_bf16"
+        default: fatalError("Ops.ropePartialMany: unsupported dtype \(qk.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(qk.buffer, offset: qk.offset, index: 0)
+        enc.setBuffer(positions.buffer, offset: positions.offset, index: 1)
+        enc.setBuffer(qk.buffer, offset: qk.offset, index: 2)
+        var hd = UInt32(headDim)
+        var half = UInt32(halfRotary)
+        var stride = UInt32(rowStride)
+        var theta = thetaBase
+        var sf = scaling.scaleFactor
+        var lf = scaling.lowFreqFactor
+        var hf = scaling.highFreqFactor
+        var om = scaling.originalMaxPosition
+        enc.setBytes(&hd, length: 4, index: 3)
+        enc.setBytes(&half, length: 4, index: 4)
+        enc.setBytes(&stride, length: 4, index: 5)
+        enc.setBytes(&theta, length: 4, index: 6)
+        enc.setBytes(&sf, length: 4, index: 7)
+        enc.setBytes(&lf, length: 4, index: 8)
+        enc.setBytes(&hf, length: 4, index: 9)
+        enc.setBytes(&om, length: 4, index: 10)
+        let grid = MTLSize(width: t, height: nHeads, depth: halfRotary)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+    }
+
+    /// Pair of `ropePartialMany` calls (Q + K) sharing ONE compute
+    /// encoder. Both buffers consume the same `positions`, `headDim`,
+    /// `rotaryDim`, `thetaBase`, and `scaling`; only the per-buffer
+    /// `nHeads` × `rowStride` differs.
+    public static func ropePartialManyTwo(
+        q: Tensor, qNHeads: Int, qRowStride: Int,
+        k: Tensor, kNHeads: Int, kRowStride: Int,
+        positions: Tensor, t: Int,
+        headDim: Int, rotaryDim: Int,
+        thetaBase: Float,
+        scaling: RoPEScaling = .none,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(q.dtype == k.dtype, "Ops.ropePartialManyTwo: dtype mismatch")
+        precondition(
+            positions.dtype == .u32,
+            "Ops.ropePartialManyTwo: positions must be .u32")
+        precondition(
+            positions.elementCount == t,
+            "Ops.ropePartialManyTwo: positions count must equal T")
+        precondition(
+            rotaryDim > 0 && rotaryDim <= headDim && rotaryDim % 2 == 0,
+            "Ops.ropePartialManyTwo: rotaryDim must be even and in 1...headDim")
+        let halfRotary = rotaryDim / 2
+        let psoName: String
+        switch q.dtype {
+        case .f32: psoName = "ffai_rope_llama_many_f32"
+        case .f16: psoName = "ffai_rope_llama_many_f16"
+        case .bf16: psoName = "ffai_rope_llama_many_bf16"
+        default: fatalError("Ops.ropePartialManyTwo: unsupported dtype \(q.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // Shared bindings: positions + constants set ONCE.
+        enc.setBuffer(positions.buffer, offset: positions.offset, index: 1)
+        var hd = UInt32(headDim)
+        var half = UInt32(halfRotary)
+        var theta = thetaBase
+        var sf = scaling.scaleFactor
+        var lf = scaling.lowFreqFactor
+        var hf = scaling.highFreqFactor
+        var om = scaling.originalMaxPosition
+        enc.setBytes(&hd, length: 4, index: 3)
+        enc.setBytes(&half, length: 4, index: 4)
+        enc.setBytes(&theta, length: 4, index: 6)
+        enc.setBytes(&sf, length: 4, index: 7)
+        enc.setBytes(&lf, length: 4, index: 8)
+        enc.setBytes(&hf, length: 4, index: 9)
+        enc.setBytes(&om, length: 4, index: 10)
+        let tg = MTLSize(width: 1, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ buf: Tensor, _ nHeads: Int, _ rowStride: Int) {
+            var stride = UInt32(rowStride)
+            enc.setBuffer(buf.buffer, offset: buf.offset, index: 0)
+            enc.setBuffer(buf.buffer, offset: buf.offset, index: 2)
+            enc.setBytes(&stride, length: 4, index: 5)
+            let grid = MTLSize(width: t, height: nHeads, depth: halfRotary)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(q, qNHeads, qRowStride)
+        dispatch(k, kNHeads, kRowStride)
+        enc.endEncoding()
     }
 
     /// YaRN RoPE parameters. `low` / `high` are the correction-range
@@ -1319,6 +1651,961 @@ public enum Ops {
             on: cmd, into: out)
     }
 
+    /// Batched int4 dequantGemv on TWO projections sharing one input
+    /// in ONE compute encoder. Used by `Qwen35MoEFFN.forward` for the
+    /// per-expert gate + up pair: both projections read the same
+    /// `[hidden]` post-norm activation, so we set the `input` binding
+    /// once and rotate `(weight, scales, biases, output)` per dispatch.
+    /// Saves one encoder begin/end pair per call.
+    ///
+    /// All outputs must share dtype with `input`; `groupSize` and the
+    /// 4-bit packing are identical across the two projections.
+    public static func dequantGemvInt4Two(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype && input.dtype == out1.dtype,
+            "Ops.dequantGemvInt4Two: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Two: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        // `inDim` derives from the packed-row width: 4-bit packs 8
+        // weights per u32 word and `weight.shape[1]` counts words.
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        enc.endEncoding()
+    }
+
+    /// Batched int4 dequantGemv on THREE projections sharing one input
+    /// in ONE compute encoder. Used by the Qwen3.5/3.6 attention mixer
+    /// for the q/k/v projection triplet.
+    public static func dequantGemvInt4Three(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        w2: Tensor, s2: Tensor, b2: Tensor, out2: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype,
+            "Ops.dequantGemvInt4Three: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Three: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        dispatch(w2, s2, b2, out2)
+        enc.endEncoding()
+    }
+
+    /// Batched int4 dequantGemv on FOUR projections sharing one input
+    /// in ONE compute encoder. Used by the Qwen3.5/3.6 GDN mixer where
+    /// the four input projections (qkv, z, b, a) all read the same
+    /// xNorm output.
+    public static func dequantGemvInt4Four(
+        input: Tensor,
+        w0: Tensor, s0: Tensor, b0: Tensor, out0: Tensor,
+        w1: Tensor, s1: Tensor, b1: Tensor, out1: Tensor,
+        w2: Tensor, s2: Tensor, b2: Tensor, out2: Tensor,
+        w3: Tensor, s3: Tensor, b3: Tensor, out3: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            input.dtype == out0.dtype,
+            "Ops.dequantGemvInt4Four: dtype mismatch")
+        let psoName: String
+        switch input.dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Four: unsupported dtype \(input.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(input.buffer, offset: input.offset, index: 3)
+        let packedPerRow = w0.shape[1]
+        let inDim = packedPerRow * 32 / 4
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        @inline(__always)
+        func dispatch(_ w: Tensor, _ s: Tensor, _ b: Tensor, _ out: Tensor) {
+            enc.setBuffer(w.buffer, offset: w.offset, index: 0)
+            enc.setBuffer(s.buffer, offset: s.offset, index: 1)
+            enc.setBuffer(b.buffer, offset: b.offset, index: 2)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 4)
+            let outDim = w.shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(w0, s0, b0, out0)
+        dispatch(w1, s1, b1, out1)
+        dispatch(w2, s2, b2, out2)
+        dispatch(w3, s3, b3, out3)
+        enc.endEncoding()
+    }
+
+    /// Batched int4 dequant-GEMV on N projections with DIFFERENT
+    /// inputs sharing ONE compute encoder. Unlike `dequantGemvInt4Two`
+    /// / `Three` / `Four` (which all share a single input), the per-
+    /// expert MoE down phase has N independent activations — one per
+    /// chosen expert — but all projections share PSO, `inDim`, and
+    /// `groupSize`. The wrapper sets the constexprs once and rotates
+    /// `(weight, scales, biases, input, output)` per dispatch. Saves
+    /// N-1 encoder begin/end pairs versus N independent
+    /// `dequantGemvInt4` calls.
+    public static func dequantGemvInt4Many(
+        weights: [Tensor], scales: [Tensor], biases: [Tensor],
+        inputs: [Tensor], outputs: [Tensor],
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        let n = weights.count
+        precondition(
+            scales.count == n && biases.count == n && inputs.count == n && outputs.count == n,
+            "Ops.dequantGemvInt4Many: count mismatch")
+        guard n > 0 else { return }
+        let dtype = inputs[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "dequant_gemv_int4_f32"
+        case .f16: psoName = "dequant_gemv_int4_f16"
+        case .bf16: psoName = "dequant_gemv_int4_bf16"
+        default: fatalError("Ops.dequantGemvInt4Many: unsupported dtype \(dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        let packedPerRow = weights[0].shape[1]
+        let inDim = packedPerRow * 32 / 4  // bits = 4 → 8 weights / u32
+        var inDimV = UInt32(inDim)
+        var groupSizeV = UInt32(groupSize)
+        enc.setBytes(&inDimV, length: 4, index: 5)
+        enc.setBytes(&groupSizeV, length: 4, index: 6)
+        let tgWidth = 256
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        for i in 0 ..< n {
+            precondition(
+                weights[i].shape[1] == packedPerRow,
+                "Ops.dequantGemvInt4Many: inDim varies at index \(i)")
+            precondition(
+                inputs[i].dtype == dtype && outputs[i].dtype == dtype,
+                "Ops.dequantGemvInt4Many: dtype varies at index \(i)")
+            enc.setBuffer(weights[i].buffer, offset: weights[i].offset, index: 0)
+            enc.setBuffer(scales[i].buffer, offset: scales[i].offset, index: 1)
+            enc.setBuffer(biases[i].buffer, offset: biases[i].offset, index: 2)
+            enc.setBuffer(inputs[i].buffer, offset: inputs[i].offset, index: 3)
+            enc.setBuffer(outputs[i].buffer, offset: outputs[i].offset, index: 4)
+            let outDim = weights[i].shape[0]
+            let grid = MTLSize(width: outDim * tgWidth, height: 1, depth: 1)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        enc.endEncoding()
+    }
+
+    /// Fused Q/K/V int4 dequant-GEMV in ONE dispatch via
+    /// `ffai_batched_qkv_qgemv_fast`. Replaces the 3-dispatch
+    /// `dequantGemvInt4Three` shared-encoder form: the matrix is
+    /// selected by `program_id<2>()` across a `[ceil(maxOut/8), 1, 3]`
+    /// threadgroup grid, so all 3 projections share a single kernel
+    /// launch and read `x` once into TG memory instead of three times
+    /// from DRAM. Saves 2 encoder begin/end pairs per attention layer
+    /// at decode T=1.
+    ///
+    /// Output layout: q, k, v concatenated in that order in `out`;
+    /// caller slices into the three regions.
+    ///
+    /// Kernel constraints (mirror `ffai_rms_norm_qgemv_fast`):
+    /// - `in_dim` MUST be a multiple of 512.
+    /// - Each of `out_q`, `out_k`, `out_v` MUST be a multiple of 8.
+    /// - `group_size` MUST be 64.
+    /// - TPG = 64.
+    public static func batchedQkvQgemvInt4Fast(
+        x: Tensor,
+        wQ: Tensor, scalesQ: Tensor, biasesQ: Tensor,
+        wK: Tensor, scalesK: Tensor, biasesK: Tensor,
+        wV: Tensor, scalesV: Tensor, biasesV: Tensor,
+        outQ: Int, outK: Int, outV: Int,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            wQ.dtype == .u32 && wK.dtype == .u32 && wV.dtype == .u32,
+            "Ops.batchedQkvQgemvInt4Fast: w_* must be u32-packed")
+        let packedPerRow = wQ.shape[1]
+        let inDim = packedPerRow * 8
+        // K and V share the same in_dim as Q — the kernel reads ONE x row
+        // and walks all three weight tensors at that packed width. A
+        // mis-packed wK/wV would silently miscompute the K/V projections.
+        precondition(
+            wK.shape[1] == packedPerRow && wV.shape[1] == packedPerRow,
+            "Ops.batchedQkvQgemvInt4Fast: wK/wV packed width (\(wK.shape[1])/\(wV.shape[1])) must equal wQ (\(packedPerRow))"
+        )
+        precondition(
+            x.elementCount == inDim,
+            "Ops.batchedQkvQgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
+        precondition(
+            out.elementCount == outQ + outK + outV,
+            "Ops.batchedQkvQgemvInt4Fast: out.elementCount must be q+k+v")
+        precondition(
+            inDim % 512 == 0,
+            "Ops.batchedQkvQgemvInt4Fast: in_dim must be a multiple of 512")
+        precondition(
+            outQ % 8 == 0 && outK % 8 == 0 && outV % 8 == 0,
+            "Ops.batchedQkvQgemvInt4Fast: out_q/k/v must each be a multiple of 8")
+        let groupSize = 64
+        let maxOut = max(outQ, max(outK, outV))
+        // Grid: [ceil(maxOut/8) * TPG, 1, 3] — TG count per matrix axis
+        // times TPG=64 lanes; 3 matrices.
+        let tpg = 64
+        let nTiles = maxOut / 8
+        let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 3)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_batched_qkv_qgemv_fast_f32(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                out: out.buffer, outOffset: out.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_batched_qkv_qgemv_fast_f16(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                out: out.buffer, outOffset: out.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_batched_qkv_qgemv_fast_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                out: out.buffer, outOffset: out.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.batchedQkvQgemvInt4Fast: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// M>1 (batched-prefill) sibling of `batchedQkvQgemvInt4Fast`. Reads
+    /// `x = [M, in_dim]` once into TG memory and produces all 3
+    /// projections into THREE separate contiguous output tensors
+    /// (`qBuf [M, out_q]`, `kBuf [M, out_k]`, `vBuf [M, out_v]`). The
+    /// split-output layout lets downstream Q/K/V code read each
+    /// projection as `[M, dim]` without strided views (vs. a single
+    /// concat buffer). One dispatch replaces three independent qmm
+    /// dispatches; the `xNorm` DRAM roundtrip is paid once instead of
+    /// three times.
+    ///
+    /// Constraints (mirror `ffai_batched_qkv_qmm_fast`):
+    /// - `in_dim` MUST be a multiple of 512.
+    /// - Each of `out_q`, `out_k`, `out_v` MUST be a multiple of 8.
+    /// - `group_size` MUST be 64. TPG = 64.
+    /// - All three outputs MUST be pre-zeroed (kernel only writes
+    ///   valid `row0 < out_*` tiles per matrix branch). The wrapper
+    ///   handles this — callers do not need to zero ahead of time.
+    public static func batchedQkvQmmFast(
+        x: Tensor,  // [M, in_dim]
+        wQ: Tensor, scalesQ: Tensor, biasesQ: Tensor,
+        wK: Tensor, scalesK: Tensor, biasesK: Tensor,
+        wV: Tensor, scalesV: Tensor, biasesV: Tensor,
+        m: Int, outQ: Int, outK: Int, outV: Int,
+        on cmd: MTLCommandBuffer,
+        qBuf: Tensor,  // [M, out_q]
+        kBuf: Tensor,  // [M, out_k]
+        vBuf: Tensor  // [M, out_v]
+    ) {
+        precondition(
+            wQ.dtype == .u32 && wK.dtype == .u32 && wV.dtype == .u32,
+            "Ops.batchedQkvQmmFast: w_* must be u32-packed")
+        let packedPerRow = wQ.shape[1]
+        let inDim = packedPerRow * 8
+        // K and V share the same in_dim as Q — the kernel reads ONE x row
+        // and walks all three weight tensors at that packed width. A
+        // mis-packed wK/wV would silently miscompute the K/V projections.
+        precondition(
+            wK.shape[1] == packedPerRow && wV.shape[1] == packedPerRow,
+            "Ops.batchedQkvQmmFast: wK/wV packed width (\(wK.shape[1])/\(wV.shape[1])) must equal wQ (\(packedPerRow))"
+        )
+        precondition(
+            x.elementCount == m * inDim,
+            "Ops.batchedQkvQmmFast: x.elementCount \(x.elementCount) ≠ M·inDim \(m * inDim)")
+        precondition(
+            qBuf.elementCount == m * outQ,
+            "Ops.batchedQkvQmmFast: qBuf.elementCount must be M·out_q")
+        precondition(
+            kBuf.elementCount == m * outK,
+            "Ops.batchedQkvQmmFast: kBuf.elementCount must be M·out_k")
+        precondition(
+            vBuf.elementCount == m * outV,
+            "Ops.batchedQkvQmmFast: vBuf.elementCount must be M·out_v")
+        precondition(
+            inDim % 512 == 0,
+            "Ops.batchedQkvQmmFast: in_dim must be a multiple of 512")
+        precondition(
+            outQ % 8 == 0 && outK % 8 == 0 && outV % 8 == 0,
+            "Ops.batchedQkvQmmFast: out_q/k/v must each be a multiple of 8")
+        // Pre-zero outputs: the kernel tile mechanic depends on the
+        // buffer starting at zero where the smaller two matrices' tiles
+        // past their `out_*` count no-op the store.
+        qBuf.zero()
+        kBuf.zero()
+        vBuf.zero()
+        let groupSize = 64
+        let tpg = 64
+        let maxOut = max(outQ, max(outK, outV))
+        let nTiles = maxOut / 8
+        let grid = MTLSize(width: nTiles * tpg, height: m, depth: 3)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_batched_qkv_qmm_fast_f32(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                q_buf: qBuf.buffer, q_bufOffset: qBuf.offset,
+                k_buf: kBuf.buffer, k_bufOffset: kBuf.offset,
+                v_buf: vBuf.buffer, v_bufOffset: vBuf.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_batched_qkv_qmm_fast_f16(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                q_buf: qBuf.buffer, q_bufOffset: qBuf.offset,
+                k_buf: kBuf.buffer, k_bufOffset: kBuf.offset,
+                v_buf: vBuf.buffer, v_bufOffset: vBuf.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_batched_qkv_qmm_fast_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w_q: wQ.buffer, w_qOffset: wQ.offset,
+                scales_q: scalesQ.buffer, scales_qOffset: scalesQ.offset,
+                biases_q: biasesQ.buffer, biases_qOffset: biasesQ.offset,
+                w_k: wK.buffer, w_kOffset: wK.offset,
+                scales_k: scalesK.buffer, scales_kOffset: scalesK.offset,
+                biases_k: biasesK.buffer, biases_kOffset: biasesK.offset,
+                w_v: wV.buffer, w_vOffset: wV.offset,
+                scales_v: scalesV.buffer, scales_vOffset: scalesV.offset,
+                biases_v: biasesV.buffer, biases_vOffset: biasesV.offset,
+                q_buf: qBuf.buffer, q_bufOffset: qBuf.offset,
+                k_buf: kBuf.buffer, k_bufOffset: kBuf.offset,
+                v_buf: vBuf.buffer, v_bufOffset: vBuf.offset,
+                out_q: UInt32(outQ), out_k: UInt32(outK), out_v: UInt32(outV),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.batchedQkvQmmFast: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// Fused 4-output int4 dequant-GEMV in ONE dispatch via
+    /// `ffai_batched_4_qgemv_fast`. Extends the QKV (3-output) pattern
+    /// to 4 projections sharing the same input. Used by the Qwen3.5
+    /// GDN mixer where the four input projections (qkv, z, b, a) all
+    /// read the same `xNorm` and can be fused into a single kernel
+    /// launch. Replaces the 4-dispatch shared-encoder form
+    /// (`Ops.dequantGemvInt4Four`) with one launch, paying the input
+    /// DRAM roundtrip once instead of four times.
+    ///
+    /// Constraints (mirror `ffai_batched_qkv_qgemv_fast`):
+    /// - `in_dim` MUST be a multiple of 512.
+    /// - Each of `out_a / out_b / out_c / out_d` MUST be a multiple
+    ///   of 8.
+    /// - `group_size` MUST be 64.
+    /// - TPG = 64. Grid: `[ceil(max(out_*) / 8) * TPG, 1, 4]`.
+    public static func batched4QgemvInt4Fast(
+        input x: Tensor,
+        wA: Tensor, scalesA: Tensor, biasesA: Tensor, outA: Tensor,
+        wB: Tensor, scalesB: Tensor, biasesB: Tensor, outB: Tensor,
+        wC: Tensor, scalesC: Tensor, biasesC: Tensor, outC: Tensor,
+        wD: Tensor, scalesD: Tensor, biasesD: Tensor, outD: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            wA.dtype == .u32 && wB.dtype == .u32 && wC.dtype == .u32 && wD.dtype == .u32,
+            "Ops.batched4QgemvInt4Fast: w_* must be u32-packed")
+        let packedPerRow = wA.shape[1]
+        let inDim = packedPerRow * 8
+        // All four weight tensors share the same in_dim — the kernel reads
+        // ONE x row and walks all four at that packed width. A mis-packed
+        // wB/wC/wD would silently miscompute its branch's output.
+        precondition(
+            wB.shape[1] == packedPerRow && wC.shape[1] == packedPerRow
+                && wD.shape[1] == packedPerRow,
+            "Ops.batched4QgemvInt4Fast: wB/wC/wD packed width must equal wA (\(packedPerRow))"
+        )
+        precondition(
+            x.elementCount == inDim,
+            "Ops.batched4QgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
+        let outA_ = outA.elementCount
+        let outB_ = outB.elementCount
+        let outC_ = outC.elementCount
+        let outD_ = outD.elementCount
+        precondition(
+            inDim % 512 == 0,
+            "Ops.batched4QgemvInt4Fast: in_dim must be a multiple of 512")
+        precondition(
+            outA_ % 8 == 0 && outB_ % 8 == 0 && outC_ % 8 == 0 && outD_ % 8 == 0,
+            "Ops.batched4QgemvInt4Fast: each out_* must be a multiple of 8")
+        let tpg = 64
+        let maxOut = max(max(outA_, outB_), max(outC_, outD_))
+        let nTiles = maxOut / 8
+        let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 4)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_batched_4_qgemv_fast_f32(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_out: outA.buffer, a_outOffset: outA.offset,
+                b_out: outB.buffer, b_outOffset: outB.offset,
+                c_out: outC.buffer, c_outOffset: outC.offset,
+                d_out: outD.buffer, d_outOffset: outD.offset,
+                out_a: UInt32(outA_), out_b: UInt32(outB_),
+                out_c: UInt32(outC_), out_d: UInt32(outD_),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_batched_4_qgemv_fast_f16(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_out: outA.buffer, a_outOffset: outA.offset,
+                b_out: outB.buffer, b_outOffset: outB.offset,
+                c_out: outC.buffer, c_outOffset: outC.offset,
+                d_out: outD.buffer, d_outOffset: outD.offset,
+                out_a: UInt32(outA_), out_b: UInt32(outB_),
+                out_c: UInt32(outC_), out_d: UInt32(outD_),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_batched_4_qgemv_fast_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_out: outA.buffer, a_outOffset: outA.offset,
+                b_out: outB.buffer, b_outOffset: outB.offset,
+                c_out: outC.buffer, c_outOffset: outC.offset,
+                d_out: outD.buffer, d_outOffset: outD.offset,
+                out_a: UInt32(outA_), out_b: UInt32(outB_),
+                out_c: UInt32(outC_), out_d: UInt32(outD_),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.batched4QgemvInt4Fast: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// M>1 (batched-prefill) sibling of `batched4QgemvInt4Fast`. Reads
+    /// `x = [M, in_dim]` once into TG memory and produces all 4
+    /// outputs (each `[M, out_*]`) in a single dispatch. Eliminates
+    /// the 3 redundant input DRAM reads of the unfused `callMany`
+    /// chain used by the GDN mixer's batched forward (qkv, z, b, a all
+    /// project from the same `xNorm`).
+    ///
+    /// Output tensors are caller-allocated and indexed independently
+    /// (`outA / outB / outC / outD`, each `[M, out_*]`).
+    ///
+    /// Constraints (mirror `ffai_batched_4_qgemv_fast`):
+    /// - `in_dim` MUST be a multiple of 512.
+    /// - Each of `out_a / out_b / out_c / out_d` MUST be a multiple
+    ///   of 8.
+    /// - `group_size` MUST be 64. TPG = 64.
+    public static func batched4QmmFast(
+        input x: Tensor, m: Int,
+        wA: Tensor, scalesA: Tensor, biasesA: Tensor, outA: Tensor,
+        wB: Tensor, scalesB: Tensor, biasesB: Tensor, outB: Tensor,
+        wC: Tensor, scalesC: Tensor, biasesC: Tensor, outC: Tensor,
+        wD: Tensor, scalesD: Tensor, biasesD: Tensor, outD: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            wA.dtype == .u32 && wB.dtype == .u32 && wC.dtype == .u32 && wD.dtype == .u32,
+            "Ops.batched4QmmFast: w_* must be u32-packed")
+        let packedPerRow = wA.shape[1]
+        let inDim = packedPerRow * 8
+        // All four weight tensors share the same in_dim — the kernel reads
+        // ONE x row and walks all four at that packed width. A mis-packed
+        // wB/wC/wD would silently miscompute its branch's output.
+        precondition(
+            wB.shape[1] == packedPerRow && wC.shape[1] == packedPerRow
+                && wD.shape[1] == packedPerRow,
+            "Ops.batched4QmmFast: wB/wC/wD packed width must equal wA (\(packedPerRow))"
+        )
+        precondition(
+            x.elementCount == m * inDim,
+            "Ops.batched4QmmFast: x size \(x.elementCount) ≠ M·inDim \(m * inDim)")
+        let outADim = wA.shape[0]
+        let outBDim = wB.shape[0]
+        let outCDim = wC.shape[0]
+        let outDDim = wD.shape[0]
+        precondition(
+            outA.elementCount == m * outADim,
+            "Ops.batched4QmmFast: outA size \(outA.elementCount) ≠ M·outADim \(m * outADim)")
+        precondition(
+            outB.elementCount == m * outBDim,
+            "Ops.batched4QmmFast: outB size \(outB.elementCount) ≠ M·outBDim \(m * outBDim)")
+        precondition(
+            outC.elementCount == m * outCDim,
+            "Ops.batched4QmmFast: outC size \(outC.elementCount) ≠ M·outCDim \(m * outCDim)")
+        precondition(
+            outD.elementCount == m * outDDim,
+            "Ops.batched4QmmFast: outD size \(outD.elementCount) ≠ M·outDDim \(m * outDDim)")
+        precondition(
+            inDim % 512 == 0,
+            "Ops.batched4QmmFast: in_dim must be a multiple of 512")
+        precondition(
+            outADim % 8 == 0 && outBDim % 8 == 0 && outCDim % 8 == 0 && outDDim % 8 == 0,
+            "Ops.batched4QmmFast: each out_* must be a multiple of 8")
+        let tpg = 64
+        let maxOut = max(max(outADim, outBDim), max(outCDim, outDDim))
+        let nTiles = maxOut / 8
+        let grid = MTLSize(width: nTiles * tpg, height: m, depth: 4)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_batched_4_qmm_fast_f32(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_buf: outA.buffer, a_bufOffset: outA.offset,
+                b_buf: outB.buffer, b_bufOffset: outB.offset,
+                c_buf: outC.buffer, c_bufOffset: outC.offset,
+                d_buf: outD.buffer, d_bufOffset: outD.offset,
+                out_a: UInt32(outADim), out_b: UInt32(outBDim),
+                out_c: UInt32(outCDim), out_d: UInt32(outDDim),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_batched_4_qmm_fast_f16(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_buf: outA.buffer, a_bufOffset: outA.offset,
+                b_buf: outB.buffer, b_bufOffset: outB.offset,
+                c_buf: outC.buffer, c_bufOffset: outC.offset,
+                d_buf: outD.buffer, d_bufOffset: outD.offset,
+                out_a: UInt32(outADim), out_b: UInt32(outBDim),
+                out_c: UInt32(outCDim), out_d: UInt32(outDDim),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_batched_4_qmm_fast_bf16(
+                x: x.buffer, xOffset: x.offset,
+                w_a: wA.buffer, w_aOffset: wA.offset,
+                scales_a: scalesA.buffer, scales_aOffset: scalesA.offset,
+                biases_a: biasesA.buffer, biases_aOffset: biasesA.offset,
+                w_b: wB.buffer, w_bOffset: wB.offset,
+                scales_b: scalesB.buffer, scales_bOffset: scalesB.offset,
+                biases_b: biasesB.buffer, biases_bOffset: biasesB.offset,
+                w_c: wC.buffer, w_cOffset: wC.offset,
+                scales_c: scalesC.buffer, scales_cOffset: scalesC.offset,
+                biases_c: biasesC.buffer, biases_cOffset: biasesC.offset,
+                w_d: wD.buffer, w_dOffset: wD.offset,
+                scales_d: scalesD.buffer, scales_dOffset: scalesD.offset,
+                biases_d: biasesD.buffer, biases_dOffset: biasesD.offset,
+                a_buf: outA.buffer, a_bufOffset: outA.offset,
+                b_buf: outB.buffer, b_bufOffset: outB.offset,
+                c_buf: outC.buffer, c_bufOffset: outC.offset,
+                d_buf: outD.buffer, d_bufOffset: outD.offset,
+                out_a: UInt32(outADim), out_b: UInt32(outBDim),
+                out_c: UInt32(outCDim), out_d: UInt32(outDDim),
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.batched4QmmFast: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// Per-expert indexed int4 dequant-GEMV. The caller stacks every
+    /// expert's weight slab into one `[nExperts, outDim, inDim/8]`
+    /// u32-packed tensor (and matching scales / biases stacks); the
+    /// kernel reads `expertIndex[0]` to pick the slab to dequantize on
+    /// this call. Paired with `Ops.moeRouterTopK`, the top-K indices
+    /// stay GPU-resident and the host-side `route → dispatch expert
+    /// gemv` sync at every MoE layer collapses to one
+    /// `expertIndex.buffer + offset = slot · 4` view per slot.
+    public static func dequantGemvInt4ExpertIndexed(
+        weightsStacked: Tensor, scalesStacked: Tensor, biasesStacked: Tensor,
+        input: Tensor, expertIndex: Tensor,
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            weightsStacked.shape.count == 3,
+            "Ops.dequantGemvInt4ExpertIndexed: weightsStacked must be [nExperts, outDim, inDim/8]")
+        precondition(
+            weightsStacked.dtype == .u32,
+            "Ops.dequantGemvInt4ExpertIndexed: weightsStacked must be u32 (packed)")
+        precondition(
+            expertIndex.dtype == .u32 && expertIndex.elementCount == 1,
+            "Ops.dequantGemvInt4ExpertIndexed: expertIndex must be [1] u32")
+        precondition(
+            scalesStacked.dtype == input.dtype && biasesStacked.dtype == input.dtype,
+            "Ops.dequantGemvInt4ExpertIndexed: scales / biases dtype must match input")
+        precondition(
+            out.dtype == input.dtype,
+            "Ops.dequantGemvInt4ExpertIndexed: out dtype must match input")
+        let outDim = weightsStacked.shape[1]
+        let packedPerRow = weightsStacked.shape[2]
+        let inDim = packedPerRow * 8  // int4 packs 8 weights per u32 word
+        precondition(
+            input.elementCount == inDim,
+            "Ops.dequantGemvInt4ExpertIndexed: input \(input.elementCount) ≠ inDim \(inDim)")
+        precondition(
+            out.elementCount == outDim,
+            "Ops.dequantGemvInt4ExpertIndexed: out \(out.elementCount) ≠ outDim \(outDim)")
+        // Kernel runs in Reduction mode with tpg=32 (one simdgroup per
+        // output row). `dispatchThreads` counts THREADS not threadgroups
+        // — total threads = outDim · 32 gives outDim threadgroups, one
+        // per output row.
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let grid = MTLSize(width: outDim * 32, height: 1, depth: 1)
+        let inDimU = UInt32(inDim)
+        let outDimU = UInt32(outDim)
+        let groupSizeU = UInt32(groupSize)
+        switch input.dtype {
+        case .f32:
+            MetalTileKernels.dequant_gemv_int4_expert_indexed_f32(
+                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
+                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
+                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
+                input: input.buffer, inputOffset: input.offset,
+                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
+                output: out.buffer, outputOffset: out.offset,
+                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.dequant_gemv_int4_expert_indexed_f16(
+                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
+                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
+                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
+                input: input.buffer, inputOffset: input.offset,
+                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
+                output: out.buffer, outputOffset: out.offset,
+                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.dequant_gemv_int4_expert_indexed_bf16(
+                weights_stacked: weightsStacked.buffer, weights_stackedOffset: weightsStacked.offset,
+                scales_stacked: scalesStacked.buffer, scales_stackedOffset: scalesStacked.offset,
+                biases_stacked: biasesStacked.buffer, biases_stackedOffset: biasesStacked.offset,
+                input: input.buffer, inputOffset: input.offset,
+                expert_index: expertIndex.buffer, expert_indexOffset: expertIndex.offset,
+                output: out.buffer, outputOffset: out.offset,
+                in_dim: inDimU, out_dim: outDimU, group_size: groupSizeU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.dequantGemvInt4ExpertIndexed: unsupported input dtype \(input.dtype)")
+        }
+    }
+
+    /// Encoder-batched form of `dequantGemvInt4ExpertIndexed`. All N
+    /// calls must share `(inDim, outDim, groupSize, dtype)` so they
+    /// reuse the same PSO + constexpr binding; only the per-call
+    /// `(weights, scales, biases, input, expertIndex, output)` rotate
+    /// per dispatch. Saves N-1 encoder begin/end pairs versus N
+    /// independent calls. At Qwen3.6-A3B's topK=8 the gate+up phase
+    /// becomes 16 calls on one encoder and the down phase 8 calls on
+    /// a second encoder per MoE layer.
+    public static func dequantGemvInt4ExpertIndexedMany(
+        weightsStacked: [Tensor], scalesStacked: [Tensor], biasesStacked: [Tensor],
+        inputs: [Tensor], expertIndices: [Tensor], outputs: [Tensor],
+        groupSize: Int = 64,
+        on cmd: MTLCommandBuffer
+    ) {
+        let n = weightsStacked.count
+        precondition(
+            scalesStacked.count == n && biasesStacked.count == n
+                && inputs.count == n && expertIndices.count == n
+                && outputs.count == n,
+            "Ops.dequantGemvInt4ExpertIndexedMany: count mismatch")
+        guard n > 0 else { return }
+        let dtype = inputs[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "dequant_gemv_int4_expert_indexed_f32"
+        case .f16: psoName = "dequant_gemv_int4_expert_indexed_f16"
+        case .bf16: psoName = "dequant_gemv_int4_expert_indexed_bf16"
+        default:
+            fatalError(
+                "Ops.dequantGemvInt4ExpertIndexedMany: unsupported dtype \(dtype)")
+        }
+        let outDim = weightsStacked[0].shape[1]
+        let packedPerRow = weightsStacked[0].shape[2]
+        let inDim = packedPerRow * 8
+        var inDimV = UInt32(inDim)
+        var outDimV = UInt32(outDim)
+        var groupSizeV = UInt32(groupSize)
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // Shared constexprs (kernel buffer indices 6, 7, 8) set once.
+        enc.setBytes(&inDimV, length: 4, index: 6)
+        enc.setBytes(&outDimV, length: 4, index: 7)
+        enc.setBytes(&groupSizeV, length: 4, index: 8)
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let grid = MTLSize(width: outDim * 32, height: 1, depth: 1)
+        for i in 0 ..< n {
+            precondition(
+                weightsStacked[i].shape[1] == outDim
+                    && weightsStacked[i].shape[2] == packedPerRow,
+                "Ops.dequantGemvInt4ExpertIndexedMany: weight shape varies at \(i)")
+            precondition(
+                inputs[i].dtype == dtype && outputs[i].dtype == dtype,
+                "Ops.dequantGemvInt4ExpertIndexedMany: dtype varies at \(i)")
+            precondition(
+                expertIndices[i].dtype == .u32 && expertIndices[i].elementCount == 1,
+                "Ops.dequantGemvInt4ExpertIndexedMany: expertIndices[\(i)] must be [1] u32")
+            enc.setBuffer(weightsStacked[i].buffer, offset: weightsStacked[i].offset, index: 0)
+            enc.setBuffer(scalesStacked[i].buffer, offset: scalesStacked[i].offset, index: 1)
+            enc.setBuffer(biasesStacked[i].buffer, offset: biasesStacked[i].offset, index: 2)
+            enc.setBuffer(inputs[i].buffer, offset: inputs[i].offset, index: 3)
+            enc.setBuffer(expertIndices[i].buffer, offset: expertIndices[i].offset, index: 4)
+            enc.setBuffer(outputs[i].buffer, offset: outputs[i].offset, index: 5)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        enc.endEncoding()
+    }
+
+    /// MoE top-K router. Reads `[nExperts]` raw logits and writes
+    /// `[k]` u32 expert indices + `[k]` weights of the same dtype.
+    /// `normTopkProb` matches Qwen3-MoE convention when `true`
+    /// (softmax restricted to the chosen k, weights renormalise to
+    /// sum-to-1); `false` matches the Qwen3-Next style (softmax over
+    /// all experts, then pick top-k without renormalisation).
+    ///
+    /// Single-row form — `logits: [nExperts]`. Internally calls the
+    /// T-batched variant with `t = 1`.
+    public static func moeRouterTopK(
+        logits: Tensor, indicesOut: Tensor, weightsOut: Tensor,
+        nExperts: Int, k: Int, normTopkProb: Bool,
+        on cmd: MTLCommandBuffer
+    ) {
+        moeRouterTopKMany(
+            logits: logits, indicesOut: indicesOut, weightsOut: weightsOut,
+            t: 1, nExperts: nExperts, k: k, normTopkProb: normTopkProb,
+            on: cmd)
+    }
+
+    /// T-batched MoE top-K router. `logits: [T, nExperts]`,
+    /// `indicesOut: [T, k]` u32, `weightsOut: [T, k]` (matching logits
+    /// dtype). The kernel iterates `T` rows along `program_id<0>()`
+    /// (one threadgroup per row), so a single dispatch covers all
+    /// prefill rows without the host commit + wait + CPU
+    /// `MoERouter.route` round-trip that the per-row form forced.
+    public static func moeRouterTopKMany(
+        logits: Tensor, indicesOut: Tensor, weightsOut: Tensor,
+        t: Int, nExperts: Int, k: Int, normTopkProb: Bool,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.moeRouterTopKMany: t must be positive")
+        precondition(
+            logits.elementCount == t * nExperts,
+            "Ops.moeRouterTopKMany: logits must be [T·nExperts]")
+        precondition(
+            indicesOut.elementCount == t * k && indicesOut.dtype == .u32,
+            "Ops.moeRouterTopKMany: indicesOut must be [T·k] u32")
+        precondition(
+            weightsOut.elementCount == t * k && weightsOut.dtype == logits.dtype,
+            "Ops.moeRouterTopKMany: weightsOut must be [T·k] matching logits dtype")
+        // Kernel pins tpg = 32 (one simdgroup per token row, Reduction
+        // mode). Grid total threads = T · 32 → T threadgroups.
+        let tg = MTLSize(width: 32, height: 1, depth: 1)
+        let grid = MTLSize(width: t * 32, height: 1, depth: 1)
+        let normFlag: UInt32 = normTopkProb ? 1 : 0
+        switch logits.dtype {
+        case .f32:
+            MetalTileKernels.mt_moe_router_topk_f32(
+                router_logits: logits.buffer, router_logitsOffset: logits.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k), norm_topk_prob: normFlag,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_moe_router_topk_f16(
+                router_logits: logits.buffer, router_logitsOffset: logits.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k), norm_topk_prob: normFlag,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_moe_router_topk_bf16(
+                router_logits: logits.buffer, router_logitsOffset: logits.offset,
+                indices_out: indicesOut.buffer, indices_outOffset: indicesOut.offset,
+                weights_out: weightsOut.buffer, weights_outOffset: weightsOut.offset,
+                n_experts: UInt32(nExperts), k: UInt32(k), norm_topk_prob: normFlag,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.moeRouterTopKMany: unsupported logits dtype \(logits.dtype)")
+        }
+    }
+
     /// GPU argmax over a 1D logits tensor. Caller supplies a 1-element
     /// u32 output buffer. Uses the cooperative 256-thread Reduction
     /// kernel — one threadgroup, ~80-300 KB / vocab logits in registers.
@@ -1370,6 +2657,79 @@ public enum Ops {
                 gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.conv1dCausalStep: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// Batched depthwise causal conv1d + SiLU + cast-to-f32. Sweeps
+    /// `t` tokens in ONE dispatch with the conv state held in
+    /// per-channel registers across the sweep — `stateIn` is read
+    /// once at the top, `stateOut` is written once at the bottom.
+    /// Replaces the per-token `conv1dCausalStep` + `siluCastToF32`
+    /// T-loop in `Qwen35GDNMixer.forwardManyChunked`.
+    ///
+    /// `convKernel` must be 4 (Qwen3.5 / 3.6, Mamba 2, NemotronH all
+    /// use kernel=4; the kernel signature carries it as a constexpr
+    /// for shape uniformity but the body is K=4 hardcoded).
+    ///
+    /// State in-place safety: each grid thread owns one channel;
+    /// reads `stateIn[*, c]` once at the start of the sweep and
+    /// writes `stateOut[*, c]` once at the end. Passing the same
+    /// buffer for both is safe.
+    public static func conv1dCausalStepSiluCastMany(
+        src: Tensor, w: Tensor, b: Tensor,
+        stateIn: Tensor, outF32: Tensor, stateOut: Tensor,
+        t: Int, convDim: Int, convKernel: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convKernel == 4,
+            "Ops.conv1dCausalStepSiluCastMany: requires conv_kernel = 4")
+        precondition(
+            src.dtype == w.dtype && src.dtype == b.dtype
+                && src.dtype == stateIn.dtype && src.dtype == stateOut.dtype,
+            "Ops.conv1dCausalStepSiluCastMany: dtype mismatch")
+        precondition(
+            outF32.dtype == .f32,
+            "Ops.conv1dCausalStepSiluCastMany: outF32 must be .f32")
+        let grid = MTLSize(width: convDim, height: 1, depth: 1)
+        let tg = MTLSize(width: min(convDim, 256), height: 1, depth: 1)
+        let tLenU = UInt32(t)
+        let cdU = UInt32(convDim)
+        let ckU = UInt32(convKernel)
+        switch src.dtype {
+        case .f32:
+            MetalTileKernels.ffai_conv1d_causal_step_silu_cast_many_f32(
+                src: src.buffer, srcOffset: src.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                out_f32: outF32.buffer, out_f32Offset: outF32.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_conv1d_causal_step_silu_cast_many_f16(
+                src: src.buffer, srcOffset: src.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                out_f32: outF32.buffer, out_f32Offset: outF32.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_conv1d_causal_step_silu_cast_many_bf16(
+                src: src.buffer, srcOffset: src.offset,
+                w: w.buffer, wOffset: w.offset,
+                b: b.buffer, bOffset: b.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                out_f32: outF32.buffer, out_f32Offset: outF32.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                t_len: tLenU, conv_dim: cdU, conv_kernel: ckU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError(
+                "Ops.conv1dCausalStepSiluCastMany: unsupported dtype \(src.dtype)")
         }
     }
 
@@ -1929,6 +3289,113 @@ public enum Ops {
         }
     }
 
+    /// Append the current token's K AND V rows to their caches in ONE
+    /// compute encoder. The cache buffers, layout, and writing thread
+    /// are identical to `kvCacheUpdate` — this just amortises the
+    /// encoder begin/end across both projections (saving one pair per
+    /// attention layer per decode token).
+    public static func kvCacheUpdateKV(
+        kSrc: Tensor, kCache: Tensor,
+        vSrc: Tensor, vCache: Tensor,
+        nKVHeads: Int, headDim: Int, maxSeq: Int, position: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kSrc.dtype == kCache.dtype && vSrc.dtype == vCache.dtype
+                && kSrc.dtype == vSrc.dtype,
+            "Ops.kvCacheUpdateKV: dtype mismatch")
+        let total = nKVHeads * headDim
+        let (grid, tg) = elementwiseGrid(total)
+        let hd = UInt32(headDim)
+        let ms = UInt32(maxSeq)
+        let pos = UInt32(position)
+        let psoName: String
+        switch kSrc.dtype {
+        case .f32: psoName = "kv_cache_update_f32"
+        case .f16: psoName = "kv_cache_update_f16"
+        case .bf16: psoName = "kv_cache_update_bf16"
+        default: fatalError("Ops.kvCacheUpdateKV: unsupported dtype \(kSrc.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        @inline(__always)
+        func dispatch(_ src: Tensor, _ cache: Tensor) {
+            enc.setBuffer(src.buffer, offset: src.offset, index: 0)
+            enc.setBuffer(cache.buffer, offset: cache.offset, index: 1)
+            var headDimV = hd
+            var maxSeqV = ms
+            var positionV = pos
+            enc.setBytes(&headDimV, length: 4, index: 2)
+            enc.setBytes(&maxSeqV, length: 4, index: 3)
+            enc.setBytes(&positionV, length: 4, index: 4)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(kSrc, kCache)
+        dispatch(vSrc, vCache)
+        enc.endEncoding()
+    }
+
+    /// Batched K + V cache append: writes T tokens' K rows AND V rows
+    /// into their respective caches in ONE shared encoder (2 batched
+    /// dispatches). Each per-token write goes to a slot indexed by
+    /// `positions[t]`. Replaces the per-token `kvCacheUpdateKV` loop
+    /// at `decodeMany` / `forwardMany` prefill — at T=512 × 10 attn
+    /// layers that's ≈ 5100 fewer dispatches per prefill call.
+    ///
+    /// Shapes:
+    ///   - `kSrc` / `vSrc`: `[T, nKVHeads, headDim]` (flat).
+    ///   - `kCache` / `vCache`: `[nKVHeads, maxSeq, headDim]`.
+    ///   - `positions`: `[T]` u32 slot indices into the caches.
+    public static func kvCacheUpdateKVMany(
+        kSrc: Tensor, kCache: Tensor,
+        vSrc: Tensor, vCache: Tensor,
+        positions: Tensor, t: Int,
+        nKVHeads: Int, headDim: Int, maxSeq: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kSrc.dtype == kCache.dtype && vSrc.dtype == vCache.dtype
+                && kSrc.dtype == vSrc.dtype,
+            "Ops.kvCacheUpdateKVMany: dtype mismatch")
+        precondition(
+            positions.dtype == .u32,
+            "Ops.kvCacheUpdateKVMany: positions must be .u32")
+        precondition(
+            positions.elementCount == t,
+            "Ops.kvCacheUpdateKVMany: positions count must equal T")
+        let elementsPerRow = nKVHeads * headDim
+        let total = t * elementsPerRow
+        let (grid, tg) = elementwiseGrid(total)
+        let psoName: String
+        switch kSrc.dtype {
+        case .f32: psoName = "kv_cache_update_many_f32"
+        case .f16: psoName = "kv_cache_update_many_f16"
+        case .bf16: psoName = "kv_cache_update_many_bf16"
+        default: fatalError("Ops.kvCacheUpdateKVMany: unsupported dtype \(kSrc.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        // Shared bindings: positions + scalars set ONCE.
+        enc.setBuffer(positions.buffer, offset: positions.offset, index: 1)
+        var hd = UInt32(headDim)
+        var ms = UInt32(maxSeq)
+        var nhd = UInt32(elementsPerRow)
+        enc.setBytes(&hd, length: 4, index: 3)
+        enc.setBytes(&ms, length: 4, index: 4)
+        enc.setBytes(&nhd, length: 4, index: 5)
+        @inline(__always)
+        func dispatch(_ src: Tensor, _ cache: Tensor) {
+            enc.setBuffer(src.buffer, offset: src.offset, index: 0)
+            enc.setBuffer(cache.buffer, offset: cache.offset, index: 2)
+            enc.dispatchThreads(grid, threadsPerThreadgroup: tg)
+        }
+        dispatch(kSrc, kCache)
+        dispatch(vSrc, vCache)
+        enc.endEncoding()
+    }
+
     /// SDPA decode. q: [n_q_heads, head_dim]. k/v cache layout:
     /// [n_kv_heads, kv_stride, head_dim] where kv_stride is the physical
     /// capacity (maxSeq) and nKV is how many positions to attend to.
@@ -2174,6 +3641,138 @@ public enum Ops {
         return result
     }
 
+    /// Two-pass Flash-Decoding SDPA. Pass 1 partitions the KV cache
+    /// into `blocks` even tiles and writes a per-block partial
+    /// `(O, max, lse)` triple; pass 2 merges them with the log-sum-exp
+    /// trick. Wins over single-pass `sdpaDecode` at long KV (≥ 1K
+    /// typical), where the single-pass kernel starves the GPU with
+    /// one threadgroup per Q-head.
+    ///
+    /// **Block-count contract.** The pass2 kernel hardcodes a 32-wide
+    /// reduction (`bn = 32` per lane) over `blocks / 32` chunks, so
+    /// `blocks` MUST be a multiple of 32 and at least 32. Passing
+    /// `blocks < 32` causes pass2 to iterate zero chunks and emit an
+    /// all-zero output silently — the precondition below catches that.
+    /// 32 is the standard short-context tile; 64 / 96 / 128 are
+    /// reasonable for very long contexts.
+    ///
+    /// **Scratch buffer sizing.** Caller owns the partials; reuse
+    /// across decode steps is safe because the shape depends only on
+    /// `(nQHeads, headDim, blocks)`:
+    ///   - `partialO` : `[nQHeads, blocks, headDim]` matching `q.dtype`
+    ///   - `partialM` : `[nQHeads, blocks]` fp32 (running max)
+    ///   - `partialL` : `[nQHeads, blocks]` fp32 (running lse)
+    public static func sdpaDecode2Pass(
+        q: Tensor, k: Tensor, v: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        nKV: Int, kvStride: Int, blocks: Int,
+        scale: Float,
+        partialO: Tensor, partialM: Tensor, partialL: Tensor,
+        into out: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            nQHeads % nKVHeads == 0,
+            "Ops.sdpaDecode2Pass: nQHeads must be a multiple of nKVHeads")
+        let gqaFactor = nQHeads / nKVHeads
+        precondition(
+            blocks >= 32 && blocks % 32 == 0,
+            "Ops.sdpaDecode2Pass: blocks (\(blocks)) must be a multiple of 32 "
+                + "and ≥ 32 — pass2 hardcodes a 32-lane block-merge reduction")
+        precondition(
+            partialO.elementCount == nQHeads * blocks * headDim,
+            "Ops.sdpaDecode2Pass: partialO must be [nQHeads, blocks, headDim]")
+        precondition(
+            partialM.elementCount == nQHeads * blocks && partialM.dtype == .f32,
+            "Ops.sdpaDecode2Pass: partialM must be [nQHeads, blocks] f32")
+        precondition(
+            partialL.elementCount == nQHeads * blocks && partialL.dtype == .f32,
+            "Ops.sdpaDecode2Pass: partialL must be [nQHeads, blocks] f32")
+        precondition(
+            partialO.dtype == q.dtype && out.dtype == q.dtype,
+            "Ops.sdpaDecode2Pass: partialO / out dtype must match q")
+
+        // Pass 1: per-block partial O / m / l. One TG per
+        // (kv_head, block) with `gqa_factor` simdgroups × 32 lanes,
+        // each lane owning `headDim / 32` consecutive elements.
+        let pass1TgWidth = gqaFactor * 32
+        let pass1Grid = MTLSize(
+            width: nKVHeads * pass1TgWidth, height: blocks, depth: 1)
+        let pass1Tg = MTLSize(width: pass1TgWidth, height: 1, depth: 1)
+
+        // Pass 2: merge partials across blocks. One TG per Q-head with
+        // 32 simdgroups × 32 lanes = 1024 threads.
+        let pass2TgWidth = 1024
+        let pass2Grid = MTLSize(
+            width: nQHeads * pass2TgWidth, height: 1, depth: 1)
+        let pass2Tg = MTLSize(width: pass2TgWidth, height: 1, depth: 1)
+
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.sdpa_decode_2pass_pass1_f32(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_f32(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case .f16:
+            MetalTileKernels.sdpa_decode_2pass_pass1_f16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_f16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.sdpa_decode_2pass_pass1_bf16(
+                q: q.buffer, qOffset: q.offset,
+                k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                head_dim: UInt32(headDim), n_kv: UInt32(nKV),
+                kv_stride: UInt32(kvStride),
+                gqa_factor: UInt32(gqaFactor), blocks: UInt32(blocks),
+                scale: scale,
+                gridSize: pass1Grid, threadgroupSize: pass1Tg, on: cmd)
+            MetalTileKernels.sdpa_decode_2pass_pass2_bf16(
+                partial_o: partialO.buffer, partial_oOffset: partialO.offset,
+                partial_m: partialM.buffer, partial_mOffset: partialM.offset,
+                partial_l: partialL.buffer, partial_lOffset: partialL.offset,
+                out: out.buffer, outOffset: out.offset,
+                head_dim: UInt32(headDim), blocks: UInt32(blocks),
+                gridSize: pass2Grid, threadgroupSize: pass2Tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaDecode2Pass: unsupported dtype \(q.dtype)")
+        }
+    }
+
     /// Multi-query SDPA — attends `nQuery` query rows against a shared
     /// K/V cache in one dispatch. `q` / output are `[nQuery, nQHeads,
     /// headDim]`; `k` / `v` are the cache buffers `[nKVHeads, kvStride,
@@ -2214,8 +3813,15 @@ public enum Ops {
         let grid = MTLSize(width: nQHeads * nQuery * threadsPerGroup, height: 1, depth: 1)
         let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
         let causalFlag = UInt32(causal ? 1 : 0)
-        switch q.dtype {
-        case .f32:
+        // Route by (dtype, headDim). d=128 → `ffai_sdpa_multi_*`; d=256
+        // → `ffai_sdpa_multi_d256_*`, the variant added for Qwen3.6-A3B
+        // full-attention layers (head_dim=256). Both kernels share the
+        // same Swift wrapper shape; the dispatch grid / TPG / online
+        // softmax / causal mask / GQA fan-out semantics are identical.
+        // The d=256 kernel uses a 2-phase output reduction internally
+        // to stay under Apple's 32 KB threadgroup-memory cap.
+        switch (q.dtype, headDim) {
+        case (.f32, 128):
             MetalTileKernels.ffai_sdpa_multi_f32(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2224,7 +3830,7 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .f16:
+        case (.f16, 128):
             MetalTileKernels.ffai_sdpa_multi_f16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2233,7 +3839,7 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
-        case .bf16:
+        case (.bf16, 128):
             MetalTileKernels.ffai_sdpa_multi_bf16(
                 q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
                 v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
@@ -2242,8 +3848,123 @@ public enum Ops {
                 kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
                 causal: causalFlag, scale: scale,
                 gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f32, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.f16, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case (.bf16, 256):
+            MetalTileKernels.ffai_sdpa_multi_d256_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset, out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                causal: causalFlag, scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
-            fatalError("Ops.sdpaMulti: unsupported dtype \(q.dtype)")
+            fatalError(
+                "Ops.sdpaMulti: unsupported dtype \(q.dtype) at headDim \(headDim) "
+                    + "— only (f32/f16/bf16) × (128, 256) are emitted")
+        }
+        return result
+    }
+
+    /// Tree-causal `sdpaMulti` — same dispatch contract but the
+    /// scalar `causal` boolean is replaced by an additive
+    /// `[nQuery, nQuery]` mask tensor consulted only for in-block KV
+    /// positions (positions `< baseKV` — the cached prefix — are
+    /// always fully attended). The mask is `0.0` for "allow" and
+    /// `-inf` for "block"; the kernel adds it directly to the
+    /// pre-softmax scores.
+    ///
+    /// Used by speculative-decode tree-verify: one verifier call
+    /// attends every leaf-to-root path of the draft tree at once,
+    /// gated by a tree-causal mask that lets each leaf only see its
+    /// own ancestors. Companion to `DraftTreeNode.treeCausalMask()`.
+    ///
+    /// Mask dtype must match `q`. `headDim` shares `sdpaMulti`'s
+    /// constraint: only the 128-variant kernel is emitted on dev
+    /// (tree-verify has no d256 use case today).
+    public static func sdpaMultiTreeMask(
+        q: Tensor, k: Tensor, v: Tensor, mask: Tensor,
+        nQHeads: Int, nKVHeads: Int, headDim: Int,
+        baseKV: Int, nQuery: Int, kvStride: Int,
+        scale: Float,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor? = nil
+    ) -> Tensor {
+        if let reason = OpsValidation.validateSdpaMulti(
+            headDim: headDim, nQHeads: nQHeads, nKVHeads: nKVHeads,
+            baseKV: baseKV, nQuery: nQuery, kvStride: kvStride
+        ) {
+            preconditionFailure("Ops.sdpaMultiTreeMask: \(reason)")
+        }
+        precondition(
+            headDim == 128,
+            "Ops.sdpaMultiTreeMask: only headDim=128 has a tree-mask kernel variant")
+        precondition(
+            mask.dtype == q.dtype,
+            "Ops.sdpaMultiTreeMask: mask dtype (\(mask.dtype)) must match q dtype (\(q.dtype))")
+        precondition(
+            mask.elementCount == nQuery * nQuery,
+            "Ops.sdpaMultiTreeMask: mask elementCount \(mask.elementCount) ≠ nQuery·nQuery \(nQuery * nQuery)")
+        let headsPerGroup = nQHeads / nKVHeads
+        let result = out ?? Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: q.dtype)
+        let threadsPerGroup = 1024
+        let grid = MTLSize(
+            width: nQHeads * nQuery * threadsPerGroup,
+            height: 1, depth: 1)
+        let tg = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+        switch q.dtype {
+        case .f32:
+            MetalTileKernels.ffai_sdpa_multi_tree_mask_f32(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                mask: mask.buffer, maskOffset: mask.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_sdpa_multi_tree_mask_f16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                mask: mask.buffer, maskOffset: mask.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_sdpa_multi_tree_mask_bf16(
+                q: q.buffer, qOffset: q.offset, k: k.buffer, kOffset: k.offset,
+                v: v.buffer, vOffset: v.offset,
+                mask: mask.buffer, maskOffset: mask.offset,
+                out: result.buffer, outOffset: result.offset,
+                head_dim: UInt32(headDim), n_q_heads: UInt32(nQHeads),
+                base_kv: UInt32(baseKV), n_query: UInt32(nQuery),
+                kv_stride: UInt32(kvStride), heads_per_group: UInt32(headsPerGroup),
+                scale: scale,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.sdpaMultiTreeMask: unsupported dtype \(q.dtype)")
         }
         return result
     }
@@ -3526,6 +5247,116 @@ public enum Ops {
         }
     }
 
+    /// Chunked-prefill counterpart to `gatedDeltaPrepStep`. Runs the
+    /// fused GDN prep + recurrence over a contiguous range of tokens
+    /// in one dispatch instead of looping the single-token kernel,
+    /// keeping the per-head recurrent state in registers across the
+    /// chunk. `tLen` is a GPU-resident `[1]` u32 scalar so the host
+    /// can chain chunked dispatches without a CPU readback for the
+    /// chunk-size constant.
+    ///
+    /// Shape contract (all share dtype except `tLen`):
+    ///   - `convOut`   : `[batchSize, tLen, hv·dv]`
+    ///   - `aLog`      : `[hv]` per-head log-decay
+    ///   - `dtBias`    : `[hv]` per-head delta-t bias
+    ///   - `aRaw`/`bRaw` : `[batchSize, tLen, hv]` chunk gates
+    ///   - `qNormWeight` / `kNormWeight` : `[dk]` Q-norm / K-norm
+    ///     applied before the recurrence
+    ///   - `stateIn` / `stateOut` : `[batchSize, hv, dv, dk]` fp32
+    ///     recurrent state (read-once / write-once across the chunk)
+    ///   - `y`         : `[batchSize, tLen, hv·dv]` output activations
+    public static func gatedDeltaPrepChunk(
+        convOut: Tensor,
+        aLog: Tensor, dtBias: Tensor,
+        aRaw: Tensor, bRaw: Tensor,
+        qNormWeight: Tensor, kNormWeight: Tensor,
+        stateIn: Tensor, stateOut: Tensor, y: Tensor,
+        tLen: Tensor,
+        batchSize: Int, dk: Int, dv: Int, hv: Int, hk: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            convOut.dtype == aLog.dtype && aLog.dtype == dtBias.dtype
+                && dtBias.dtype == aRaw.dtype && aRaw.dtype == bRaw.dtype
+                && bRaw.dtype == qNormWeight.dtype && qNormWeight.dtype == kNormWeight.dtype
+                && kNormWeight.dtype == stateIn.dtype && stateIn.dtype == stateOut.dtype
+                && stateOut.dtype == y.dtype,
+            "Ops.gatedDeltaPrepChunk: every tensor must share dtype")
+        precondition(
+            dk % 32 == 0,
+            "Ops.gatedDeltaPrepChunk: dk (\(dk)) must be a multiple of 32")
+        precondition(
+            dv % 32 == 0,
+            "Ops.gatedDeltaPrepChunk: dv (\(dv)) must be a multiple of 32")
+        precondition(
+            hv % hk == 0,
+            "Ops.gatedDeltaPrepChunk: hv (\(hv)) must be a multiple of hk (\(hk)) (GQA)")
+        precondition(
+            tLen.dtype == .u32 && tLen.elementCount == 1,
+            "Ops.gatedDeltaPrepChunk: tLen must be a [1] u32 scalar buffer")
+        // One simdgroup per (head, dv index) ; grid sweeps batch · hv
+        // along Y. Kernel walks tLen tokens internally.
+        let tgWidth = 32
+        let grid = MTLSize(
+            width: dv * tgWidth,
+            height: batchSize * hv,
+            depth: 1)
+        let tg = MTLSize(width: tgWidth, height: 1, depth: 1)
+        let dkU = UInt32(dk)
+        let dvU = UInt32(dv)
+        let hvU = UInt32(hv)
+        let hkU = UInt32(hk)
+        switch convOut.dtype {
+        case .f32:
+            MetalTileKernels.mt_gated_delta_prep_chunk_f32(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_gated_delta_prep_chunk_f16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_gated_delta_prep_chunk_bf16(
+                conv_out: convOut.buffer, conv_outOffset: convOut.offset,
+                a_log: aLog.buffer, a_logOffset: aLog.offset,
+                dt_bias: dtBias.buffer, dt_biasOffset: dtBias.offset,
+                a_raw: aRaw.buffer, a_rawOffset: aRaw.offset,
+                b_raw: bRaw.buffer, b_rawOffset: bRaw.offset,
+                q_norm_weight: qNormWeight.buffer, q_norm_weightOffset: qNormWeight.offset,
+                k_norm_weight: kNormWeight.buffer, k_norm_weightOffset: kNormWeight.offset,
+                state_in: stateIn.buffer, state_inOffset: stateIn.offset,
+                state_out: stateOut.buffer, state_outOffset: stateOut.offset,
+                y: y.buffer, yOffset: y.offset,
+                t_len: tLen.buffer, t_lenOffset: tLen.offset,
+                dk: dkU, dv: dvU, hv: hvU, hk: hkU,
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedDeltaPrepChunk: unsupported dtype \(convOut.dtype)")
+        }
+    }
+
     // ─── Dynamic-M batched-prefill int4 qmm ───────────────────────────
     //
     // Host-side driver around `mt_qmm_mma`. The kernel's dispatch grid is
@@ -3743,6 +5574,103 @@ public enum Ops {
         }
     }
 
+    /// Cast TWO same-dtype tensors to f32 on the same compute encoder.
+    /// Saves one encoder begin/end pair versus two `castToF32` calls.
+    /// Used inside the Qwen3 GDN T-loop where the two raw gate inputs
+    /// (`aRaw`, `bRaw`) need to be promoted to fp32 every token.
+    public static func castToF32Two(
+        _ a: Tensor, into outA: Tensor,
+        _ b: Tensor, into outB: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            a.dtype == b.dtype,
+            "Ops.castToF32Two: inputs must share dtype")
+        precondition(
+            outA.dtype == .f32 && outB.dtype == .f32,
+            "Ops.castToF32Two: outputs must be f32")
+        precondition(
+            a.elementCount == outA.elementCount,
+            "Ops.castToF32Two: a / outA element-count mismatch")
+        precondition(
+            b.elementCount == outB.elementCount,
+            "Ops.castToF32Two: b / outB element-count mismatch")
+        let psoName: String
+        switch a.dtype {
+        case .bf16: psoName = "mt_cast_to_f32_bf16"
+        case .f16: psoName = "mt_cast_to_f32_f16"
+        case .f32: psoName = "mt_cast_to_f32_f32"
+        default: fatalError("Ops.castToF32Two: unsupported dtype \(a.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        @inline(__always)
+        func dispatch(_ input: Tensor, _ out: Tensor) {
+            enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+            let n = input.elementCount
+            let tgWidth = min(n, 256)
+            enc.dispatchThreads(
+                MTLSize(width: n, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        dispatch(a, outA)
+        dispatch(b, outB)
+        enc.endEncoding()
+    }
+
+    /// Cast THREE same-dtype tensors to f32 on the same compute
+    /// encoder. Used in the Qwen3 GDN fused-prep path where
+    /// `convAct`, `aRaw`, and `bRaw` all need f32 promotion before
+    /// the recurrence kernel.
+    public static func castToF32Three(
+        _ a: Tensor, into outA: Tensor,
+        _ b: Tensor, into outB: Tensor,
+        _ c: Tensor, into outC: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            a.dtype == b.dtype && b.dtype == c.dtype,
+            "Ops.castToF32Three: all inputs must share dtype")
+        precondition(
+            outA.dtype == .f32 && outB.dtype == .f32 && outC.dtype == .f32,
+            "Ops.castToF32Three: outputs must all be f32")
+        precondition(
+            a.elementCount == outA.elementCount,
+            "Ops.castToF32Three: a / outA element-count mismatch")
+        precondition(
+            b.elementCount == outB.elementCount,
+            "Ops.castToF32Three: b / outB element-count mismatch")
+        precondition(
+            c.elementCount == outC.elementCount,
+            "Ops.castToF32Three: c / outC element-count mismatch")
+        let psoName: String
+        switch a.dtype {
+        case .bf16: psoName = "mt_cast_to_f32_bf16"
+        case .f16: psoName = "mt_cast_to_f32_f16"
+        case .f32: psoName = "mt_cast_to_f32_f32"
+        default: fatalError("Ops.castToF32Three: unsupported dtype \(a.dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        @inline(__always)
+        func dispatch(_ input: Tensor, _ out: Tensor) {
+            enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+            let n = input.elementCount
+            let tgWidth = min(n, 256)
+            enc.dispatchThreads(
+                MTLSize(width: n, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        dispatch(a, outA)
+        dispatch(b, outB)
+        dispatch(c, outC)
+        enc.endEncoding()
+    }
+
     public static func castToF32(
         _ input: Tensor, into output: Tensor,
         on cmd: MTLCommandBuffer
@@ -3779,6 +5707,67 @@ public enum Ops {
         default:
             fatalError("Ops.castToF32: unsupported input dtype \(input.dtype)")
         }
+    }
+
+    /// One silu-cast plus two plain casts to f32 on the SAME compute
+    /// encoder. Used inside the Qwen3.5 GDN T-loop where, every token,
+    /// the input goes through `siluCastToF32` while `aRaw` / `bRaw`
+    /// (the gate scalars) go through plain `castToF32`. The wrapper
+    /// sets the silu PSO once, dispatches the silu, then switches to
+    /// the plain-cast PSO and dispatches the two raw casts. Saves the
+    /// encoder begin/end pair between dispatches that would otherwise
+    /// fire on every GDN token.
+    public static func siluCastF32PlusCastF32Two(
+        siluIn: Tensor, into siluOut: Tensor,
+        _ a: Tensor, into outA: Tensor,
+        _ b: Tensor, into outB: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            siluIn.dtype == a.dtype && a.dtype == b.dtype,
+            "Ops.siluCastF32PlusCastF32Two: all inputs must share dtype")
+        precondition(
+            siluOut.dtype == .f32 && outA.dtype == .f32 && outB.dtype == .f32,
+            "Ops.siluCastF32PlusCastF32Two: outputs must be f32")
+        precondition(
+            siluIn.elementCount == siluOut.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: silu in/out count mismatch")
+        precondition(
+            a.elementCount == outA.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: a/outA count mismatch")
+        precondition(
+            b.elementCount == outB.elementCount,
+            "Ops.siluCastF32PlusCastF32Two: b/outB count mismatch")
+        let siluPso: String
+        let castPso: String
+        switch siluIn.dtype {
+        case .f16:
+            siluPso = "mt_silu_cast_to_f32_f16"
+            castPso = "mt_cast_to_f32_f16"
+        case .bf16:
+            siluPso = "mt_silu_cast_to_f32_bf16"
+            castPso = "mt_cast_to_f32_bf16"
+        default:
+            fatalError(
+                "Ops.siluCastF32PlusCastF32Two: unsupported dtype \(siluIn.dtype)")
+        }
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        @inline(__always)
+        func dispatch(_ input: Tensor, _ out: Tensor) {
+            enc.setBuffer(input.buffer, offset: input.offset, index: 0)
+            enc.setBuffer(out.buffer, offset: out.offset, index: 1)
+            let n = input.elementCount
+            let tgWidth = min(n, 256)
+            enc.dispatchThreads(
+                MTLSize(width: n, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        enc.setComputePipelineState(PSOCache.shared.pipelineState(for: siluPso))
+        dispatch(siluIn, siluOut)
+        enc.setComputePipelineState(PSOCache.shared.pipelineState(for: castPso))
+        dispatch(a, outA)
+        dispatch(b, outB)
+        enc.endEncoding()
     }
 
     // ─── Fused gated mixer norm ───────────────────────────────────────
@@ -3871,6 +5860,309 @@ public enum Ops {
                 n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
         default:
             fatalError("Ops.gatedMixerNorm: unsupported out dtype \(out.dtype)")
+        }
+    }
+
+    /// T-batched `gatedMixerNorm`. Same kernel, same per-row geometry
+    /// (one threadgroup per row, `Dv / 4` threads per TG); the grid X
+    /// axis widens from `Hv` to `T · Hv` so a single dispatch covers
+    /// every prefill row. Used in the Qwen3.5 GDN mixer's prefill
+    /// path where the T-loop over per-token norms was an explicit
+    /// performance hotspot.
+    ///
+    /// Tensor shapes:
+    ///   - `y` `[T, Hv, Dv]` fp32 (recurrence output stays fp32)
+    ///   - `z` / `out` `[T, Hv, Dv]` in model dtype
+    ///   - `weight` `[Dv]` in model dtype
+    ///   - `epsBuf` `[1]` fp32
+    public static func gatedMixerNormMany(
+        y: Tensor, z: Tensor, weight: Tensor,
+        epsBuf: Tensor,
+        into out: Tensor,
+        t: Int, numValueHeads: Int, valueHeadDim: Int,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(t > 0, "Ops.gatedMixerNormMany: t must be positive")
+        precondition(
+            y.dtype == .f32,
+            "Ops.gatedMixerNormMany: y must be f32 (got \(y.dtype))")
+        precondition(
+            z.dtype == weight.dtype && weight.dtype == out.dtype,
+            "Ops.gatedMixerNormMany: z / weight / out must share dtype")
+        precondition(
+            epsBuf.dtype == .f32,
+            "Ops.gatedMixerNormMany: epsBuf must be f32")
+        precondition(
+            valueHeadDim.isMultiple(of: 4),
+            "Ops.gatedMixerNormMany: valueHeadDim (\(valueHeadDim)) must be a multiple of 4")
+        let expected = t * numValueHeads * valueHeadDim
+        precondition(
+            y.elementCount == expected,
+            "Ops.gatedMixerNormMany: y has \(y.elementCount), expected T·Hv·Dv = \(expected)")
+        precondition(
+            z.elementCount == expected,
+            "Ops.gatedMixerNormMany: z has \(z.elementCount), expected \(expected)")
+        precondition(
+            weight.elementCount == valueHeadDim,
+            "Ops.gatedMixerNormMany: weight has \(weight.elementCount), expected Dv = \(valueHeadDim)")
+        precondition(
+            out.elementCount == expected,
+            "Ops.gatedMixerNormMany: out has \(out.elementCount), expected \(expected)")
+        let tpg = valueHeadDim / 4
+        let nRows = t * numValueHeads
+        let grid = MTLSize(width: nRows * tpg, height: 1, depth: 1)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        let nU = UInt32(valueHeadDim)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.mt_gated_mixer_norm_f32(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: out.buffer, outOffset: out.offset,
+                eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
+                n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.mt_gated_mixer_norm_f16(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: out.buffer, outOffset: out.offset,
+                eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
+                n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.mt_gated_mixer_norm_bf16(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                w: weight.buffer, wOffset: weight.offset,
+                out: out.buffer, outOffset: out.offset,
+                eps_buf: epsBuf.buffer, eps_bufOffset: epsBuf.offset,
+                n: nU, gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedMixerNormMany: unsupported out dtype \(out.dtype)")
+        }
+    }
+
+    // ─── Fused RMSNorm + int4 dequant-GEMV ────────────────────────────
+    //
+    // Wraps `ffai_rms_norm_qgemv_fast` (RMSNorm-fused) and
+    // `ffai_gated_rms_norm_qgemv_int4_fast` (Mamba2-gated-RMSNorm-
+    // fused). Both keep the normalised activation in registers and
+    // feed it straight into the int4 dequant-GEMV, replacing a
+    // 2-dispatch chain (`Ops.rmsNorm` / `Ops.gatedRmsNorm` + `Ops.
+    // dequantGemvInt4`) with a single kernel. Saves a full `[in_dim]`
+    // DRAM roundtrip on the intermediate `normed` per call.
+    //
+    // Use at every site where a pre-norm immediately precedes a
+    // single int4 qmm projection — most notably the finalNorm + lmHead
+    // boundary (one dispatch per token) and the GDN mixer's
+    // post-recurrence gatedRmsNorm + outProj pair.
+
+    /// Fused RMSNorm + int4 dequant-GEMV in ONE dispatch via
+    /// `ffai_rms_norm_qgemv_fast`. Computes
+    ///   `y[row] = Σ_i (q[row,i]·scale + bias) ·
+    ///            (x[i] · norm_weight[i] · inv_rms)`
+    /// with `inv_rms = rsqrt(mean(x²) + eps)` and the normalised
+    /// activation never leaving registers.
+    ///
+    /// Kernel constraints (`ffai_rms_norm_qgemv_fast`):
+    /// - `in_dim` MUST be a multiple of 512 (kernel block size = 512
+    ///   K-elements per outer iter).
+    /// - `out_dim` MUST be a multiple of 8 (kernel processes 8 output
+    ///   rows per TG).
+    /// - `group_size` MUST equal 64.
+    /// - TPG = 64 (2 simdgroups × 32 lanes).
+    public static func rmsNormQgemvInt4Fast(
+        x: Tensor, normWeight: Tensor, eps: Float,
+        qWeight: Tensor, qScales: Tensor, qBiases: Tensor,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor
+    ) {
+        precondition(
+            qWeight.dtype == .u32,
+            "Ops.rmsNormQgemvInt4Fast: qWeight must be u32-packed")
+        precondition(
+            qWeight.shape.count == 2,
+            "Ops.rmsNormQgemvInt4Fast: qWeight must be [outDim, inDim/8]")
+        let outDim = qWeight.shape[0]
+        let packedPerRow = qWeight.shape[1]
+        let inDim = packedPerRow * 8
+        precondition(
+            x.elementCount == inDim,
+            "Ops.rmsNormQgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
+        precondition(
+            normWeight.elementCount == inDim,
+            "Ops.rmsNormQgemvInt4Fast: normWeight.elementCount \(normWeight.elementCount) ≠ inDim \(inDim)")
+        precondition(
+            out.elementCount == outDim,
+            "Ops.rmsNormQgemvInt4Fast: out.elementCount \(out.elementCount) ≠ outDim \(outDim)")
+        precondition(
+            x.dtype == normWeight.dtype && normWeight.dtype == qScales.dtype
+                && qScales.dtype == qBiases.dtype && qBiases.dtype == out.dtype,
+            "Ops.rmsNormQgemvInt4Fast: all non-weight tensors must share dtype")
+        precondition(
+            inDim % 512 == 0,
+            "Ops.rmsNormQgemvInt4Fast: in_dim \(inDim) must be a multiple of 512 (fast variant)")
+        precondition(
+            outDim % 8 == 0,
+            "Ops.rmsNormQgemvInt4Fast: out_dim \(outDim) must be a multiple of 8")
+        // INVARIANT: kernel pins group_size=64 + TPG=64 for the fast
+        // 8-rows-per-TG variant. group_size is checked as a constexpr
+        // by the kernel; we re-assert here for early failure.
+        let groupSize = 64
+        precondition(
+            inDim % groupSize == 0,
+            "Ops.rmsNormQgemvInt4Fast: in_dim must divide group_size=64")
+        // eps as a 1-element f32 buffer.
+        var epsValue = eps
+        let epsBuf = device.makeBuffer(length: 4)
+        memcpy(epsBuf.contents(), &epsValue, 4)
+        let tg = MTLSize(width: 64, height: 1, depth: 1)
+        let nTiles = outDim / 8
+        let grid = MTLSize(width: nTiles * 64, height: 1, depth: 1)
+        switch x.dtype {
+        case .f32:
+            MetalTileKernels.ffai_rms_norm_qgemv_fast_f32(
+                x: x.buffer, xOffset: x.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                weight: qWeight.buffer, weightOffset: qWeight.offset,
+                scales: qScales.buffer, scalesOffset: qScales.offset,
+                biases: qBiases.buffer, biasesOffset: qBiases.offset,
+                output: out.buffer, outputOffset: out.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_rms_norm_qgemv_fast_f16(
+                x: x.buffer, xOffset: x.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                weight: qWeight.buffer, weightOffset: qWeight.offset,
+                scales: qScales.buffer, scalesOffset: qScales.offset,
+                biases: qBiases.buffer, biasesOffset: qBiases.offset,
+                output: out.buffer, outputOffset: out.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_rms_norm_qgemv_fast_bf16(
+                x: x.buffer, xOffset: x.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                weight: qWeight.buffer, weightOffset: qWeight.offset,
+                scales: qScales.buffer, scalesOffset: qScales.offset,
+                biases: qBiases.buffer, biasesOffset: qBiases.offset,
+                output: out.buffer, outputOffset: out.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                in_dim: UInt32(inDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.rmsNormQgemvInt4Fast: unsupported dtype \(x.dtype)")
+        }
+    }
+
+    /// Fused Mamba2-style gated RMSNorm + int4 dequant-GEMV in ONE
+    /// dispatch via `ffai_gated_rms_norm_qgemv_int4_fast`. Computes
+    /// the GDN mixer's `silu(z) · w · rmsnorm(y)` and feeds the result
+    /// straight into the int4 outProj — replaces the 2-dispatch
+    /// chain (`Ops.gatedRmsNorm` + `Ops.dequantGemvInt4`) with a
+    /// single kernel. Saves a full `[Hv·Dv]` DRAM roundtrip on the
+    /// intermediate gated-norm output per call.
+    ///
+    /// Use at the GDN mixer post-recurrence boundary, where the
+    /// gated-norm output is the direct input to the outProj projection.
+    ///
+    /// Kernel constraints:
+    /// - `Hv·Dv` (in_dim) MUST be a multiple of 512.
+    /// - `Hv·Dv` MUST be ≤ 8192 (kernel TG-memory cap; the gated-norm
+    ///   pass stages the full input in TG memory).
+    /// - `out_dim` MUST be a multiple of 8.
+    /// - `group_size` MUST be 64. TPG = 64.
+    public static func gatedRmsNormQgemvInt4Fast(
+        y: Tensor,  // [Hv, Dv] f32 (GDN recurrence output)
+        z: Tensor,  // [Hv*Dv] T
+        normWeight: Tensor,  // [Dv] T
+        eps: Float,
+        qWeight: Tensor,  // [out_dim, in_dim/8] u32
+        qScales: Tensor,  // [out_dim, in_dim/group_size] T
+        qBiases: Tensor,
+        hv: Int, dv: Int, outDim: Int, groupSize: Int = 64,
+        on cmd: MTLCommandBuffer,
+        into out: Tensor  // [out_dim] T
+    ) {
+        precondition(
+            y.dtype == .f32,
+            "Ops.gatedRmsNormQgemvInt4Fast: y must be f32")
+        precondition(
+            z.dtype == normWeight.dtype && normWeight.dtype == out.dtype,
+            "Ops.gatedRmsNormQgemvInt4Fast: z/weight/out dtype mismatch")
+        precondition(
+            qWeight.dtype == .u32,
+            "Ops.gatedRmsNormQgemvInt4Fast: q_weight must be u32-packed")
+        let inDim = hv * dv
+        precondition(
+            inDim % 512 == 0,
+            "Ops.gatedRmsNormQgemvInt4Fast: Hv·Dv (\(inDim)) must be multiple of 512")
+        precondition(
+            inDim <= 8192,
+            "Ops.gatedRmsNormQgemvInt4Fast: Hv·Dv (\(inDim)) must be ≤ 8192 (kernel TG-mem cap)")
+        precondition(
+            outDim % 8 == 0,
+            "Ops.gatedRmsNormQgemvInt4Fast: out_dim must be multiple of 8")
+        precondition(
+            groupSize == 64,
+            "Ops.gatedRmsNormQgemvInt4Fast: group_size must be 64")
+        precondition(
+            out.elementCount == outDim,
+            "Ops.gatedRmsNormQgemvInt4Fast: out element count mismatch")
+        let tpg = 64
+        let nTiles = outDim / 8
+        let grid = MTLSize(width: nTiles * tpg, height: 1, depth: 1)
+        let tg = MTLSize(width: tpg, height: 1, depth: 1)
+        // eps as a 1-element f32 buffer.
+        var epsValue = eps
+        let epsBuf = device.makeBuffer(length: 4)
+        memcpy(epsBuf.contents(), &epsValue, 4)
+        switch out.dtype {
+        case .f32:
+            MetalTileKernels.ffai_gated_rms_norm_qgemv_int4_fast_f32(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                q_weight: qWeight.buffer, q_weightOffset: qWeight.offset,
+                q_scales: qScales.buffer, q_scalesOffset: qScales.offset,
+                q_biases: qBiases.buffer, q_biasesOffset: qBiases.offset,
+                out: out.buffer, outOffset: out.offset,
+                hv: UInt32(hv), dv: UInt32(dv),
+                out_dim: UInt32(outDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .f16:
+            MetalTileKernels.ffai_gated_rms_norm_qgemv_int4_fast_f16(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                q_weight: qWeight.buffer, q_weightOffset: qWeight.offset,
+                q_scales: qScales.buffer, q_scalesOffset: qScales.offset,
+                q_biases: qBiases.buffer, q_biasesOffset: qBiases.offset,
+                out: out.buffer, outOffset: out.offset,
+                hv: UInt32(hv), dv: UInt32(dv),
+                out_dim: UInt32(outDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        case .bf16:
+            MetalTileKernels.ffai_gated_rms_norm_qgemv_int4_fast_bf16(
+                y: y.buffer, yOffset: y.offset,
+                z: z.buffer, zOffset: z.offset,
+                norm_weight: normWeight.buffer, norm_weightOffset: normWeight.offset,
+                eps_buf: epsBuf, eps_bufOffset: 0,
+                q_weight: qWeight.buffer, q_weightOffset: qWeight.offset,
+                q_scales: qScales.buffer, q_scalesOffset: qScales.offset,
+                q_biases: qBiases.buffer, q_biasesOffset: qBiases.offset,
+                out: out.buffer, outOffset: out.offset,
+                hv: UInt32(hv), dv: UInt32(dv),
+                out_dim: UInt32(outDim), group_size: UInt32(groupSize),
+                gridSize: grid, threadgroupSize: tg, on: cmd)
+        default:
+            fatalError("Ops.gatedRmsNormQgemvInt4Fast: unsupported dtype \(out.dtype)")
         }
     }
 
@@ -4070,6 +6362,51 @@ public enum Ops {
             fatalError("Ops.swiglu: unsupported dtype \(gate.dtype)")
         }
         return result
+    }
+
+    /// N independent SwiGLU dispatches sharing ONE compute encoder.
+    /// Each `(gate, up, out)` triple is dispatched in sequence after
+    /// setting the same `mt_swiglu_*` PSO once. Used by the MoE
+    /// per-expert SwiGLU phase at decode (one dispatch per chosen
+    /// expert × topK experts × MoE layers) where the encoder
+    /// begin/end pairs dominated CPU side.
+    public static func swigluMany(
+        gates: [Tensor], ups: [Tensor], outs: [Tensor],
+        on cmd: MTLCommandBuffer
+    ) {
+        let n = gates.count
+        precondition(
+            ups.count == n && outs.count == n,
+            "Ops.swigluMany: count mismatch")
+        guard n > 0 else { return }
+        let dtype = gates[0].dtype
+        let psoName: String
+        switch dtype {
+        case .f32: psoName = "mt_swiglu_f32"
+        case .f16: psoName = "mt_swiglu_f16"
+        case .bf16: psoName = "mt_swiglu_bf16"
+        default: fatalError("Ops.swigluMany: unsupported dtype \(dtype)")
+        }
+        let pso = PSOCache.shared.pipelineState(for: psoName)
+        guard let enc = cmd.makeComputeCommandEncoder() else { return }
+        enc.setComputePipelineState(pso)
+        for i in 0 ..< n {
+            let count = gates[i].elementCount
+            precondition(
+                ups[i].elementCount == count && outs[i].elementCount == count,
+                "Ops.swigluMany: shape mismatch at index \(i)")
+            precondition(
+                ups[i].dtype == dtype && outs[i].dtype == dtype,
+                "Ops.swigluMany: dtype mismatch at index \(i)")
+            let tgWidth = min(count, 256)
+            enc.setBuffer(gates[i].buffer, offset: gates[i].offset, index: 0)
+            enc.setBuffer(ups[i].buffer, offset: ups[i].offset, index: 1)
+            enc.setBuffer(outs[i].buffer, offset: outs[i].offset, index: 2)
+            enc.dispatchThreads(
+                MTLSize(width: count, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
+        }
+        enc.endEncoding()
     }
 
     // ─── MoE gather quantised matmul, scalar m1 ────────────────────────

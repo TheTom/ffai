@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -417,7 +417,7 @@ public struct Qwen35Hybrid: Qwen35Variant {
                     qNorm: qNorm, kNorm: kNorm,
                     nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
                     rotaryDim: rotaryDim, ropeTheta: ropeTheta,
-                    attnOutputGate: attnOutputGate)
+                    attnOutputGate: attnOutputGate, device: device)
                 layers.append(
                     Qwen35AttentionLayer(
                         inputNorm: inputNorm, postNorm: postNorm,
@@ -777,17 +777,17 @@ public final class Qwen35DenseMLP: Module {
         return out
     }
 
-    /// down(silu(gate(x)) * up(x)).
+    /// down(silu(gate(x)) * up(x)). Uses fused `Ops.swiglu` —
+    /// one dispatch vs silu + mul = two dispatches.
     func forward(_ xNorm: Tensor, cmd: MTLCommandBuffer) -> Tensor {
         let g = gateProj(xNorm, on: cmd)
         let u = upProj(xNorm, on: cmd)
-        let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
+        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj(inner, on: cmd)
     }
 
     /// T-batched: down(silu(gate(x)) * up(x)) over T rows. Returns
-    /// `[T, hidden]` flat. Three batched projections + one elementwise
-    /// SwiGLU pass.
+    /// `[T, hidden]` flat. Three batched projections + one fused SwiGLU.
     func forwardMany(
         _ xNormFlat: Tensor, t: Int,
         cmd: MTLCommandBuffer, device: Device
@@ -795,7 +795,7 @@ public final class Qwen35DenseMLP: Module {
         let xRows = xNormFlat.reshaped(to: [t, xNormFlat.elementCount / t])
         let g = gateProj.callMany(xRows, t: t, on: cmd, device: device)
         let u = upProj.callMany(xRows, t: t, on: cmd, device: device)
-        let inner = Ops.mul(Ops.silu(g, on: cmd), u, on: cmd)
+        let inner = Ops.swiglu(gate: g, up: u, on: cmd)
         return downProj.callMany(inner, t: t, on: cmd, device: device)
     }
 }
@@ -810,12 +810,29 @@ public final class Qwen35DenseMLP: Module {
 // `MoELayer.decode` commits the command buffer; this wrapper therefore
 // also commits, and runs the shared expert + the routed-combine add on
 // fresh private buffers so the returned tensor is fully resident.
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` / `forwardMany` mutate per-instance shared-expert scratch
+// buffers (`sharedSgScratch`, `sharedSuScratch`,
+// `sharedGateLogitScratch`, `sharedResultScratch`) without internal
+// synchronisation. Callers must serialise inference on a given
+// instance.
 
 public final class Qwen35MoEFFN: Module {
     let moe: MoELayer
     let sharedGateProj, sharedUpProj, sharedDownProj: AnyLinear
     let sharedExpertGate: AnyLinear
     let hidden: Int
+
+    /// Cached shared-expert scratches. The single-token forward fans
+    /// gate+up + expert-gate qmms through one shared encoder; pre-
+    /// allocating the outputs at instance level avoids per-token
+    /// Tensor.empty allocations.
+    private var sharedSgScratch: Tensor?
+    private var sharedSuScratch: Tensor?
+    private var sharedGateLogitScratch: Tensor?
+    /// Cached `result` output for the GPU fan-out.
+    private var sharedResultScratch: Tensor?
 
     init(
         moe: MoELayer,
@@ -853,37 +870,120 @@ public final class Qwen35MoEFFN: Module {
     /// Run the MoE FFN. `MoELayer.decode` commits the passed `cmd`; the
     /// shared expert + the final add run on fresh private buffers, so
     /// the returned tensor never depends on the now-dead `cmd`.
+    ///
+    /// Optional `residual` parameter folds the post-FFN residual add
+    /// into the final `sigmoidScalarFMA` dispatch (becomes
+    /// `sigmoidScalarFMAResidual`). When `residual != nil`, the returned
+    /// tensor already includes `residual + routed + sigmoid(gate)·sharedOut`
+    /// and the caller MUST NOT do its own `Ops.add(residual, ffnOut)`.
     func forward(
         _ xNorm: Tensor, position: Int,
-        cmd: MTLCommandBuffer, device: Device
+        cmd: MTLCommandBuffer, device: Device,
+        residual: Tensor? = nil
     ) -> Tensor {
         // Routed top-K experts — commits `cmd`.
         let routed = moe.decode(
             xNorm, position: position,
             cache: StatelessLayerCache(),
             cmd: cmd, device: device)
-        // Shared expert on a fresh buffer: SwiGLU + scalar gate logit.
-        // The fused-sigmoid kernel keeps the scalar on the GPU, so this
-        // buffer no longer needs a `waitUntilCompleted` — it just needs
-        // to be in flight so the FMA can hazard-track its dependencies.
+        // Shared expert on a fresh buffer.
         let work = device.makeCommandBuffer()
-        let sg = sharedGateProj(xNorm, on: work)
-        let su = sharedUpProj(xNorm, on: work)
-        let sharedInner = Ops.mul(Ops.silu(sg, on: work), su, on: work)
+        // Batch sharedGate + sharedUp + sharedExpertGate (3 int4 qmms
+        // sharing the same `xNorm`) onto ONE shared encoder via
+        // dequantGemvInt4Three. Saves ~40 encoder begin/end pairs per
+        // decode token on Qwen3.6-A3B (40 layers × one pair each).
+        let sg: Tensor
+        let su: Tensor
+        let gateLogit: Tensor
+        let qg = sharedGateProj.inner as? QuantizedLinear
+        let qu = sharedUpProj.inner as? QuantizedLinear
+        let qgate = sharedExpertGate.inner as? QuantizedLinear
+        if let qg = qg, let qu = qu, let qgate = qgate,
+            qg.bits == 4, qu.bits == 4, qgate.bits == 4,
+            qg.groupSize == qu.groupSize, qu.groupSize == qgate.groupSize
+        {
+            let outDim = qg.weight.shape[0]
+            let gateOutDim = qgate.weight.shape[0]
+            if sharedSgScratch == nil
+                || sharedSgScratch!.dtype != xNorm.dtype
+                || sharedSgScratch!.elementCount != outDim
+            {
+                sharedSgScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+                sharedSuScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+            }
+            if sharedGateLogitScratch == nil
+                || sharedGateLogitScratch!.dtype != xNorm.dtype
+                || sharedGateLogitScratch!.elementCount != gateOutDim
+            {
+                sharedGateLogitScratch = Tensor.empty(
+                    shape: [gateOutDim], dtype: xNorm.dtype, device: device)
+            }
+            sg = sharedSgScratch!
+            su = sharedSuScratch!
+            gateLogit = sharedGateLogitScratch!
+            Ops.dequantGemvInt4Three(
+                input: xNorm,
+                w0: qg.weight, s0: qg.scales, b0: qg.biases, out0: sg,
+                w1: qu.weight, s1: qu.scales, b1: qu.biases, out1: su,
+                w2: qgate.weight, s2: qgate.scales, b2: qgate.biases,
+                out2: gateLogit,
+                groupSize: qg.groupSize, on: work)
+        } else if let qg = qg, let qu = qu,
+            qg.bits == 4, qu.bits == 4, qg.groupSize == qu.groupSize
+        {
+            let outDim = qg.weight.shape[0]
+            if sharedSgScratch == nil
+                || sharedSgScratch!.dtype != xNorm.dtype
+                || sharedSgScratch!.elementCount != outDim
+            {
+                sharedSgScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+                sharedSuScratch = Tensor.empty(
+                    shape: [outDim], dtype: xNorm.dtype, device: device)
+            }
+            sg = sharedSgScratch!
+            su = sharedSuScratch!
+            Ops.dequantGemvInt4Two(
+                input: xNorm,
+                w0: qg.weight, s0: qg.scales, b0: qg.biases, out0: sg,
+                w1: qu.weight, s1: qu.scales, b1: qu.biases, out1: su,
+                groupSize: qg.groupSize, on: work)
+            gateLogit = sharedExpertGate(xNorm, on: work)
+        } else {
+            sg = sharedGateProj(xNorm, on: work)
+            su = sharedUpProj(xNorm, on: work)
+            gateLogit = sharedExpertGate(xNorm, on: work)
+        }
+        // Fused SwiGLU.
+        let sharedInner = Ops.swiglu(gate: sg, up: su, on: work)
         let sharedOut = sharedDownProj(sharedInner, on: work)
-        let gateLogit = sharedExpertGate(xNorm, on: work)
         work.commit()
 
         // GPU fan-out: `out = routed + sigmoid(gateLogit) * sharedOut`
-        // in one dispatch. Replaces the prior host detour
-        // (`gateLogit.toFloatArray()` + host sigmoid + `Tensor.filled`
-        // broadcast + mul + add + commit + wait) — saves one host stall
-        // per MoE layer per token. Fires on all 40 Qwen3.6-A3B layers.
+        // (+ residual when the caller passes one) in one dispatch.
         let fmaCmd = device.makeCommandBuffer()
-        let result = Tensor.empty(shape: [hidden], dtype: routed.dtype, device: device)
-        Ops.sigmoidScalarFMA(
-            gate: gateLogit, value: sharedOut, base: routed,
-            into: result, on: fmaCmd)
+        if sharedResultScratch == nil
+            || sharedResultScratch!.dtype != routed.dtype
+            || sharedResultScratch!.elementCount != hidden
+        {
+            sharedResultScratch = Tensor.empty(
+                shape: [hidden], dtype: routed.dtype, device: device)
+        }
+        let result = sharedResultScratch!
+        if let residual = residual {
+            // Fused 4-input. result = residual + routed +
+            // sigmoid(gateLogit) · sharedOut. Saves 1 dispatch + 1
+            // [hidden] DRAM roundtrip vs sigmoidScalarFMA then Ops.add.
+            Ops.sigmoidScalarFMAResidual(
+                gate: gateLogit, value: sharedOut, base: routed,
+                residual: residual, into: result, on: fmaCmd)
+        } else {
+            Ops.sigmoidScalarFMA(
+                gate: gateLogit, value: sharedOut, base: routed,
+                into: result, on: fmaCmd)
+        }
         fmaCmd.commit()
         return result
     }
@@ -911,7 +1011,8 @@ public final class Qwen35MoEFFN: Module {
         let xRows = xNormFlat.reshaped(to: [t, hidden])
         let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
         let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
-        let sharedInnerAll = Ops.mul(Ops.silu(sgAll, on: work), suAll, on: work)
+        // Fused SwiGLU.
+        let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work)
         let sharedOutAll = sharedDownProj.callMany(
             sharedInnerAll, t: t,
             on: work, device: device)
@@ -1012,6 +1113,17 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
     public var bytesInUse: Int {
         length == 0 ? 0 : bytesAllocated
     }
+
+    /// Composite-level length-only restore. Tensor state for conv/gdn is
+    /// restored separately by the caller via the per-cache `restore`
+    /// methods; this fixes the position counter without disturbing the
+    /// just-restored sub-cache buffers.
+    public func setLength(_ length: Int) {
+        precondition(
+            length >= 0,
+            "Qwen35GDNLayerCache.setLength: must be ≥ 0")
+        self.length = length
+    }
 }
 
 // ─── Qwen35GDNMixer — Gated Delta Net recurrent mixer ────────────────
@@ -1023,6 +1135,12 @@ public final class Qwen35GDNLayerCache: LayerCacheProtocol, @unchecked Sendable 
 // Because the prep needs a CPU sync, `forward` commits the command
 // buffer it is handed and returns a resident tensor on a fresh buffer
 // (the Jamba mamba-mixer pattern).
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` / `forwardMany` / `forwardManyChunked` mutate per-instance
+// scratch buffers and reuse them across calls without internal
+// synchronisation. Callers must serialise inference on a given
+// instance.
 
 public final class Qwen35GDNMixer: Module {
     let inProjQKV, inProjZ, inProjB, inProjA, outProj: AnyLinear
@@ -1086,6 +1204,28 @@ public final class Qwen35GDNMixer: Module {
     let yF32Scratch: Tensor
     let yGatedScratch: Tensor
 
+    /// Batched 4-projection input fast path. When all 4 inProj are
+    /// QuantizedLinear int4 with same groupSize, the mixer routes
+    /// through `Ops.dequantGemvInt4Four` — 4 qmms on one shared
+    /// encoder. Saves 3 encoder begin/end pairs per GDN layer × 30 ≈
+    /// 1.5 ms/token. Allocated scratch buffers are pinned in the
+    /// device residency set in init.
+    private var batchedInputProj:
+        (
+            qW: Tensor, qS: Tensor, qB: Tensor,
+            zW: Tensor, zS: Tensor, zB: Tensor,
+            bW: Tensor, bS: Tensor, bB: Tensor,
+            aW: Tensor, aS: Tensor, aB: Tensor,
+            groupSize: Int
+        )?
+    private var qkvScratch: Tensor?
+    private var zScratch: Tensor?
+    private var bRawScratch: Tensor?
+    private var aRawScratch: Tensor?
+    /// Single-dispatch `ffai_batched_4_qgemv_fast` fast path.
+    /// Constraints: in_dim%512==0, each out_dim%8==0, groupSize=64.
+    private var fused4Eligible: Bool = false
+
     init(
         inProjQKV: AnyLinear, inProjZ: AnyLinear,
         inProjB: AnyLinear, inProjA: AnyLinear, outProj: AnyLinear,
@@ -1133,13 +1273,14 @@ public final class Qwen35GDNMixer: Module {
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
-        self.fused = ProcessInfo.processInfo.environment["FFAI_GDN_FUSED_PREP"] != nil
+        // Fused-prep is DEFAULT ON for Qwen3.6-A3B. The legacy host-loop
+        // path lives behind `FFAI_GDN_NO_FUSED_PREP=1` for precision
+        // comparison.
+        self.fused =
+            ProcessInfo.processInfo.environment["FFAI_GDN_NO_FUSED_PREP"] == nil
 
         // Per-decode-token scratch — pre-allocated once at init so the
         // fused GDN path doesn't pay 6 × MTLBuffer allocations per call.
-        // See the comments next to the field declarations for the
-        // cross-token safety argument (Metal hazard tracking + the
-        // engine's per-token cmd wait).
         self.convOutScratch = Tensor.empty(shape: [convDim], dtype: dtype, device: device)
         self.convActF32Scratch = Tensor.empty(shape: [convDim], dtype: .f32, device: device)
         self.aRawF32Scratch = Tensor.empty(shape: [numValueHeads], dtype: .f32, device: device)
@@ -1148,6 +1289,57 @@ public final class Qwen35GDNMixer: Module {
             shape: [numValueHeads, valueHeadDim],
             dtype: .f32, device: device)
         self.yGatedScratch = Tensor.empty(shape: [valueDim], dtype: dtype, device: device)
+
+        // Set up the batched 4-projection input fast path when all 4
+        // inProj are QuantizedLinear int4 with the same groupSize, and
+        // pin scratches in the device residency set so Metal skips
+        // per-encoder residency revalidation.
+        if let qQL = inProjQKV.inner as? QuantizedLinear,
+            let zQL = inProjZ.inner as? QuantizedLinear,
+            let bQL = inProjB.inner as? QuantizedLinear,
+            let aQL = inProjA.inner as? QuantizedLinear,
+            qQL.bits == 4 && zQL.bits == 4 && bQL.bits == 4 && aQL.bits == 4,
+            qQL.groupSize == zQL.groupSize,
+            qQL.groupSize == bQL.groupSize,
+            qQL.groupSize == aQL.groupSize
+        {
+            self.batchedInputProj = (
+                qW: qQL.weight, qS: qQL.scales, qB: qQL.biases,
+                zW: zQL.weight, zS: zQL.scales, zB: zQL.biases,
+                bW: bQL.weight, bS: bQL.scales, bB: bQL.biases,
+                aW: aQL.weight, aS: aQL.scales, aB: aQL.biases,
+                groupSize: qQL.groupSize
+            )
+            // Single-dispatch fast path eligibility.
+            let inDim = qQL.weight.shape[1] * 8
+            if inDim % 512 == 0
+                && convDim % 8 == 0 && valueDim % 8 == 0
+                && numValueHeads % 8 == 0
+                && qQL.groupSize == 64
+                && ProcessInfo.processInfo.environment["FFAI_NO_FUSED_GDN_4"] == nil
+            {
+                self.fused4Eligible = true
+            }
+            self.qkvScratch = Tensor.empty(
+                shape: [convDim], dtype: dtype, device: device)
+            self.zScratch = Tensor.empty(
+                shape: [valueDim], dtype: dtype, device: device)
+            self.bRawScratch = Tensor.empty(
+                shape: [numValueHeads], dtype: dtype, device: device)
+            self.aRawScratch = Tensor.empty(
+                shape: [numValueHeads], dtype: dtype, device: device)
+            // Pin scratch buffers + fused-path constants so Metal
+            // skips per-encoder residency revalidation.
+            device.markWeightsResident([
+                qkvScratch!.buffer, zScratch!.buffer,
+                bRawScratch!.buffer, aRawScratch!.buffer,
+                convOutScratch.buffer, convActF32Scratch.buffer,
+                aRawF32Scratch.buffer, bRawF32Scratch.buffer,
+                yF32Scratch.buffer, yGatedScratch.buffer,
+                qNormWeightF32.buffer, kNormWeightF32.buffer,
+                aLogTF32.buffer, dtBiasTF32.buffer, epsBufFused.buffer,
+            ])
+        }
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -1182,16 +1374,62 @@ public final class Qwen35GDNMixer: Module {
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         // ── GPU phase 1: projections + conv + SiLU ────────────────────
-        let qkv = inProjQKV(xNorm, on: cmd)  // [conv_dim]
-        let z = inProjZ(xNorm, on: cmd)  // [value_dim]
-        let bRaw = inProjB(xNorm, on: cmd)  // [num_value_heads]
-        let aRaw = inProjA(xNorm, on: cmd)  // [num_value_heads]
+        // 4-projection shared-encoder fast path when all inProj are int4
+        // QuantizedLinear with the same groupSize. Saves 3 encoder
+        // begin/end pairs per GDN layer × 30 ≈ 1.5 ms/token. Upgrades
+        // to a single-dispatch fast path via `batched4QgemvInt4Fast`
+        // when constraints match (out_dim%8, in_dim%512, groupSize=64).
+        let qkv: Tensor
+        let z: Tensor
+        let bRaw: Tensor
+        let aRaw: Tensor
+        if let bp = batchedInputProj {
+            qkv = qkvScratch!
+            z = zScratch!
+            bRaw = bRawScratch!
+            aRaw = aRawScratch!
+            if fused4Eligible {
+                Ops.batched4QgemvInt4Fast(
+                    input: xNorm,
+                    wA: bp.qW, scalesA: bp.qS, biasesA: bp.qB, outA: qkv,
+                    wB: bp.zW, scalesB: bp.zS, biasesB: bp.zB, outB: z,
+                    wC: bp.bW, scalesC: bp.bS, biasesC: bp.bB, outC: bRaw,
+                    wD: bp.aW, scalesD: bp.aS, biasesD: bp.aB, outD: aRaw,
+                    groupSize: bp.groupSize, on: cmd)
+            } else {
+                Ops.dequantGemvInt4Four(
+                    input: xNorm,
+                    w0: bp.qW, s0: bp.qS, b0: bp.qB, out0: qkv,
+                    w1: bp.zW, s1: bp.zS, b1: bp.zB, out1: z,
+                    w2: bp.bW, s2: bp.bS, b2: bp.bB, out2: bRaw,
+                    w3: bp.aW, s3: bp.aS, b3: bp.aB, out3: aRaw,
+                    groupSize: bp.groupSize, on: cmd)
+            }
+        } else {
+            qkv = inProjQKV(xNorm, on: cmd)  // [conv_dim]
+            z = inProjZ(xNorm, on: cmd)  // [value_dim]
+            bRaw = inProjB(xNorm, on: cmd)  // [num_value_heads]
+            aRaw = inProjA(xNorm, on: cmd)  // [num_value_heads]
+        }
 
         Ops.conv1dCausalStep(
             x: qkv, w: convW, b: convB,
             state: cache.conv.state, into: convOutScratch,
             nChannels: convDim, kernelSize: convKernel, on: cmd)
-        let convAct = Ops.silu(convOutScratch, on: cmd)  // [conv_dim]
+        // In the fused path the convOut silu + cast to f32 fuse with
+        // the aRaw / bRaw casts via `siluCastF32PlusCastF32Two` later
+        // on the same shared encoder. Outside the fused path the
+        // legacy host phase still needs the bf16 silu output, so
+        // compute it eagerly there.
+        let convAct: Tensor
+        if fused {
+            // Fused path: skip the silu here; the combined
+            // siluCast+cast2 dispatch below produces the f32 input
+            // directly.
+            convAct = convOutScratch
+        } else {
+            convAct = Ops.silu(convOutScratch, on: cmd)  // [conv_dim]
+        }
 
         // ── Fused GDN prep + recurrence path (opt-in) ─────────────────
         //
@@ -1218,9 +1456,15 @@ public final class Qwen35GDNMixer: Module {
             // fused step runs the recurrence in fp32 against the
             // existing fp32 state slots, matching the canonical
             // precision of the legacy path.
-            Ops.castToF32(convAct, into: convActF32Scratch, on: cmd)
-            Ops.castToF32(aRaw, into: aRawF32Scratch, on: cmd)
-            Ops.castToF32(bRaw, into: bRawF32Scratch, on: cmd)
+            // Collapse silu+cast (convOut → f32) AND the two plain
+            // casts (aRaw, bRaw → f32) onto ONE shared encoder. Saves
+            // 1 encoder begin/end per GDN layer × 30 ≈ 30 pairs per
+            // decode token.
+            Ops.siluCastF32PlusCastF32Two(
+                siluIn: convOutScratch, into: convActF32Scratch,
+                aRaw, into: aRawF32Scratch,
+                bRaw, into: bRawF32Scratch,
+                on: cmd)
 
             Ops.gatedDeltaPrepStep(
                 convOut: convActF32Scratch,
@@ -1406,6 +1650,15 @@ public final class Qwen35GDNMixer: Module {
             "Qwen35GDNMixer.forwardMany: xNormFlat size \(xNormFlat.elementCount) ≠ T·hidden = \(t * hidden)"
         )
 
+        // Chunked prep+recurrence is the default route. Replaces the
+        // per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
+        // dispatch — state register-resident across the full T-sweep.
+        // Opt out via FFAI_GDN_NO_PREP_CHUNK=1 for A/B benching.
+        if ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK"] == nil {
+            return forwardManyChunked(
+                xNormFlat, t: t, cache: cache, cmd: cmd, device: device)
+        }
+
         let dt = xNormFlat.dtype
         let dtBytes = dt.byteSize
 
@@ -1415,8 +1668,20 @@ public final class Qwen35GDNMixer: Module {
         let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
         let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
 
+        // a_raw / b_raw → f32 once via shared-encoder `castToF32Two`,
+        // then per-row slices alias into the pre-cast f32 storage.
+        let aRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        let bRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        Ops.castToF32Two(
+            aRawAll, into: aRawF32All,
+            bRawAll, into: bRawF32All,
+            on: cmd)
+
         // ── Per-token recurrence — scratches reused, T-loop on `cmd`. ────
         let yGatedAll = Tensor.empty(shape: [t * valueDim], dtype: dt, device: device)
+        let f32Bytes = DType.f32.byteSize
         for r in 0 ..< t {
             let qkvRow = Tensor(
                 buffer: qkvAll.buffer,
@@ -1426,38 +1691,30 @@ public final class Qwen35GDNMixer: Module {
                 buffer: zAll.buffer,
                 offset: zAll.offset + r * valueDim * dtBytes,
                 shape: [valueDim], dtype: dt)
-            let bRawRow = Tensor(
-                buffer: bRawAll.buffer,
-                offset: bRawAll.offset + r * numValueHeads * dtBytes,
-                shape: [numValueHeads], dtype: dt)
-            let aRawRow = Tensor(
-                buffer: aRawAll.buffer,
-                offset: aRawAll.offset + r * numValueHeads * dtBytes,
-                shape: [numValueHeads], dtype: dt)
+            let aRawF32Row = Tensor(
+                buffer: aRawF32All.buffer,
+                offset: aRawF32All.offset + r * numValueHeads * f32Bytes,
+                shape: [numValueHeads], dtype: .f32)
+            let bRawF32Row = Tensor(
+                buffer: bRawF32All.buffer,
+                offset: bRawF32All.offset + r * numValueHeads * f32Bytes,
+                shape: [numValueHeads], dtype: .f32)
 
             Ops.conv1dCausalStep(
                 x: qkvRow, w: convW, b: convB,
                 state: cache.conv.state, into: convOutScratch,
                 nChannels: convDim, kernelSize: convKernel, on: cmd)
-            // Fused silu + cast-to-f32. Replaces the prior two-dispatch
-            // chain `silu(convOutScratch) → castToF32(...)` with one
-            // dispatch reading bf16/f16 conv output, applying silu at
-            // fp32 precision, writing fp32 directly into the prep
-            // scratch. Saves T·30 dispatches per Qwen3.6-A3B prefill.
             if convOutScratch.dtype == .f32 {
-                // f32 conv → silu in place, no cast needed.
                 _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
                 Ops.castToF32(convOutScratch, into: convActF32Scratch, on: cmd)
             } else {
                 Ops.siluCastToF32(convOutScratch, into: convActF32Scratch, on: cmd)
             }
-            Ops.castToF32(aRawRow, into: aRawF32Scratch, on: cmd)
-            Ops.castToF32(bRawRow, into: bRawF32Scratch, on: cmd)
 
             Ops.gatedDeltaPrepStep(
                 convOut: convActF32Scratch,
                 aLog: aLogTF32, dtBias: dtBiasTF32,
-                aRaw: aRawF32Scratch, bRaw: bRawF32Scratch,
+                aRaw: aRawF32Row, bRaw: bRawF32Row,
                 qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
                 stateIn: cache.gdn.current, stateOut: cache.gdn.next,
                 y: yF32Scratch,
@@ -1483,6 +1740,135 @@ public final class Qwen35GDNMixer: Module {
         let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
         return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
     }
+
+    /// Chunked GDN forward — replaces the per-token T-loop body with one
+    /// `Ops.gatedDeltaPrepChunk` dispatch. The recurrence state stays in
+    /// per-lane registers across all T tokens; the kernel loads state
+    /// once, sweeps T tokens, stores state once. State traffic per layer
+    /// drops from `T × (load + store)` to `1 × (load + store)`.
+    ///
+    /// Conv1d still loops T times unless the batched
+    /// `conv1dCausalStepSiluCastMany` kernel applies (convKernel == 4),
+    /// in which case all T conv1d_steps fuse with silu+cast into ONE
+    /// dispatch and conv state stays in per-channel registers.
+    ///
+    /// Mixer norm runs once over T·Hv rows via `gatedMixerNormMany`.
+    /// Output projection fans through a batched qmm. Gated by the
+    /// `forwardMany` dispatcher; opt out via `FFAI_GDN_NO_PREP_CHUNK=1`.
+    func forwardManyChunked(
+        _ xNormFlat: Tensor, t: Int,
+        cache: Qwen35GDNLayerCache,
+        cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        let dt = xNormFlat.dtype
+        let dtBytes = dt.byteSize
+        let f32Bytes = DType.f32.byteSize
+        let _ = f32Bytes  // silence unused warning when conv-many path used
+
+        // ── Five T-batched projections (same as forwardMany) ─────────────
+        let qkvAll = inProjQKV.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let zAll = inProjZ.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
+        let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
+
+        // a_raw / b_raw → f32 once on ONE shared encoder via
+        // `castToF32Two`. Saves one encoder begin/end pair per GDN
+        // layer × 30 = 30 pairs/prefill.
+        let aRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        let bRawF32All = Tensor.empty(
+            shape: [t * numValueHeads], dtype: .f32, device: device)
+        Ops.castToF32Two(
+            aRawAll, into: aRawF32All,
+            bRawAll, into: bRawF32All,
+            on: cmd)
+
+        // ── Conv1d + silu+cast → `[T, convDim]` f32 staging buffer ──────
+        // When conv_kernel = 4, the batched
+        // `conv1dCausalStepSiluCastMany` kernel sweeps all T tokens in
+        // ONE dispatch with the conv state held in per-channel registers
+        // across the sweep — state read once at start, written once at
+        // end. Saves T-1 dispatches per layer × 30 ≈ 15K dispatches at
+        // T=512, and state DRAM traffic drops to 1·(load+store). Gate
+        // via FFAI_NO_CONV1D_MANY=1.
+        let convOutAllF32 = Tensor.empty(
+            shape: [t * convDim], dtype: .f32, device: device)
+        if convKernel == 4
+            && ProcessInfo.processInfo.environment["FFAI_NO_CONV1D_MANY"] == nil
+        {
+            Ops.conv1dCausalStepSiluCastMany(
+                src: qkvAll.reshaped(to: [t, convDim]),
+                w: convW, b: convB,
+                stateIn: cache.conv.state,
+                outF32: convOutAllF32,
+                stateOut: cache.conv.state,
+                t: t, convDim: convDim, convKernel: convKernel,
+                on: cmd)
+        } else {
+            for r in 0 ..< t {
+                let qkvRow = Tensor(
+                    buffer: qkvAll.buffer,
+                    offset: qkvAll.offset + r * convDim * dtBytes,
+                    shape: [convDim], dtype: dt)
+                Ops.conv1dCausalStep(
+                    x: qkvRow, w: convW, b: convB,
+                    state: cache.conv.state, into: convOutScratch,
+                    nChannels: convDim, kernelSize: convKernel, on: cmd)
+                let convOutRowF32 = Tensor(
+                    buffer: convOutAllF32.buffer,
+                    offset: convOutAllF32.offset + r * convDim * f32Bytes,
+                    shape: [convDim], dtype: .f32)
+                if convOutScratch.dtype == .f32 {
+                    _ = Ops.silu(convOutScratch, on: cmd, into: convOutScratch)
+                    Ops.castToF32(convOutScratch, into: convOutRowF32, on: cmd)
+                } else {
+                    Ops.siluCastToF32(
+                        convOutScratch, into: convOutRowF32, on: cmd)
+                }
+            }
+        }
+
+        // ── ONE chunked prep+recurrence dispatch over all T tokens ──────
+        let tLenBuf = device.makeBuffer(length: 4)
+        var tLenU32 = UInt32(t)
+        memcpy(tLenBuf.contents(), &tLenU32, 4)
+        let tLenScalar = Tensor(
+            buffer: tLenBuf, offset: 0, shape: [1], dtype: .u32)
+
+        let yF32All = Tensor.empty(
+            shape: [t * numValueHeads * valueHeadDim],
+            dtype: .f32, device: device)
+
+        Ops.gatedDeltaPrepChunk(
+            convOut: convOutAllF32,
+            aLog: aLogTF32, dtBias: dtBiasTF32,
+            aRaw: aRawF32All, bRaw: bRawF32All,
+            qNormWeight: qNormWeightF32, kNormWeight: kNormWeightF32,
+            stateIn: cache.gdn.current, stateOut: cache.gdn.next,
+            y: yF32All,
+            tLen: tLenScalar,
+            batchSize: 1, dk: keyHeadDim, dv: valueHeadDim,
+            hv: numValueHeads, hk: numKeyHeads,
+            on: cmd)
+        cache.gdn.swap()
+        for _ in 0 ..< t { cache.advance() }
+
+        // ── Mixer norm T-batched (one dispatch across T·Hv rows) ────────
+        // `gatedMixerNormMany` collapses T per-row dispatches into one
+        // shared-encoder dispatch.
+        let yGatedAll = Tensor.empty(
+            shape: [t * valueDim], dtype: dt, device: device)
+        Ops.gatedMixerNormMany(
+            y: yF32All, z: zAll, weight: mixerNorm.weight,
+            epsBuf: epsBufFused,
+            into: yGatedAll,
+            t: t, numValueHeads: numValueHeads, valueHeadDim: valueHeadDim,
+            on: cmd)
+
+        // ── Batched output projection ───────────────────────────────────
+        let yGatedRows = yGatedAll.reshaped(to: [t, valueDim])
+        return outProj.callMany(yGatedRows, t: t, on: cmd, device: device)
+    }
 }
 
 // ─── Qwen35AttentionMixer — gated multi-head attention ───────────────
@@ -1491,6 +1877,13 @@ public final class Qwen35GDNMixer: Module {
 // gate); the attention output is multiplied by `sigmoid(gate)` before
 // `o_proj`. `q_norm` / `k_norm` are per-head RMSNorm. RoPE is partial
 // (`partial_rotary_factor`): only the first `rotaryDim` dims rotate.
+//
+// Threading contract: instances are NOT safe for concurrent calls.
+// `forward` reuses ~12 per-instance scratch tensors (`qOutScratch`,
+// `qNormedScratch`, `attnOutScratch`, `partialOScratch`, …) across
+// calls without internal synchronisation. `forwardMany` allocates
+// fresh per-call tensors and does not touch the single-token
+// scratches. Callers must serialise inference on a given instance.
 
 public final class Qwen35AttentionMixer: Module {
     let qProj, kProj, vProj, oProj: AnyLinear
@@ -1499,12 +1892,64 @@ public final class Qwen35AttentionMixer: Module {
     let ropeTheta: Float
     let attnOutputGate: Bool
     let scale: Float
+    /// Cached row-index tensors for sliceHeadHalves35. The indices are
+    /// constant per `nHeads` (even rows = queries, odd rows = gates) —
+    /// previously rebuilt + memcpy'd into a fresh MTLBuffer per attn
+    /// layer per decode token.
+    let sliceFirstIdx: Tensor?  // [nHeads] u32 — 0, 2, 4, ...
+    let sliceSecondIdx: Tensor?  // [nHeads] u32 — 1, 3, 5, ...
+    /// Batched QKV-projection fast-path detection. When all 3
+    /// projections (q, k, v) are QuantizedLinear int4 with the same
+    /// groupSize, the mixer routes through `Ops.dequantGemvInt4Three`
+    /// — 3 qmms on one shared encoder.
+    private var batchedQKV:
+        (
+            qW: Tensor, qS: Tensor, qB: Tensor,
+            kW: Tensor, kS: Tensor, kB: Tensor,
+            vW: Tensor, vS: Tensor, vB: Tensor,
+            groupSize: Int
+        )?
+    private var qOutScratch: Tensor?
+    private var kOutScratch: Tensor?
+    private var vOutScratch: Tensor?
+    /// Fused-QKV single-dispatch fast path. When set, `forward` uses
+    /// `Ops.batchedQkvQgemvInt4Fast` (1 dispatch) instead of
+    /// `dequantGemvInt4Three` (3 dispatches on shared encoder).
+    /// Backing scratch is one contiguous `[qDim+kDim+vDim]` buffer.
+    private var fusedQKVEligible: Bool = false
+    private var qkvFusedScratch: Tensor?
+    /// Cached q_norm + k_norm outputs (was fresh per call).
+    private var qNormedScratch: Tensor?
+    private var kNormedScratch: Tensor?
+    /// Cached sliceHeadHalves35 gather outputs.
+    private var queriesScratch: Tensor?
+    private var gateSliceScratch: Tensor?
+    /// Cached sdpaDecode output + sigmoidMul output.
+    private var attnOutScratch: Tensor?
+    private var attnFlatGatedScratch: Tensor?
+    /// Cached Flash-Decoding 2-pass partial buffers. Allocated lazily
+    /// on first 2-pass dispatch (when kv.length ≥ threshold). Sized for
+    /// (nHeads, blocks=32, headDim) — ~192KB per attn layer on
+    /// Qwen3.6 bf16.
+    private var partialOScratch: Tensor?
+    private var partialMScratch: Tensor?
+    private var partialLScratch: Tensor?
+    private let sdpa2PassBlocks: Int = 32
+    private let sdpa2PassThreshold: Int = {
+        if let raw = ProcessInfo.processInfo.environment["FFAI_SDPA_2PASS_THRESHOLD"],
+            let n = Int(raw)
+        {
+            return n
+        }
+        return 1024  // default: only kick in at long KV
+    }()
 
     init(
         qProj: AnyLinear, kProj: AnyLinear, vProj: AnyLinear, oProj: AnyLinear,
         qNorm: RMSNorm, kNorm: RMSNorm,
         nHeads: Int, nKVHeads: Int, headDim: Int, rotaryDim: Int,
-        ropeTheta: Float, attnOutputGate: Bool
+        ropeTheta: Float, attnOutputGate: Bool,
+        device: Device = .shared
     ) {
         self.qProj = qProj
         self.kProj = kProj
@@ -1519,6 +1964,61 @@ public final class Qwen35AttentionMixer: Module {
         self.ropeTheta = ropeTheta
         self.attnOutputGate = attnOutputGate
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
+        if attnOutputGate {
+            // Pre-build the row-index tensors for the gate-split
+            // gather. Even rows = queries, odd rows = gates.
+            var firstRows = [UInt32](repeating: 0, count: nHeads)
+            var secondRows = [UInt32](repeating: 0, count: nHeads)
+            for h in 0 ..< nHeads {
+                firstRows[h] = UInt32(2 * h)
+                secondRows[h] = UInt32(2 * h + 1)
+            }
+            let firstBuf = device.makeBuffer(length: nHeads * 4)
+            let secondBuf = device.makeBuffer(length: nHeads * 4)
+            firstRows.withUnsafeBytes {
+                _ = memcpy(firstBuf.contents(), $0.baseAddress!, nHeads * 4)
+            }
+            secondRows.withUnsafeBytes {
+                _ = memcpy(secondBuf.contents(), $0.baseAddress!, nHeads * 4)
+            }
+            self.sliceFirstIdx = Tensor(
+                buffer: firstBuf, offset: 0, shape: [nHeads], dtype: .u32)
+            self.sliceSecondIdx = Tensor(
+                buffer: secondBuf, offset: 0, shape: [nHeads], dtype: .u32)
+            // Pin idx scratches to the residency set.
+            device.markWeightsResident([firstBuf, secondBuf])
+        } else {
+            self.sliceFirstIdx = nil
+            self.sliceSecondIdx = nil
+        }
+        // Detect batched-qkv fast path.
+        if let qQL = qProj.inner as? QuantizedLinear,
+            let kQL = kProj.inner as? QuantizedLinear,
+            let vQL = vProj.inner as? QuantizedLinear,
+            qQL.bits == 4 && kQL.bits == 4 && vQL.bits == 4,
+            qQL.groupSize == kQL.groupSize, qQL.groupSize == vQL.groupSize
+        {
+            self.batchedQKV = (
+                qW: qQL.weight, qS: qQL.scales, qB: qQL.biases,
+                kW: kQL.weight, kS: kQL.scales, kB: kQL.biases,
+                vW: vQL.weight, vS: vQL.scales, vB: vQL.biases,
+                groupSize: qQL.groupSize
+            )
+            // Fused single-dispatch QKV gemv. Constraints: in_dim
+            // multiple of 512, each out_dim multiple of 8,
+            // group_size=64.
+            let inDim = qQL.weight.shape[1] * 8
+            let qDim = qQL.weight.shape[0]
+            let kDim = kQL.weight.shape[0]
+            let vDim = vQL.weight.shape[0]
+            if inDim % 512 == 0
+                && qDim % 8 == 0 && kDim % 8 == 0 && vDim % 8 == 0
+                && qQL.groupSize == 64
+                && ProcessInfo.processInfo.environment["FFAI_NO_FUSED_QKV"] == nil
+            {
+                self.fusedQKVEligible = true
+            }
+        }
     }
 
     public func parameters() -> [(String, Tensor)] {
@@ -1542,42 +2042,127 @@ public final class Qwen35AttentionMixer: Module {
         // q_proj projects 2× heads when attn_output_gate is set: the
         // first `nHeads · headDim` elements are the queries, the second
         // half is the per-head sigmoid gate.
-        let qOut = qProj(xNorm, on: cmd)
+        // Batch q+k+v projections into one encoder when all 3 are
+        // QuantizedLinear int4; when the fast-path constraints match,
+        // fuse all three into a single dispatch.
+        let qOut: Tensor
+        let kPre: Tensor
+        let vPre: Tensor
+        if let bq = batchedQKV {
+            let qDim = bq.qW.shape[0]
+            let kDim = bq.kW.shape[0]
+            let vDim = bq.vW.shape[0]
+            if fusedQKVEligible {
+                // ONE dispatch into a [qDim+kDim+vDim] scratch.
+                // qOut / kPre / vPre are offset views into the same buffer.
+                let total = qDim + kDim + vDim
+                if qkvFusedScratch == nil
+                    || qkvFusedScratch!.elementCount != total
+                    || qkvFusedScratch!.dtype != xNorm.dtype
+                {
+                    qkvFusedScratch = Tensor.empty(
+                        shape: [total], dtype: xNorm.dtype, device: device)
+                    qOutScratch = qkvFusedScratch!.slicedRows(start: 0, count: qDim)
+                    kOutScratch = qkvFusedScratch!.slicedRows(start: qDim, count: kDim)
+                    vOutScratch = qkvFusedScratch!.slicedRows(
+                        start: qDim + kDim, count: vDim)
+                }
+                qOut = qOutScratch!
+                kPre = kOutScratch!
+                vPre = vOutScratch!
+                Ops.batchedQkvQgemvInt4Fast(
+                    x: xNorm,
+                    wQ: bq.qW, scalesQ: bq.qS, biasesQ: bq.qB,
+                    wK: bq.kW, scalesK: bq.kS, biasesK: bq.kB,
+                    wV: bq.vW, scalesV: bq.vS, biasesV: bq.vB,
+                    outQ: qDim, outK: kDim, outV: vDim,
+                    on: cmd, into: qkvFusedScratch!)
+            } else {
+                // Legacy 3-dispatch shared-encoder path.
+                if qOutScratch == nil || qOutScratch!.elementCount != qDim {
+                    qOutScratch = Tensor.empty(
+                        shape: [qDim], dtype: xNorm.dtype, device: device)
+                }
+                if kOutScratch == nil || kOutScratch!.elementCount != kDim {
+                    kOutScratch = Tensor.empty(
+                        shape: [kDim], dtype: xNorm.dtype, device: device)
+                }
+                if vOutScratch == nil || vOutScratch!.elementCount != vDim {
+                    vOutScratch = Tensor.empty(
+                        shape: [vDim], dtype: xNorm.dtype, device: device)
+                }
+                qOut = qOutScratch!
+                kPre = kOutScratch!
+                vPre = vOutScratch!
+                Ops.dequantGemvInt4Three(
+                    input: xNorm,
+                    w0: bq.qW, s0: bq.qS, b0: bq.qB, out0: qOut,
+                    w1: bq.kW, s1: bq.kS, b1: bq.kB, out1: kPre,
+                    w2: bq.vW, s2: bq.vS, b2: bq.vB, out2: vPre,
+                    groupSize: bq.groupSize, on: cmd)
+            }
+        } else {
+            qOut = qProj(xNorm, on: cmd)
+            kPre = kProj(xNorm, on: cmd)
+            vPre = vProj(xNorm, on: cmd)
+        }
         let queries: Tensor
         let gate: Tensor?
         if attnOutputGate {
             // Layout is [nHeads, 2 · headDim] — per head the first
             // `headDim` is the query, the next `headDim` the gate.
+            // Use cached idx tensors.
             let q2 = qOut.reshaped(to: [nHeads, 2 * headDim])
-            queries = sliceHeadHalves35(
-                q2, nHeads: nHeads, headDim: headDim, takeFirst: true,
-                on: cmd, device: device)
-            gate = sliceHeadHalves35(
-                q2, nHeads: nHeads, headDim: headDim, takeFirst: false,
-                on: cmd, device: device)
+            let table = q2.reshaped(to: [nHeads * 2, headDim])
+            if queriesScratch == nil
+                || queriesScratch!.elementCount != nHeads * headDim
+                || queriesScratch!.dtype != qOut.dtype
+            {
+                queriesScratch = Tensor.empty(
+                    shape: [nHeads, headDim], dtype: qOut.dtype, device: device)
+                gateSliceScratch = Tensor.empty(
+                    shape: [nHeads, headDim], dtype: qOut.dtype, device: device)
+            }
+            // Batched two-gather on shared encoder, saves 1 encoder
+            // begin/end pair per attn layer × 10 = ~170 µs/token.
+            Ops.gatherTwo(
+                table: table,
+                ids1: sliceFirstIdx!, into: queriesScratch!,
+                ids2: sliceSecondIdx!, into: gateSliceScratch!,
+                on: cmd)
+            queries = queriesScratch!.reshaped(to: [nHeads * headDim])
+            gate = gateSliceScratch!.reshaped(to: [nHeads * headDim])
         } else {
             queries = qOut
             gate = nil
         }
-        let k = kProj(xNorm, on: cmd)
-        let v = vProj(xNorm, on: cmd)
+        let k = kPre
+        let v = vPre
 
         // Per-head q_norm / k_norm (weighted RMSNorm over headDim).
-        let qNormed = Ops.rmsNormRows(
-            queries, weight: qNorm.weight, eps: qNorm.eps,
-            nRows: nHeads, rowSize: headDim, on: cmd)
-        let kNormed = Ops.rmsNormRows(
-            k, weight: kNorm.weight, eps: kNorm.eps,
-            nRows: nKVHeads, rowSize: headDim, on: cmd)
+        // Shared encoder + cached scratches.
+        if qNormedScratch == nil
+            || qNormedScratch!.elementCount != queries.elementCount
+            || qNormedScratch!.dtype != queries.dtype
+        {
+            qNormedScratch = Tensor.empty(
+                shape: queries.shape, dtype: queries.dtype, device: device)
+            kNormedScratch = Tensor.empty(
+                shape: k.shape, dtype: k.dtype, device: device)
+        }
+        let qNormed = qNormedScratch!
+        let kNormed = kNormedScratch!
+        Ops.rmsNormRowsTwo(
+            queries, weight: qNorm.weight, eps1: qNorm.eps,
+            nRows1: nHeads, rowSize1: headDim, into: qNormed,
+            k, weight: kNorm.weight, eps2: kNorm.eps,
+            nRows2: nKVHeads, rowSize2: headDim, into: kNormed,
+            on: cmd)
 
         // Partial RoPE — rotate only the first `rotaryDim` dims of each
-        // head, in place.
-        Ops.ropePartial(
-            qNormed, position: position,
-            headDim: headDim, rotaryDim: rotaryDim,
-            thetaBase: ropeTheta, on: cmd)
-        Ops.ropePartial(
-            kNormed, position: position,
+        // head, in place. q + k on shared encoder.
+        Ops.ropePartialTwo(
+            qNormed, kNormed, position: position,
             headDim: headDim, rotaryDim: rotaryDim,
             thetaBase: ropeTheta, on: cmd)
 
@@ -1587,16 +2172,60 @@ public final class Qwen35AttentionMixer: Module {
             vFlat: v.reshaped(to: [nKVHeads, headDim]), on: cmd)
 
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
-        let attnOut = Ops.sdpaDecode(
-            q: qNormed.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
-            nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-            nKV: kv.length, kvStride: kv.maxSeq,
-            scale: scale, on: cmd)
+        // Cached sdpaDecode output + sigmoidMul output scratches.
+        if attnOutScratch == nil
+            || attnOutScratch!.elementCount != nHeads * headDim
+            || attnOutScratch!.dtype != qNormed.dtype
+        {
+            attnOutScratch = Tensor.empty(
+                shape: [nHeads, headDim], dtype: qNormed.dtype, device: device)
+            attnFlatGatedScratch = Tensor.empty(
+                shape: [nHeads * headDim], dtype: qNormed.dtype, device: device)
+        }
+        // Flash-Decoding 2-pass at long KV. Splits KV across `blocks`
+        // threadgroups in pass1, merges in pass2. Wins over single-pass
+        // when nKV ≥ ~1024 (default threshold); env var
+        // `FFAI_SDPA_2PASS_THRESHOLD` overrides.
+        let attnOut: Tensor
+        if kv.length >= sdpa2PassThreshold {
+            if partialOScratch == nil
+                || partialOScratch!.elementCount
+                    != nHeads * sdpa2PassBlocks * headDim
+                || partialOScratch!.dtype != qNormed.dtype
+            {
+                partialOScratch = Tensor.empty(
+                    shape: [nHeads, sdpa2PassBlocks, headDim],
+                    dtype: qNormed.dtype, device: device)
+                partialMScratch = Tensor.empty(
+                    shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+                partialLScratch = Tensor.empty(
+                    shape: [nHeads, sdpa2PassBlocks], dtype: .f32, device: device)
+            }
+            Ops.sdpaDecode2Pass(
+                q: qNormed.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                nKV: kv.length, kvStride: kv.maxSeq, blocks: sdpa2PassBlocks,
+                scale: scale,
+                partialO: partialOScratch!,
+                partialM: partialMScratch!,
+                partialL: partialLScratch!,
+                into: attnOutScratch!, on: cmd)
+            attnOut = attnOutScratch!
+        } else {
+            attnOut = Ops.sdpaDecode(
+                q: qNormed.reshaped(to: [nHeads, headDim]), k: cacheK, v: cacheV,
+                nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                nKV: kv.length, kvStride: kv.maxSeq,
+                scale: scale, on: cmd, into: attnOutScratch)
+        }
 
         // Gated output: attnOut * sigmoid(gate), then o_proj.
+        // Fused sigmoidMul via mt_sigmoid_mul into cached scratch —
+        // saves 1 encoder per attn layer × 10 ≈ 170 µs/token.
         var attnFlat = attnOut.reshaped(to: [nHeads * headDim])
         if let gate {
-            attnFlat = Ops.mul(attnFlat, Ops.sigmoid(gate, on: cmd), on: cmd)
+            attnFlat = Ops.sigmoidMul(
+                attnFlat, gate, on: cmd, into: attnFlatGatedScratch)
         }
         return oProj(attnFlat, on: cmd)
     }
@@ -1632,101 +2261,146 @@ public final class Qwen35AttentionMixer: Module {
         let qDim = nHeads * headDim
         let kvDim = nKVHeads * headDim
 
-        // ── Projections — one gemm/qmm each, T-batched ───────────────────
-        let qOut = qProj.callMany(xNormFlat, t: t, on: cmd, device: device)
-        let kOut = kProj.callMany(xNormFlat, t: t, on: cmd, device: device)
-        let vOut = vProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+        // ── Projections — fused QKV qmm when constraints match ──────────
+        // `Ops.batchedQkvQmmFast` produces all three Q/K/V projections
+        // in ONE dispatch when the three QuantizedLinear projections
+        // share `bits=4`, `groupSize=64`, and `in_dim%512==0` /
+        // `out_*%8==0`. Replaces 3 `callMany` qmm encoders with 1 fused
+        // encoder. Predicate is the same `fusedQKVEligible` flag the
+        // single-token path uses.
+        let qOut: Tensor
+        let kOut: Tensor
+        let vOut: Tensor
+        if fusedQKVEligible, let bq = batchedQKV {
+            let qDimW = bq.qW.shape[0]
+            let kDimW = bq.kW.shape[0]
+            let vDimW = bq.vW.shape[0]
+            let inDim = bq.qW.shape[1] * 8
+            let qBuf = Tensor.empty(shape: [t, qDimW], dtype: dt, device: device)
+            let kBuf = Tensor.empty(shape: [t, kDimW], dtype: dt, device: device)
+            let vBuf = Tensor.empty(shape: [t, vDimW], dtype: dt, device: device)
+            Ops.batchedQkvQmmFast(
+                x: xNormFlat.reshaped(to: [t, inDim]),
+                wQ: bq.qW, scalesQ: bq.qS, biasesQ: bq.qB,
+                wK: bq.kW, scalesK: bq.kS, biasesK: bq.kB,
+                wV: bq.vW, scalesV: bq.vS, biasesV: bq.vB,
+                m: t, outQ: qDimW, outK: kDimW, outV: vDimW,
+                on: cmd,
+                qBuf: qBuf, kBuf: kBuf, vBuf: vBuf)
+            qOut = qBuf
+            kOut = kBuf
+            vOut = vBuf
+        } else {
+            qOut = qProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+            kOut = kProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+            vOut = vProj.callMany(xNormFlat, t: t, on: cmd, device: device)
+        }
 
-        // ── Gate split — one gather (vs T) when attnOutputGate ───────────
+        // ── Gate split — one shared-encoder gather (vs T) when
+        // attnOutputGate. Both halves run on a shared encoder via
+        // sliceHeadHalvesManyBoth35.
         let queriesFlat: Tensor  // `[T, nHeads, headDim]` flat
         let gateFlat: Tensor?  // `[T, nHeads, headDim]` flat
         if attnOutputGate {
             let q2T = qOut.reshaped(to: [t, nHeads, 2 * headDim])
-            queriesFlat = sliceHeadHalvesMany35(
-                q2T, t: t, nHeads: nHeads, headDim: headDim, takeFirst: true,
+            let (q, g) = sliceHeadHalvesManyBoth35(
+                q2T, t: t, nHeads: nHeads, headDim: headDim,
                 on: cmd, device: device)
-            gateFlat = sliceHeadHalvesMany35(
-                q2T, t: t, nHeads: nHeads, headDim: headDim, takeFirst: false,
-                on: cmd, device: device)
+            queriesFlat = q
+            gateFlat = g
         } else {
             queriesFlat = qOut
             gateFlat = nil
         }
 
-        // ── Q/K norm — one rmsNormRows over (T*nHeads) and (T*nKVHeads)
-        // rows. rmsNormRows is already row-wise, so the T-batched form is
-        // a count change, not a kernel change.
-        let qNormed = Ops.rmsNormRows(
-            queriesFlat, weight: qNorm.weight, eps: qNorm.eps,
-            nRows: t * nHeads, rowSize: headDim, on: cmd)
-        let kNormed = Ops.rmsNormRows(
-            kOut, weight: kNorm.weight, eps: kNorm.eps,
-            nRows: t * nKVHeads, rowSize: headDim, on: cmd)
+        // ── Q/K norm — one shared encoder over (T·nHeads) + (T·nKVHeads)
+        // rows. Collapses the two separate `rmsNormRows` dispatches into
+        // one `rmsNormRowsTwo` shared encoder, mirroring the single-
+        // token `forward` path. Saves 1 encoder begin/end per attn-
+        // layer prefill call.
+        let qNormed = Tensor.empty(
+            shape: queriesFlat.shape, dtype: queriesFlat.dtype, device: device)
+        let kNormed = Tensor.empty(
+            shape: kOut.shape, dtype: kOut.dtype, device: device)
+        Ops.rmsNormRowsTwo(
+            queriesFlat, weight: qNorm.weight, eps1: qNorm.eps,
+            nRows1: t * nHeads, rowSize1: headDim, into: qNormed,
+            kOut, weight: kNorm.weight, eps2: kNorm.eps,
+            nRows2: t * nKVHeads, rowSize2: headDim, into: kNormed,
+            on: cmd)
 
-        // ── RoPE per token + KV append — T dispatches each, all on `cmd`.
-        // The single-token RoPE kernel grids `[nHeads, halfRotary]` —
-        // small enough that T launches at T≤256 cost less than one big
-        // qmm. KV append uses appendRangeOnGPU for the single length-lock
-        // path; each step is one Ops.kvCacheUpdate dispatch.
-        var kRows: [Tensor] = []
-        kRows.reserveCapacity(t)
-        var vRows: [Tensor] = []
-        vRows.reserveCapacity(t)
-        for r in 0 ..< t {
-            let qRow = Tensor(
-                buffer: qNormed.buffer,
-                offset: qNormed.offset + r * qDim * dtBytes,
-                shape: [qDim], dtype: dt)
-            let kRow = Tensor(
-                buffer: kNormed.buffer,
-                offset: kNormed.offset + r * kvDim * dtBytes,
-                shape: [kvDim], dtype: dt)
-            let vRow = Tensor(
-                buffer: vOut.buffer,
-                offset: vOut.offset + r * kvDim * dtBytes,
-                shape: [kvDim], dtype: dt)
-            Ops.ropePartial(
-                qRow, position: startPosition + r,
-                headDim: headDim, rotaryDim: rotaryDim,
-                thetaBase: ropeTheta, on: cmd)
-            Ops.ropePartial(
-                kRow, position: startPosition + r,
-                headDim: headDim, rotaryDim: rotaryDim,
-                thetaBase: ropeTheta, on: cmd)
-            kRows.append(kRow.reshaped(to: [nKVHeads, headDim]))
-            vRows.append(vRow.reshaped(to: [nKVHeads, headDim]))
-        }
-        kv.appendRangeOnGPU(kRows: kRows, vRows: vRows, on: cmd)
+        // ── Batched RoPE over all T tokens on ONE shared encoder.
+        // `Ops.ropePartialManyTwo` pairs Q+K RoPE for each of the T
+        // rows in a single dispatch — saves T-1 encoder begin/end pairs
+        // per attn layer × 10 ≈ 5100 fewer dispatches at T=512.
+        let positions = device.makeBuffer(length: t * 4)
+        let positionsPtr = positions.contents().bindMemory(
+            to: UInt32.self, capacity: t)
+        for r in 0 ..< t { positionsPtr[r] = UInt32(startPosition + r) }
+        let positionsT = Tensor(
+            buffer: positions, offset: 0, shape: [t], dtype: .u32)
+        Ops.ropePartialManyTwo(
+            q: qNormed, qNHeads: nHeads, qRowStride: qDim,
+            k: kNormed, kNHeads: nKVHeads, kRowStride: kvDim,
+            positions: positionsT, t: t,
+            headDim: headDim, rotaryDim: rotaryDim,
+            thetaBase: ropeTheta, on: cmd)
 
-        // ── SDPA — per-token loop over `sdpaDecode`. `Ops.sdpaMulti`
-        // would consolidate the T calls into one but it's head_dim-128
-        // only today; Qwen3.6 attention is head_dim-256. The per-token
-        // sdpaDecode loop preserves correctness; the projection and
-        // norm wins above still amortise. A future head_dim-256
-        // `sdpaMulti` variant (or transpose-to-prefill_mma) collapses
-        // these T launches into one.
+        // ── KV append — batched K+V cache append. Reserves T
+        // sequential physical slots on host under lengthLock, then writes
+        // K/V for all T tokens via ONE shared encoder + 2 dispatches (vs
+        // the T-loop of `kvCacheUpdateKV` paired-encoder calls).
+        let appendPositions = Tensor.empty(
+            shape: [t], dtype: .u32, device: device)
+        kv.reserveSlotsManyOnHost(t: t, into: appendPositions)
+        kv.appendRangeOnGPUMany(
+            kFlat: kNormed, vFlat: vOut, t: t,
+            positions: appendPositions, on: cmd)
+
+        // ── SDPA — fuse the T-token causal attention into ONE
+        // `Ops.sdpaMulti` dispatch. d=128 wraps `ffai_sdpa_multi`;
+        // d=256 (Qwen3.6-A3B full-attention layers) wraps
+        // `ffai_sdpa_multi_d256` — same semantics, head_dim-256 2-phase
+        // output reduction internally. T-loop `sdpaDecode` fallback only
+        // fires for other head_dims.
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
-        let attnAll = Tensor.empty(shape: [t * qDim], dtype: dt, device: device)
-        for r in 0 ..< t {
-            let qRow = Tensor(
-                buffer: qNormed.buffer,
-                offset: qNormed.offset + r * qDim * dtBytes,
-                shape: [nHeads, headDim], dtype: dt)
-            let outRow = Tensor(
-                buffer: attnAll.buffer,
-                offset: attnAll.offset + r * qDim * dtBytes,
-                shape: [nHeads, headDim], dtype: dt)
-            _ = Ops.sdpaDecode(
-                q: qRow, k: cacheK, v: cacheV,
+        let attnAll: Tensor
+        if headDim == 128 || headDim == 256 {
+            // qNormed is `[T, nHeads, headDim]` flat. Reshape into the
+            // shape sdpaMulti expects (same buffer, no copy).
+            let qBlock = qNormed.reshaped(to: [t, nHeads, headDim])
+            attnAll = Ops.sdpaMulti(
+                q: qBlock, k: cacheK, v: cacheV,
                 nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
-                nKV: startPosition + r + 1, kvStride: kv.maxSeq,
-                scale: scale, on: cmd, into: outRow)
+                baseKV: startPosition, nQuery: t, kvStride: kv.maxSeq,
+                causal: true, scale: scale, on: cmd
+            ).reshaped(to: [t * qDim])
+        } else {
+            let attnAllScratch = Tensor.empty(
+                shape: [t * qDim], dtype: dt, device: device)
+            for r in 0 ..< t {
+                let qRow = Tensor(
+                    buffer: qNormed.buffer,
+                    offset: qNormed.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: dt)
+                let outRow = Tensor(
+                    buffer: attnAllScratch.buffer,
+                    offset: attnAllScratch.offset + r * qDim * dtBytes,
+                    shape: [nHeads, headDim], dtype: dt)
+                _ = Ops.sdpaDecode(
+                    q: qRow, k: cacheK, v: cacheV,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: startPosition + r + 1, kvStride: kv.maxSeq,
+                    scale: scale, on: cmd, into: outRow)
+            }
+            attnAll = attnAllScratch
         }
 
-        // ── Gated output * o_proj ────────────────────────────────────────
+        // ── Gated output * o_proj — fused sigmoidMul on the prefill
+        // path (same kernel as the single-token forward path).
         var attnFlat = attnAll
         if let gateFlat {
-            attnFlat = Ops.mul(attnFlat, Ops.sigmoid(gateFlat, on: cmd), on: cmd)
+            attnFlat = Ops.sigmoidMul(attnFlat, gateFlat, on: cmd)
         }
         let attnRows = attnFlat.reshaped(to: [t, qDim])
         return oProj.callMany(attnRows, t: t, on: cmd, device: device)
@@ -1833,9 +2507,6 @@ public final class Qwen35GDNLayer: Module, DecoderLayer {
             hFlat.elementCount == t * hidden,
             "Qwen35GDNLayer.decodeMany: hFlat size \(hFlat.elementCount) ≠ T·hidden = \(t * hidden)"
         )
-
-        let dt = hFlat.dtype
-        let dtBytes = dt.byteSize
 
         // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
         let xNormFlat = Ops.rmsNormRows(
@@ -1988,9 +2659,6 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             "Qwen35AttentionLayer.decodeMany: hFlat size \(hFlat.elementCount) "
                 + "≠ T·hidden = \(t * hidden)")
 
-        let dt = hFlat.dtype
-        let dtBytes = dt.byteSize
-
         // ── Pre-norm — one rmsNormRows over T rows ──────────────────────
         let xNormFlat = Ops.rmsNormRows(
             hFlat, weight: inputNorm.weight, eps: inputNorm.eps,
@@ -2031,6 +2699,36 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
             cmd: cmd, device: device,
             preNormed: ffnNorm)
     }
+}
+
+// ─── finalNorm + lmHead fused dispatch helper ───────────────────────
+//
+// Replaces the 2-dispatch chain `finalNorm(h)` + `lmHead(normed)` with
+// a single `Ops.rmsNormQgemvInt4Fast` dispatch when the lmHead's
+// underlying linear is a 4-bit `QuantizedLinear` that satisfies the
+// fast kernel's constraints (in_dim multiple of 512, out_dim multiple
+// of 8, group_size = 64). Falls back to the separate-chain form
+// otherwise (dense lmHead, int8/int3 quant, smaller vocab, etc.).
+private func qwen35FinalNormLmHead(
+    h: Tensor, finalNorm: RMSNorm, lmHead: AnyLinear,
+    on cmd: MTLCommandBuffer
+) -> Tensor {
+    if let qLm = lmHead.inner as? QuantizedLinear, qLm.bits == 4,
+        qLm.groupSize == 64,
+        h.elementCount % 512 == 0,
+        qLm.weight.shape[0] % 8 == 0
+    {
+        let outDim = qLm.weight.shape[0]
+        let logits = Tensor.empty(shape: [outDim], dtype: h.dtype)
+        Ops.rmsNormQgemvInt4Fast(
+            x: h, normWeight: finalNorm.weight, eps: finalNorm.eps,
+            qWeight: qLm.weight, qScales: qLm.scales, qBiases: qLm.biases,
+            on: cmd, into: logits)
+        return logits
+    }
+    // Fallback: separate dispatches (legacy two-step).
+    let normed = finalNorm(h, on: cmd)
+    return lmHead(normed, on: cmd)
 }
 
 // ─── Shared FFN helpers ──────────────────────────────────────────────
@@ -2083,7 +2781,6 @@ private func qwen35ApplyFFNMany(
         let addCmd = device.makeCommandBuffer()
         let resultFlat = Ops.add(postMix, ffnOut, on: addCmd)
         addCmd.commit()
-        let _ = resultFlat
         return resultFlat
     }
 }
@@ -2122,17 +2819,14 @@ private func qwen35ApplyFFN(
         }
         return result
     case .moe(let moe):
-        // Qwen35MoEFFN.forward commits `cmd`; run the residual add on a
-        // fresh buffer. We commit without waiting: the residual add
-        // tensor is the layer's output; the next layer queues onto a
-        // fresh workCmd and Metal hazard-tracks the read.
-        let ffnOut = moe.forward(
+        // Qwen35MoEFFN.forward commits `cmd`. Folds the post-FFN
+        // residual add into the final sigmoidScalarFMA via
+        // `sigmoidScalarFMAResidual` — when this is taken the returned
+        // tensor already includes `postMix + routed + sigmoid·shared`.
+        return moe.forward(
             ffnNorm, position: position,
-            cmd: cmd, device: device)
-        let addCmd = device.makeCommandBuffer()
-        let result = Ops.add(postMix, ffnOut, on: addCmd)
-        addCmd.commit()
-        return result
+            cmd: cmd, device: device,
+            residual: postMix)
     }
 }
 
@@ -2305,8 +2999,10 @@ public final class Qwen35Model: LanguageModel {
         }
 
         // Final norm + lm_head queue onto the caller's pristine `cmd`.
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        // Fused rmsNorm+qgemv when lmHead is 4-bit QuantizedLinear with
+        // matching constraints; falls back otherwise.
+        return qwen35FinalNormLmHead(
+            h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
     /// LanguageModel-protocol entry point for chunked prefill. Delegates
@@ -2392,6 +3088,31 @@ public final class Qwen35Model: LanguageModel {
             tokenIds: tokenIds,
             startPosition: startPosition,
             caches: caches,
+            returnAllLogits: false,
+            on: cmd, device: device)
+    }
+
+    /// Multi-token forward returning logits at EVERY position — `[T, vocab]`.
+    /// Same KV/GDN-cache-writing semantics as `forwardMany`; differs only
+    /// in the output: instead of slicing the last row's hidden, applies
+    /// final RMSNorm + lm_head row-wise to all T positions.
+    ///
+    /// Spec-decode driver: a drafter proposes `γ` candidate tokens, the
+    /// target verifies via `forwardManyAllLogits(prefix + candidates)` to
+    /// get the per-position logits, then accepts up to the first reject.
+    public func forwardManyAllLogits(
+        tokenIds: [Int], startPosition: Int,
+        caches: [any LayerCacheProtocol],
+        on cmd: MTLCommandBuffer, device: Device
+    ) -> Tensor {
+        precondition(
+            !tokenIds.isEmpty,
+            "Qwen35Model.forwardManyAllLogits: tokenIds must not be empty")
+        return _forwardManyBatched(
+            tokenIds: tokenIds,
+            startPosition: startPosition,
+            caches: caches,
+            returnAllLogits: true,
             on: cmd, device: device)
     }
 
@@ -2423,11 +3144,17 @@ public final class Qwen35Model: LanguageModel {
     /// Mixed-dispatch batched forwardMany. Attention layers fan to
     /// `decodeMany`; GDN (and any other) layer types stay per-token with
     /// a per-row `Ops.copy` blit-back into the running `[T, hidden]`
-    /// buffer. Embedding gathers all T tokens in one dispatch. Final
-    /// norm + lm_head run only on the LAST row, on the caller's `cmd`.
+    /// buffer. Embedding gathers all T tokens in one dispatch.
+    ///
+    /// Output shape depends on `returnAllLogits`:
+    ///   * `false` (default, prefill driver): final norm + lm_head run
+    ///     on the LAST row only → `[vocab]`.
+    ///   * `true` (spec-decode verify): batched RMSNorm over T rows +
+    ///     batched lm_head → `[T, vocab]`.
     private func _forwardManyBatched(
         tokenIds: [Int], startPosition: Int,
         caches: [any LayerCacheProtocol],
+        returnAllLogits: Bool,
         on cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         let t = tokenIds.count
@@ -2508,13 +3235,28 @@ public final class Qwen35Model: LanguageModel {
             workCmd.waitUntilCompleted()
         }
 
-        // ── Final norm + lm_head on the LAST row only ────────────────────
-        let lastRow = Tensor(
-            buffer: h.buffer,
-            offset: h.offset + (t - 1) * hidden * dtBytes,
-            shape: [hidden], dtype: dt)
-        let normed = finalNorm(lastRow, on: cmd)
-        return lmHead(normed, on: cmd)
+        // ── Final norm + lm_head ─────────────────────────────────────────
+        // Two output shapes (see _forwardManyBatched docstring):
+        //   * returnAllLogits == false: logits of the LAST row only,
+        //     fused via qwen35FinalNormLmHead.
+        //   * returnAllLogits == true: batched RMSNorm over T rows +
+        //     batched lm_head — the spec-decode verify path needs
+        //     per-position logits.
+        if !returnAllLogits {
+            let lastRow = Tensor(
+                buffer: h.buffer,
+                offset: h.offset + (t - 1) * hidden * dtBytes,
+                shape: [hidden], dtype: dt)
+            return qwen35FinalNormLmHead(
+                h: lastRow, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
+        }
+        // All-T path: batched RMSNorm over T rows + batched lm_head.
+        let normedAll = Ops.rmsNormRows(
+            h, weight: finalNorm.weight, eps: finalNorm.eps,
+            nRows: t, rowSize: hidden, on: cmd)
+        return lmHead.callMany(
+            normedAll.reshaped(to: [t, hidden]),
+            t: t, on: cmd, device: device)
     }
 
     // ─── VLM embedding-input path ────────────────────────────────────
@@ -2564,8 +3306,10 @@ public final class Qwen35Model: LanguageModel {
             workCmd.waitUntilCompleted()
         }
 
-        let normed = finalNorm(h, on: cmd)
-        return lmHead(normed, on: cmd)
+        // Fused finalNorm+lmHead on the VLM embed-input forward path
+        // too.
+        return qwen35FinalNormLmHead(
+            h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
 
     /// Raw embedding-table lookup for one text token.
@@ -2711,6 +3455,55 @@ private func sliceHeadHalves35(
     let idx = Tensor(buffer: idxBuf, offset: 0, shape: [nHeads], dtype: .u32)
     let gathered = Ops.gather(table: table, tokenIds: idx, on: cmd)
     return gathered.reshaped(to: [nHeads * headDim])
+}
+
+/// T-batched both-halves variant. Returns `(queriesFlat, gateFlat)`
+/// — both `[T·nHeads·headDim]` flat — using a single shared-encoder
+/// `Ops.gatherTwo` dispatch over the two interleaved row sets.
+/// Replaces two back-to-back `sliceHeadHalvesMany35` calls in
+/// `forwardMany` with one encoder begin/end pair.
+private func sliceHeadHalvesManyBoth35(
+    _ q2T: Tensor, t: Int,
+    nHeads: Int, headDim: Int,
+    on cmd: MTLCommandBuffer,
+    device: Device
+) -> (Tensor, Tensor) {
+    precondition(
+        q2T.elementCount == t * nHeads * 2 * headDim,
+        "sliceHeadHalvesManyBoth35: q2T must be [T, nHeads, 2·headDim]")
+    let table = q2T.reshaped(to: [t * nHeads * 2, headDim])
+    let nIdx = t * nHeads
+    var rowsFirst = [UInt32](repeating: 0, count: nIdx)
+    var rowsSecond = [UInt32](repeating: 0, count: nIdx)
+    for r in 0 ..< t {
+        let base = UInt32(r * 2 * nHeads)
+        let rowBase = r * nHeads
+        for h in 0 ..< nHeads {
+            rowsFirst[rowBase + h] = base + UInt32(2 * h)
+            rowsSecond[rowBase + h] = base + UInt32(2 * h) + 1
+        }
+    }
+    let firstBuf = device.makeBuffer(length: nIdx * 4)
+    rowsFirst.withUnsafeBytes {
+        _ = memcpy(firstBuf.contents(), $0.baseAddress!, nIdx * 4)
+    }
+    let secondBuf = device.makeBuffer(length: nIdx * 4)
+    rowsSecond.withUnsafeBytes {
+        _ = memcpy(secondBuf.contents(), $0.baseAddress!, nIdx * 4)
+    }
+    let idxFirst = Tensor(buffer: firstBuf, offset: 0, shape: [nIdx], dtype: .u32)
+    let idxSecond = Tensor(buffer: secondBuf, offset: 0, shape: [nIdx], dtype: .u32)
+    let out1 = Tensor.empty(shape: [nIdx, headDim], dtype: q2T.dtype, device: device)
+    let out2 = Tensor.empty(shape: [nIdx, headDim], dtype: q2T.dtype, device: device)
+    Ops.gatherTwo(
+        table: table,
+        ids1: idxFirst, into: out1,
+        ids2: idxSecond, into: out2,
+        on: cmd)
+    return (
+        out1.reshaped(to: [nIdx * headDim]),
+        out2.reshaped(to: [nIdx * headDim])
+    )
 }
 
 /// T-batched variant of `sliceHeadHalves35`. Input `q2T` is

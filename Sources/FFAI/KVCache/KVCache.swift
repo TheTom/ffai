@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -195,6 +195,10 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
         self.kBuffer.zero()
         self.vBuffer.zero()
         self._evictionState = KVEvictionState(policy: eviction, bufferCapacity: maxSeq)
+        // KV buffers live for the entire generation — pin them in the
+        // device's residency set so per-dispatch residency tracking
+        // doesn't fire on the thousands of decode-step appends + reads.
+        device.markWeightsResident([self.kBuffer.buffer, self.vBuffer.buffer])
     }
 
     /// CPU-side legacy append. Caller must have already sync'd the
@@ -277,6 +281,49 @@ public final class KVCache: KVCacheProtocol, @unchecked Sendable {
                     nKVHeads: nKVHeads, headDim: headDim,
                     maxSeq: maxSeq, position: pos, on: cmd)
             }
+        }
+    }
+
+    /// Batched range append: takes contiguous `[T, nKVHeads, headDim]`
+    /// flat K + V tensors and writes them all in ONE shared encoder
+    /// (2 dispatches: K then V) using a `[T]` u32 positions buffer.
+    /// Caller provides the positions buffer (allocated + filled with
+    /// the freshly-reserved slot indices). Replaces the T-loop of
+    /// `Ops.kvCacheUpdateKV` calls.
+    public func appendRangeOnGPUMany(
+        kFlat: Tensor, vFlat: Tensor,
+        t: Int, positions: Tensor,
+        on cmd: MTLCommandBuffer
+    ) {
+        precondition(
+            kFlat.dtype == dtype && vFlat.dtype == dtype,
+            "KVCache.appendRangeOnGPUMany: dtype mismatch")
+        precondition(
+            positions.dtype == .u32 && positions.elementCount == t,
+            "KVCache.appendRangeOnGPUMany: positions must be .u32[T]")
+        Ops.kvCacheUpdateKVMany(
+            kSrc: kFlat, kCache: kBuffer,
+            vSrc: vFlat, vCache: vBuffer,
+            positions: positions, t: t,
+            nKVHeads: nKVHeads, headDim: headDim, maxSeq: maxSeq,
+            on: cmd)
+    }
+
+    /// Reserve T sequential physical slots in the cache, writing the
+    /// chosen indices into `positionsOut` (a u32 buffer length ≥ T).
+    /// Atomic under `lengthLock`. Returns nothing — caller passes the
+    /// positions tensor straight to `appendRangeOnGPUMany`.
+    public func reserveSlotsManyOnHost(t: Int, into positionsOut: Tensor) {
+        precondition(
+            positionsOut.dtype == .u32,
+            "KVCache.reserveSlotsManyOnHost: positionsOut must be .u32")
+        precondition(
+            positionsOut.elementCount >= t,
+            "KVCache.reserveSlotsManyOnHost: positionsOut shorter than T")
+        let ptr = positionsOut.buffer.contents().advanced(by: positionsOut.offset)
+            .bindMemory(to: UInt32.self, capacity: t)
+        lengthLock.withLock {
+            for r in 0 ..< t { ptr[r] = UInt32(_evictionState.reserveNextSlot()) }
         }
     }
 

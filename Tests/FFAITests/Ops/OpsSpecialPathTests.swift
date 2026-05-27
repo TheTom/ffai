@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,6 +85,232 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("castToF32Two f16 — same as two sequential castToF32 calls")
+    func castToF32TwoMatchesSequential() {
+        autoreleasepool {
+            let n = 4
+            let a = Tensor.empty(shape: [n], dtype: .f16)
+            a.copyIn(from: [Float16(0.5), 2, -2, 4])
+            let b = Tensor.empty(shape: [n], dtype: .f16)
+            b.copyIn(from: [Float16(-1), 0, 1, 0.25])
+            let refA = Tensor.empty(shape: [n], dtype: .f32)
+            let refB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.castToF32(a, into: refA, on: cb)
+                Ops.castToF32(b, into: refB, on: cb)
+            }
+            let outA = Tensor.empty(shape: [n], dtype: .f32)
+            let outB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.castToF32Two(a, into: outA, b, into: outB, on: cb)
+            }
+            let rA = refA.toArray(as: Float.self)
+            let gA = outA.toArray(as: Float.self)
+            let rB = refB.toArray(as: Float.self)
+            let gB = outB.toArray(as: Float.self)
+            for i in 0 ..< n {
+                #expect(abs(gA[i] - rA[i]) < 1e-5, "a[\(i)]")
+                #expect(abs(gB[i] - rB[i]) < 1e-5, "b[\(i)]")
+            }
+        }
+    }
+
+    @Test("castToF32Three bf16 — same as three sequential castToF32 calls")
+    func castToF32ThreeMatchesSequential() {
+        autoreleasepool {
+            // bf16 round-trip — fewer mantissa bits than f16 but still
+            // exact when source values fit the type.
+            let n = 4
+            let aSrc: [Float] = [0.5, 2, -2, 4]
+            let bSrc: [Float] = [-1, 0, 1, 0.25]
+            let cSrc: [Float] = [3.5, -0.125, 1.0, 0]
+            // bf16 store: pick the top 16 bits of each Float bit pattern.
+            func toBF16Bits(_ xs: [Float]) -> [UInt16] {
+                xs.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+            }
+            let a = Tensor.empty(shape: [n], dtype: .bf16)
+            a.copyIn(from: toBF16Bits(aSrc))
+            let b = Tensor.empty(shape: [n], dtype: .bf16)
+            b.copyIn(from: toBF16Bits(bSrc))
+            let c = Tensor.empty(shape: [n], dtype: .bf16)
+            c.copyIn(from: toBF16Bits(cSrc))
+            let refA = Tensor.empty(shape: [n], dtype: .f32)
+            let refB = Tensor.empty(shape: [n], dtype: .f32)
+            let refC = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.castToF32(a, into: refA, on: cb)
+                Ops.castToF32(b, into: refB, on: cb)
+                Ops.castToF32(c, into: refC, on: cb)
+            }
+            let outA = Tensor.empty(shape: [n], dtype: .f32)
+            let outB = Tensor.empty(shape: [n], dtype: .f32)
+            let outC = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.castToF32Three(
+                    a, into: outA, b, into: outB, c, into: outC, on: cb)
+            }
+            let rA = refA.toArray(as: Float.self)
+            let gA = outA.toArray(as: Float.self)
+            let rB = refB.toArray(as: Float.self)
+            let gB = outB.toArray(as: Float.self)
+            let rC = refC.toArray(as: Float.self)
+            let gC = outC.toArray(as: Float.self)
+            for i in 0 ..< n {
+                #expect(abs(gA[i] - rA[i]) < 1e-5, "a[\(i)]")
+                #expect(abs(gB[i] - rB[i]) < 1e-5, "b[\(i)]")
+                #expect(abs(gC[i] - rC[i]) < 1e-5, "c[\(i)]")
+            }
+        }
+    }
+
+    @Test("swigluMany f32 — N=3 separate dispatches share one encoder")
+    func swigluManyMatchesSequential() {
+        autoreleasepool {
+            let n = 8
+            // Build three (gate, up) pairs of different sizes — the
+            // wrapper sets PSO once and dispatches each independently.
+            let g0 = Tensor.empty(shape: [n], dtype: .f32)
+            g0.copyIn(from: (0 ..< n).map { Float($0) * 0.1 })
+            let u0 = Tensor.empty(shape: [n], dtype: .f32)
+            u0.copyIn(from: (0 ..< n).map { Float($0 + 1) })
+            let g1 = Tensor.empty(shape: [n], dtype: .f32)
+            g1.copyIn(from: (0 ..< n).map { Float($0) * -0.2 })
+            let u1 = Tensor.empty(shape: [n], dtype: .f32)
+            u1.copyIn(from: (0 ..< n).map { Float($0) * 0.5 + 1 })
+            let g2 = Tensor.empty(shape: [n], dtype: .f32)
+            g2.copyIn(from: (0 ..< n).map { Float($0) * 0.3 - 0.1 })
+            let u2 = Tensor.empty(shape: [n], dtype: .f32)
+            u2.copyIn(from: (0 ..< n).map { Float(n - $0) })
+            var ref0: Tensor!
+            var ref1: Tensor!
+            var ref2: Tensor!
+            runAndWait { cb in
+                ref0 = Ops.swiglu(gate: g0, up: u0, on: cb)
+                ref1 = Ops.swiglu(gate: g1, up: u1, on: cb)
+                ref2 = Ops.swiglu(gate: g2, up: u2, on: cb)
+            }
+            let out0 = Tensor.empty(shape: [n], dtype: .f32)
+            let out1 = Tensor.empty(shape: [n], dtype: .f32)
+            let out2 = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.swigluMany(
+                    gates: [g0, g1, g2],
+                    ups: [u0, u1, u2],
+                    outs: [out0, out1, out2],
+                    on: cb)
+            }
+            let pairs: [(Tensor, Tensor)] = [(ref0, out0), (ref1, out1), (ref2, out2)]
+            for (idx, pair) in pairs.enumerated() {
+                let r = pair.0.toArray(as: Float.self)
+                let g = pair.1.toArray(as: Float.self)
+                for i in 0 ..< n {
+                    #expect(abs(r[i] - g[i]) < 1e-5, "pair \(idx) [\(i)]")
+                }
+            }
+        }
+    }
+
+    @Test("gatedMixerNormMany f32 — T=2 matches two sequential gatedMixerNorm calls")
+    func gatedMixerNormManyMatchesSequential() {
+        autoreleasepool {
+            let t = 2
+            let hv = 2
+            let dv = 8
+            let total = t * hv * dv
+            let perToken = hv * dv
+            let yData = (0 ..< total).map { Float($0 + 1) * 0.1 }
+            let zData = (0 ..< total).map { Float16(Float($0 % 5) * 0.2 - 0.4) }
+            let weightData = (0 ..< dv).map { Float16(0.5 + Float($0) * 0.05) }
+            let weight = Tensor.empty(shape: [dv], dtype: .f16)
+            weight.copyIn(from: weightData)
+            let epsBuf = Tensor.empty(shape: [1], dtype: .f32)
+            epsBuf.copyIn(from: [Float(1e-6)])
+            // Reference: two single-token gatedMixerNorm dispatches with
+            // pre-sliced inputs. All allocations + slicing happen up
+            // front; runAndWait only carries kernel work.
+            var refSlices: [Tensor] = []
+            for tt in 0 ..< t {
+                let ySlice = Tensor.empty(shape: [hv, dv], dtype: .f32)
+                ySlice.copyIn(from: Array(yData[tt * perToken ..< (tt + 1) * perToken]))
+                let zSlice = Tensor.empty(shape: [hv, dv], dtype: .f16)
+                zSlice.copyIn(from: Array(zData[tt * perToken ..< (tt + 1) * perToken]))
+                let outSlice = Tensor.empty(shape: [hv, dv], dtype: .f16)
+                runAndWait { cb in
+                    Ops.gatedMixerNorm(
+                        y: ySlice, z: zSlice, weight: weight, epsBuf: epsBuf,
+                        into: outSlice,
+                        numValueHeads: hv, valueHeadDim: dv, on: cb)
+                }
+                refSlices.append(outSlice)
+            }
+            // Batched dispatch over the full T·Hv·Dv span.
+            let y = Tensor.empty(shape: [t, hv, dv], dtype: .f32)
+            y.copyIn(from: yData)
+            let z = Tensor.empty(shape: [t, hv, dv], dtype: .f16)
+            z.copyIn(from: zData)
+            let outMany = Tensor.empty(shape: [t, hv, dv], dtype: .f16)
+            runAndWait { cb in
+                Ops.gatedMixerNormMany(
+                    y: y, z: z, weight: weight, epsBuf: epsBuf,
+                    into: outMany,
+                    t: t, numValueHeads: hv, valueHeadDim: dv, on: cb)
+            }
+            let g = outMany.toArray(as: Float16.self)
+            for tt in 0 ..< t {
+                let r = refSlices[tt].toArray(as: Float16.self)
+                for i in 0 ..< perToken {
+                    let rf = Float(r[i])
+                    let gf = Float(g[tt * perToken + i])
+                    #expect(abs(rf - gf) < 5e-3, "t=\(tt) i=\(i): ref \(rf) vs got \(gf)")
+                }
+            }
+        }
+    }
+
+    @Test("siluCastF32PlusCastF32Two f16 — same as sequential silu+two casts")
+    func siluCastF32PlusCastF32TwoFromF16() {
+        autoreleasepool {
+            let n = 4
+            // Reference: three separate dispatches.
+            let s = Tensor.empty(shape: [n], dtype: .f16)
+            s.copyIn(from: [Float16(0), 1, -1, 2])
+            let a = Tensor.empty(shape: [n], dtype: .f16)
+            a.copyIn(from: [Float16(0.5), 2, -2, 4])
+            let b = Tensor.empty(shape: [n], dtype: .f16)
+            b.copyIn(from: [Float16(-1), 0, 1, 0.25])
+            let refSilu = Tensor.empty(shape: [n], dtype: .f32)
+            let refA = Tensor.empty(shape: [n], dtype: .f32)
+            let refB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.siluCastToF32(s, into: refSilu, on: cb)
+                Ops.castToF32(a, into: refA, on: cb)
+                Ops.castToF32(b, into: refB, on: cb)
+            }
+            // Batched: one encoder, switches PSO between silu+cast and plain cast.
+            let outSilu = Tensor.empty(shape: [n], dtype: .f32)
+            let outA = Tensor.empty(shape: [n], dtype: .f32)
+            let outB = Tensor.empty(shape: [n], dtype: .f32)
+            runAndWait { cb in
+                Ops.siluCastF32PlusCastF32Two(
+                    siluIn: s, into: outSilu,
+                    a, into: outA,
+                    b, into: outB,
+                    on: cb)
+            }
+            let rRef = refSilu.toArray(as: Float.self)
+            let rGot = outSilu.toArray(as: Float.self)
+            let aRef = refA.toArray(as: Float.self)
+            let aGot = outA.toArray(as: Float.self)
+            let bRef = refB.toArray(as: Float.self)
+            let bGot = outB.toArray(as: Float.self)
+            for i in 0 ..< n {
+                #expect(abs(rGot[i] - rRef[i]) < 1e-5, "silu[\(i)]")
+                #expect(abs(aGot[i] - aRef[i]) < 1e-5, "a[\(i)]")
+                #expect(abs(bGot[i] - bRef[i]) < 1e-5, "b[\(i)]")
+            }
+        }
+    }
+
     @Test("swiglu f32 — out[i] = silu(gate[i]) * up[i]")
     func swigluF32() {
         autoreleasepool {
@@ -128,7 +354,267 @@ struct OpsSpecialPathTests {
         }
     }
 
+    @Test("sigmoidScalarFMAResidual f32 — out = residual + base + sigmoid(gate) * value")
+    func sigmoidScalarFMAResidualF32() {
+        autoreleasepool {
+            let gate = Tensor.empty(shape: [1], dtype: .f32)
+            gate.copyIn(from: [Float(0)])  // sigmoid(0) = 0.5
+            let value = Tensor.empty(shape: [4], dtype: .f32)
+            value.copyIn(from: [Float(2), 4, 6, 8])
+            let base = Tensor.empty(shape: [4], dtype: .f32)
+            base.copyIn(from: [Float(10), 20, 30, 40])
+            let residual = Tensor.empty(shape: [4], dtype: .f32)
+            residual.copyIn(from: [Float(100), 200, 300, 400])
+            let out = Tensor.empty(shape: [4], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.sigmoidScalarFMAResidual(
+                    gate: gate, value: value, base: base, residual: residual,
+                    into: out, on: cb)
+            }
+            // out[i] = residual[i] + base[i] + 0.5 * value[i]
+            let r = out.toArray(as: Float.self)
+            #expect(abs(r[0] - 111) < 1e-4)
+            #expect(abs(r[1] - 222) < 1e-4)
+            #expect(abs(r[2] - 333) < 1e-4)
+            #expect(abs(r[3] - 444) < 1e-4)
+        }
+    }
+
+    @Test("scalarFMA f32 — out = base + scalar * value")
+    func scalarFMAF32() {
+        autoreleasepool {
+            let scalar = Tensor.empty(shape: [1], dtype: .f32)
+            scalar.copyIn(from: [Float(0.25)])
+            let value = Tensor.empty(shape: [4], dtype: .f32)
+            value.copyIn(from: [Float(4), 8, 12, 16])
+            let base = Tensor.empty(shape: [4], dtype: .f32)
+            base.copyIn(from: [Float(10), 20, 30, 40])
+            let out = Tensor.empty(shape: [4], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.scalarFMA(
+                    scalar: scalar, value: value, base: base,
+                    into: out, on: cb)
+            }
+            // 0.25 * [4,8,12,16] = [1,2,3,4]; + base = [11,22,33,44]
+            let r = out.toArray(as: Float.self)
+            #expect(abs(r[0] - 11) < 1e-4)
+            #expect(abs(r[1] - 22) < 1e-4)
+            #expect(abs(r[2] - 33) < 1e-4)
+            #expect(abs(r[3] - 44) < 1e-4)
+        }
+    }
+
+    @Test("scalarFMAMany f32 — N=3 serial accumulate into acc on one encoder")
+    func scalarFMAManyF32() {
+        autoreleasepool {
+            let n = 4
+            // Three (scalar, value) pairs accumulating into acc starting
+            // from initial values. Final acc[i] = acc0[i] + sum_k s_k * v_k[i].
+            let scalars: [Tensor] = (0 ..< 3).map { _ in
+                Tensor.empty(shape: [1], dtype: .f32)
+            }
+            scalars[0].copyIn(from: [Float(1.0)])
+            scalars[1].copyIn(from: [Float(2.0)])
+            scalars[2].copyIn(from: [Float(0.5)])
+            let values: [Tensor] = (0 ..< 3).map { _ in
+                Tensor.empty(shape: [n], dtype: .f32)
+            }
+            values[0].copyIn(from: [Float(1), 2, 3, 4])
+            values[1].copyIn(from: [Float(10), 20, 30, 40])
+            values[2].copyIn(from: [Float(100), 200, 300, 400])
+            let acc = Tensor.empty(shape: [n], dtype: .f32)
+            acc.copyIn(from: [Float(1000), 1000, 1000, 1000])
+            runAndWait { cb in
+                Ops.scalarFMAMany(scalars: scalars, values: values, acc: acc, on: cb)
+            }
+            // acc[i] = 1000 + 1·v0[i] + 2·v1[i] + 0.5·v2[i]
+            // i=0: 1000 + 1 + 20 + 50 = 1071
+            // i=1: 1000 + 2 + 40 + 100 = 1142
+            // i=2: 1000 + 3 + 60 + 150 = 1213
+            // i=3: 1000 + 4 + 80 + 200 = 1284
+            let r = acc.toArray(as: Float.self)
+            #expect(abs(r[0] - 1071) < 1e-3)
+            #expect(abs(r[1] - 1142) < 1e-3)
+            #expect(abs(r[2] - 1213) < 1e-3)
+            #expect(abs(r[3] - 1284) < 1e-3)
+        }
+    }
+
+    @Test("scalarFMAChain8 f32 — out = sum_{k=0..8} scalar_k * value_k")
+    func scalarFMAChain8F32() {
+        autoreleasepool {
+            let n = 4
+            let scalars: [Tensor] = (0 ..< 8).map { i in
+                let t = Tensor.empty(shape: [1], dtype: .f32)
+                t.copyIn(from: [Float(i + 1)])  // 1, 2, 3, ..., 8
+                return t
+            }
+            let values: [Tensor] = (0 ..< 8).map { i in
+                let t = Tensor.empty(shape: [n], dtype: .f32)
+                t.copyIn(from: (0 ..< n).map { Float((i + 1) * ($0 + 1)) })
+                return t
+            }
+            let out = Tensor.empty(shape: [n], dtype: .f32)
+            out.zero()
+            runAndWait { cb in
+                Ops.scalarFMAChain8(scalars: scalars, values: values, out: out, on: cb)
+            }
+            // value_k[j] = (k+1)·(j+1); scalar_k = k+1
+            // out[j] = sum_{k=0..7} (k+1)^2 · (j+1) = (j+1) · sum k^2 (k=1..8) = (j+1) · 204
+            let r = out.toArray(as: Float.self)
+            for j in 0 ..< n {
+                let expected = Float((j + 1) * 204)
+                #expect(abs(r[j] - expected) < 1e-3)
+            }
+        }
+    }
+
+    // MARK: - sdpaDecode2Pass
+
+    @Test("sdpaDecode2Pass f32 — blocks=32 matches single-pass sdpaDecode")
+    func sdpaDecode2PassMatchesSinglePass() {
+        autoreleasepool {
+            // Pin the dispatch geometry contract that PR #10 violated:
+            // the wrapper preconditions blocks ≥ 32 && blocks % 32 == 0
+            // (pass-2 hardcodes a 32-lane block-merge). Cross-check that
+            // at the minimal legal `blocks=32`, the two-pass output
+            // matches the canonical single-pass `sdpaDecode` element-
+            // for-element within bf16-tier tolerance.
+            let nHeads = 4
+            let nKVHeads = 2
+            let headDim = 128  // a supported single-pass dim
+            let nKV = 64
+            let kvStride = 64
+            let blocks = 32  // the minimum legal value
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0 ..< nHeads * headDim).map { Float($0 % 17) * 0.1 - 0.5 })
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(
+                from: (0 ..< nKVHeads * kvStride * headDim).map {
+                    Float($0 % 13) * 0.05 - 0.3
+                })
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(
+                from: (0 ..< nKVHeads * kvStride * headDim).map {
+                    Float($0 % 11) * 0.07 - 0.4
+                })
+
+            // Single-pass reference.
+            let outRef = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            runAndWait { cb in
+                _ = Ops.sdpaDecode(
+                    q: q, k: k, v: v,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: nKV, kvStride: kvStride,
+                    scale: scale, on: cb, into: outRef)
+            }
+
+            // Two-pass under test.
+            let partialO = Tensor.empty(
+                shape: [nHeads, blocks, headDim], dtype: .f32)
+            let partialM = Tensor.empty(shape: [nHeads, blocks], dtype: .f32)
+            let partialL = Tensor.empty(shape: [nHeads, blocks], dtype: .f32)
+            let out = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.sdpaDecode2Pass(
+                    q: q, k: k, v: v,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: nKV, kvStride: kvStride, blocks: blocks,
+                    scale: scale,
+                    partialO: partialO, partialM: partialM, partialL: partialL,
+                    into: out, on: cb)
+            }
+
+            let ref = outRef.toArray(as: Float.self)
+            let got = out.toArray(as: Float.self)
+            #expect(ref.count == got.count)
+            for i in 0 ..< ref.count {
+                #expect(
+                    abs(got[i] - ref[i]) < 1e-4,
+                    "row=\(i / headDim) d=\(i % headDim): two-pass \(got[i]) vs single-pass \(ref[i])"
+                )
+            }
+        }
+    }
+
     // MARK: - KV cache append
+
+    @Test("kvCacheUpdateKVMany f32 — writes T rows at the right positions")
+    func kvCacheUpdateKVManyF32() {
+        autoreleasepool {
+            let t = 2
+            let nKV = 2
+            let headDim = 4
+            let maxSeq = 4
+            let kSrc = Tensor.empty(shape: [t, nKV, headDim], dtype: .f32)
+            // Token 0: heads [1..4, 5..8]; token 1: heads [9..12, 13..16]
+            kSrc.copyIn(from: (0 ..< t * nKV * headDim).map { Float($0 + 1) })
+            let vSrc = Tensor.empty(shape: [t, nKV, headDim], dtype: .f32)
+            vSrc.copyIn(from: (0 ..< t * nKV * headDim).map { Float($0 + 1) * 10 })
+            let kCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            kCache.zero()
+            let vCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            vCache.zero()
+            let positions = Tensor.empty(shape: [t], dtype: .u32)
+            positions.copyIn(from: [UInt32(1), UInt32(2)])
+            runAndWait { cb in
+                Ops.kvCacheUpdateKVMany(
+                    kSrc: kSrc, kCache: kCache,
+                    vSrc: vSrc, vCache: vCache,
+                    positions: positions, t: t,
+                    nKVHeads: nKV, headDim: headDim, maxSeq: maxSeq, on: cb)
+            }
+            let kGot = kCache.toArray(as: Float.self)
+            // head 0 row 1 ← token0 head0 = [1,2,3,4]
+            #expect(Array(kGot[4 ..< 8]) == [1, 2, 3, 4])
+            // head 0 row 2 ← token1 head0 = [9,10,11,12]
+            #expect(Array(kGot[8 ..< 12]) == [9, 10, 11, 12])
+            // head 1 row 1 ← token0 head1 = [5,6,7,8]
+            #expect(Array(kGot[20 ..< 24]) == [5, 6, 7, 8])
+            // head 1 row 2 ← token1 head1 = [13,14,15,16]
+            #expect(Array(kGot[24 ..< 28]) == [13, 14, 15, 16])
+            // Untouched slots stay zero.
+            #expect(Array(kGot[0 ..< 4]) == [0, 0, 0, 0])
+            #expect(Array(kGot[12 ..< 16]) == [0, 0, 0, 0])
+            let vGot = vCache.toArray(as: Float.self)
+            #expect(Array(vGot[4 ..< 8]) == [10, 20, 30, 40])
+            #expect(Array(vGot[8 ..< 12]) == [90, 100, 110, 120])
+        }
+    }
+
+    @Test("kvCacheUpdateKV f32 — appends K and V rows on one encoder")
+    func kvCacheUpdateKVF32() {
+        autoreleasepool {
+            let nKV = 2
+            let headDim = 4
+            let maxSeq = 3
+            let kSrc = Tensor.empty(shape: [nKV, headDim], dtype: .f32)
+            kSrc.copyIn(from: [Float(1), 2, 3, 4, 5, 6, 7, 8])
+            let vSrc = Tensor.empty(shape: [nKV, headDim], dtype: .f32)
+            vSrc.copyIn(from: [Float(10), 20, 30, 40, 50, 60, 70, 80])
+            let kCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            kCache.zero()
+            let vCache = Tensor.empty(shape: [nKV, maxSeq, headDim], dtype: .f32)
+            vCache.zero()
+            runAndWait { cb in
+                Ops.kvCacheUpdateKV(
+                    kSrc: kSrc, kCache: kCache,
+                    vSrc: vSrc, vCache: vCache,
+                    nKVHeads: nKV, headDim: headDim,
+                    maxSeq: maxSeq, position: 1, on: cb)
+            }
+            let kGot = kCache.toArray(as: Float.self)
+            #expect(Array(kGot[4 ..< 8]) == [1, 2, 3, 4])
+            #expect(Array(kGot[16 ..< 20]) == [5, 6, 7, 8])
+            let vGot = vCache.toArray(as: Float.self)
+            #expect(Array(vGot[4 ..< 8]) == [10, 20, 30, 40])
+            #expect(Array(vGot[16 ..< 20]) == [50, 60, 70, 80])
+        }
+    }
 
     @Test("kvCacheUpdate f32 — writes one row into [nKV, maxSeq, headDim]")
     func kvCacheUpdateF32() {

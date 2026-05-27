@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -87,7 +87,13 @@ public final class MetalTileLibrary: @unchecked Sendable {
         {
             return parsed
         }
-        return 16
+        // 64 lets the Metal driver pipeline more cmd-buffers in flight
+        // before applying backpressure. Measured as a 2-3% prefill
+        // T=512 win on Qwen3.6-A3B / M5 Max vs the 16 default — the
+        // bump absorbs per-cmd-buffer encode latency across more
+        // concurrent submissions. Set FFAI_MAX_COMMAND_BUFFERS to
+        // override for triage.
+        return 64
     }()
 
     /// Process-wide singleton. Lazily initialized; throws on first access if

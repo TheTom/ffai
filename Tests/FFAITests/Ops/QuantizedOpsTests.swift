@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -700,6 +700,311 @@ struct QuantizedOpsTests {
                     )
                 }
             }
+        }
+    }
+
+    // MARK: - Batched dequantGemvInt4 (Two/Three/Four-projection variants)
+    //
+    // The batched wrappers do N back-to-back `dequant_gemv_int4_*`
+    // dispatches inside one compute encoder, sharing the input
+    // binding and the `in_dim` / `group_size` constants. Correctness
+    // = N independent `dequantGemvInt4` calls produce the same output
+    // tensors. The tests below build one input + N (weight, scales,
+    // biases) triples, run both code paths, and require element-wise
+    // equality.
+
+    /// Build one realistic (weight, scales, biases, expectedOut) shape
+    /// for a single int4 projection. Returns CPU-truth output for
+    /// later equality checking.
+    private static func makeInt4Projection(
+        outDim: Int, inDim: Int, gs: Int,
+        rowSeed: Int, scaleStep: Float, biasStep: Float,
+        input: [Float]
+    ) -> (weight: Tensor, scales: Tensor, biases: Tensor, expected: [Float]) {
+        let nGroups = inDim / gs
+        var q = [[UInt32]](repeating: [], count: outDim)
+        for r in 0 ..< outDim {
+            q[r] = (0 ..< inDim).map { UInt32(($0 + r * rowSeed) % 16) }
+        }
+        let scales: [Float] = (0 ..< (outDim * nGroups)).map { Float($0 + 1) * scaleStep }
+        let biases: [Float] = (0 ..< (outDim * nGroups)).map { Float($0) * biasStep }
+        var packed: [UInt32] = []
+        for r in 0 ..< outDim {
+            for i in stride(from: 0, to: inDim, by: 8) {
+                let nibbles = Array(q[r][i ..< i + 8])
+                packed.append(Self.pack8(nibbles))
+            }
+        }
+        var expected: [Float] = []
+        for r in 0 ..< outDim {
+            var acc: Float = 0
+            for g in 0 ..< nGroups {
+                let s = scales[r * nGroups + g]
+                let b = biases[r * nGroups + g]
+                for j in 0 ..< gs {
+                    let qv = Float(q[r][g * gs + j])
+                    acc += (qv * s + b) * input[g * gs + j]
+                }
+            }
+            expected.append(acc)
+        }
+        let weight = Tensor.empty(shape: [outDim, inDim / 8], dtype: .u32)
+        weight.copyIn(from: packed)
+        let scalesT = Tensor.empty(shape: [outDim, nGroups], dtype: .f32)
+        scalesT.copyIn(from: scales)
+        let biasesT = Tensor.empty(shape: [outDim, nGroups], dtype: .f32)
+        biasesT.copyIn(from: biases)
+        return (weight, scalesT, biasesT, expected)
+    }
+
+    @Test("dequantGemvInt4Two: two projections in one encoder match CPU")
+    func dequantGemvInt4TwoCorrectness() {
+        autoreleasepool {
+            let outDim = 4
+            let inDim = 128
+            let gs = 64
+            let input: [Float] = (0 ..< inDim).map { Float($0) * 0.1 - 6.4 }
+            let p0 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 7, scaleStep: 0.01, biasStep: -0.005, input: input)
+            let p1 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 13, scaleStep: 0.02, biasStep: 0.003, input: input)
+            let inputT = Tensor.empty(shape: [inDim], dtype: .f32)
+            inputT.copyIn(from: input)
+            let out0 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out1 = Tensor.empty(shape: [outDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.dequantGemvInt4Two(
+                    input: inputT,
+                    w0: p0.weight, s0: p0.scales, b0: p0.biases, out0: out0,
+                    w1: p1.weight, s1: p1.scales, b1: p1.biases, out1: out1,
+                    groupSize: gs, on: cb)
+            }
+            let r0 = out0.toArray(as: Float.self)
+            let r1 = out1.toArray(as: Float.self)
+            for i in 0 ..< outDim {
+                #expect(abs(r0[i] - p0.expected[i]) < 1e-2)
+                #expect(abs(r1[i] - p1.expected[i]) < 1e-2)
+            }
+        }
+    }
+
+    @Test("dequantGemvInt4Three: three projections in one encoder match CPU")
+    func dequantGemvInt4ThreeCorrectness() {
+        autoreleasepool {
+            let outDim = 4
+            let inDim = 128
+            let gs = 64
+            let input: [Float] = (0 ..< inDim).map { Float($0) * 0.05 - 3.2 }
+            let p0 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 7, scaleStep: 0.01, biasStep: -0.005, input: input)
+            let p1 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 11, scaleStep: 0.02, biasStep: 0.003, input: input)
+            let p2 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 17, scaleStep: 0.015, biasStep: -0.002, input: input)
+            let inputT = Tensor.empty(shape: [inDim], dtype: .f32)
+            inputT.copyIn(from: input)
+            let out0 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out1 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out2 = Tensor.empty(shape: [outDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.dequantGemvInt4Three(
+                    input: inputT,
+                    w0: p0.weight, s0: p0.scales, b0: p0.biases, out0: out0,
+                    w1: p1.weight, s1: p1.scales, b1: p1.biases, out1: out1,
+                    w2: p2.weight, s2: p2.scales, b2: p2.biases, out2: out2,
+                    groupSize: gs, on: cb)
+            }
+            for i in 0 ..< outDim {
+                #expect(abs(out0.toArray(as: Float.self)[i] - p0.expected[i]) < 1e-2)
+                #expect(abs(out1.toArray(as: Float.self)[i] - p1.expected[i]) < 1e-2)
+                #expect(abs(out2.toArray(as: Float.self)[i] - p2.expected[i]) < 1e-2)
+            }
+        }
+    }
+
+    @Test("dequantGemvInt4Four: four projections in one encoder match CPU")
+    func dequantGemvInt4FourCorrectness() {
+        autoreleasepool {
+            let outDim = 4
+            let inDim = 128
+            let gs = 64
+            let input: [Float] = (0 ..< inDim).map { Float($0) * 0.04 - 2.5 }
+            let p0 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 7, scaleStep: 0.01, biasStep: -0.005, input: input)
+            let p1 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 11, scaleStep: 0.02, biasStep: 0.003, input: input)
+            let p2 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 17, scaleStep: 0.015, biasStep: -0.002, input: input)
+            let p3 = Self.makeInt4Projection(
+                outDim: outDim, inDim: inDim, gs: gs,
+                rowSeed: 23, scaleStep: 0.025, biasStep: 0.001, input: input)
+            let inputT = Tensor.empty(shape: [inDim], dtype: .f32)
+            inputT.copyIn(from: input)
+            let out0 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out1 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out2 = Tensor.empty(shape: [outDim], dtype: .f32)
+            let out3 = Tensor.empty(shape: [outDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.dequantGemvInt4Four(
+                    input: inputT,
+                    w0: p0.weight, s0: p0.scales, b0: p0.biases, out0: out0,
+                    w1: p1.weight, s1: p1.scales, b1: p1.biases, out1: out1,
+                    w2: p2.weight, s2: p2.scales, b2: p2.biases, out2: out2,
+                    w3: p3.weight, s3: p3.scales, b3: p3.biases, out3: out3,
+                    groupSize: gs, on: cb)
+            }
+            for i in 0 ..< outDim {
+                #expect(abs(out0.toArray(as: Float.self)[i] - p0.expected[i]) < 1e-2)
+                #expect(abs(out1.toArray(as: Float.self)[i] - p1.expected[i]) < 1e-2)
+                #expect(abs(out2.toArray(as: Float.self)[i] - p2.expected[i]) < 1e-2)
+                #expect(abs(out3.toArray(as: Float.self)[i] - p3.expected[i]) < 1e-2)
+            }
+        }
+    }
+
+    @Test("dequantGemvInt4Many: N projections with distinct inputs match standalone calls")
+    func dequantGemvInt4ManyCorrectness() {
+        autoreleasepool {
+            // N=3 projections, each with its own input + output.
+            let outDim = 4
+            let inDim = 128
+            let gs = 64
+            let inputs: [[Float]] = [
+                (0 ..< inDim).map { Float($0) * 0.05 - 3.2 },
+                (0 ..< inDim).map { Float($0) * 0.04 - 2.5 },
+                (0 ..< inDim).map { Float($0) * 0.03 - 1.8 },
+            ]
+            var experts: [(weight: Tensor, scales: Tensor, biases: Tensor, expected: [Float])] = []
+            for i in 0 ..< 3 {
+                let p = Self.makeInt4Projection(
+                    outDim: outDim, inDim: inDim, gs: gs,
+                    rowSeed: 7 + i * 5, scaleStep: 0.01 + Float(i) * 0.005,
+                    biasStep: -0.005 + Float(i) * 0.002, input: inputs[i])
+                experts.append(p)
+            }
+            var inputTs: [Tensor] = []
+            for i in 0 ..< 3 {
+                let t = Tensor.empty(shape: [inDim], dtype: .f32)
+                t.copyIn(from: inputs[i])
+                inputTs.append(t)
+            }
+            let outs = (0 ..< 3).map { _ in Tensor.empty(shape: [outDim], dtype: .f32) }
+            runAndWait { cb in
+                Ops.dequantGemvInt4Many(
+                    weights: experts.map { $0.weight },
+                    scales: experts.map { $0.scales },
+                    biases: experts.map { $0.biases },
+                    inputs: inputTs, outputs: outs,
+                    groupSize: gs, on: cb)
+            }
+            for i in 0 ..< 3 {
+                let got = outs[i].toArray(as: Float.self)
+                for j in 0 ..< outDim {
+                    #expect(abs(got[j] - experts[i].expected[j]) < 1e-2)
+                }
+            }
+        }
+    }
+
+    @Test("dequantGemvInt4ExpertIndexed: matches standalone dequantGemvInt4 for the picked expert")
+    func dequantGemvInt4ExpertIndexedCorrectness() {
+        autoreleasepool {
+            let nExperts = 4
+            let outDim = 4
+            let inDim = 128
+            let gs = 64
+            let input: [Float] = (0 ..< inDim).map { Float($0) * 0.05 - 3.2 }
+            // Build per-expert weight tensors AND a stacked weight tensor
+            // that concatenates each expert's slab.
+            var experts: [(weight: Tensor, scales: Tensor, biases: Tensor, expected: [Float])] = []
+            for e in 0 ..< nExperts {
+                let p = Self.makeInt4Projection(
+                    outDim: outDim, inDim: inDim, gs: gs,
+                    rowSeed: 7 + e * 5, scaleStep: 0.01 + Float(e) * 0.005,
+                    biasStep: -0.005 + Float(e) * 0.002, input: input)
+                experts.append(p)
+            }
+            // Stack: [nExperts, outDim, inDim/8]
+            let packedPerRow = inDim / 8
+            let nGroups = inDim / gs
+            let weightsStacked = Tensor.empty(
+                shape: [nExperts, outDim, packedPerRow], dtype: .u32)
+            let scalesStacked = Tensor.empty(
+                shape: [nExperts, outDim, nGroups], dtype: .f32)
+            let biasesStacked = Tensor.empty(
+                shape: [nExperts, outDim, nGroups], dtype: .f32)
+            // Repack by copying each expert's data into the stacked tensor.
+            var packedAll: [UInt32] = []
+            var scalesAll: [Float] = []
+            var biasesAll: [Float] = []
+            for e in 0 ..< nExperts {
+                packedAll.append(contentsOf: experts[e].weight.toArray(as: UInt32.self))
+                scalesAll.append(contentsOf: experts[e].scales.toArray(as: Float.self))
+                biasesAll.append(contentsOf: experts[e].biases.toArray(as: Float.self))
+            }
+            weightsStacked.copyIn(from: packedAll)
+            scalesStacked.copyIn(from: scalesAll)
+            biasesStacked.copyIn(from: biasesAll)
+
+            let inputT = Tensor.empty(shape: [inDim], dtype: .f32)
+            inputT.copyIn(from: input)
+
+            // Pick expert 2.
+            let pick: UInt32 = 2
+            let pickT = Tensor.empty(shape: [1], dtype: .u32)
+            pickT.copyIn(from: [pick])
+            let out = Tensor.empty(shape: [outDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.dequantGemvInt4ExpertIndexed(
+                    weightsStacked: weightsStacked,
+                    scalesStacked: scalesStacked,
+                    biasesStacked: biasesStacked,
+                    input: inputT, expertIndex: pickT,
+                    groupSize: gs, on: cb, into: out)
+            }
+            let got = out.toArray(as: Float.self)
+            let want = experts[Int(pick)].expected
+            for i in 0 ..< outDim {
+                #expect(abs(got[i] - want[i]) < 1e-2, "row \(i)")
+            }
+        }
+    }
+
+    @Test("moeRouterTopK f32 — top-K of (1, 5, 3, 4) at k=2 picks indices [1, 3]")
+    func moeRouterTopKDeterministic() {
+        autoreleasepool {
+            // norm_topk_prob = true → weights are softmax over the two
+            // selected logits and renormalise to 1.0. With logits
+            // (1, 5, 3, 4), the top-2 are indices 1 and 3 (values 5, 4).
+            // softmax([5, 4]) = (e^5, e^4) / (e^5 + e^4) ≈ (0.731, 0.269).
+            let nExperts = 4
+            let k = 2
+            let logits = Tensor.empty(shape: [nExperts], dtype: .f32)
+            logits.copyIn(from: [Float(1), 5, 3, 4])
+            let indicesOut = Tensor.empty(shape: [k], dtype: .u32)
+            let weightsOut = Tensor.empty(shape: [k], dtype: .f32)
+            runAndWait { cb in
+                Ops.moeRouterTopK(
+                    logits: logits,
+                    indicesOut: indicesOut, weightsOut: weightsOut,
+                    nExperts: nExperts, k: k, normTopkProb: true, on: cb)
+            }
+            let idx = indicesOut.toArray(as: UInt32.self)
+            let wts = weightsOut.toArray(as: Float.self)
+            #expect(Set(idx) == Set([UInt32(1), 3]))
+            // Sum should be ~1.0 (norm_topk_prob).
+            #expect(abs(wts[0] + wts[1] - 1.0) < 1e-3)
+            // Index 1 has the larger logit so its weight should dominate.
+            let weightOf1 = idx[0] == 1 ? wts[0] : wts[1]
+            #expect(weightOf1 > 0.7)
         }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2026 Eric Kryski (@ekryski)
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -107,6 +107,93 @@ struct OpsTests {
             // Dims [2,4) are outside rotaryDim → untouched pass-through.
             #expect(abs(r[2] - 7) < 1e-5)
             #expect(abs(r[3] - 9) < 1e-5)
+        }
+    }
+
+    @Test("ropePartialTwo f32 — same result as two sequential ropePartial calls")
+    func ropePartialTwoMatchesSequential() {
+        autoreleasepool {
+            let headDim = 4
+            let rotaryDim = 2
+            let q0 = Tensor.empty(shape: [headDim], dtype: .f32)
+            q0.copyIn(from: [Float(1), 0, 7, 9])
+            let k0 = Tensor.empty(shape: [headDim], dtype: .f32)
+            k0.copyIn(from: [Float(0), 1, -3, 4])
+            let q1 = Tensor.empty(shape: [headDim], dtype: .f32)
+            q1.copyIn(from: [Float(1), 0, 7, 9])
+            let k1 = Tensor.empty(shape: [headDim], dtype: .f32)
+            k1.copyIn(from: [Float(0), 1, -3, 4])
+            // Reference: two independent ropePartial calls.
+            runAndWait { cb in
+                Ops.ropePartial(
+                    q0, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+                Ops.ropePartial(
+                    k0, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+            }
+            // Batched: one-encoder, two dispatches.
+            runAndWait { cb in
+                Ops.ropePartialTwo(
+                    q1, k1, position: 3, headDim: headDim, rotaryDim: rotaryDim,
+                    thetaBase: 10000, on: cb)
+            }
+            let r0q = q0.toArray(as: Float.self)
+            let r0k = k0.toArray(as: Float.self)
+            let r1q = q1.toArray(as: Float.self)
+            let r1k = k1.toArray(as: Float.self)
+            for i in 0 ..< headDim {
+                #expect(abs(r0q[i] - r1q[i]) < 1e-5, "q[\(i)]: \(r0q[i]) vs \(r1q[i])")
+                #expect(abs(r0k[i] - r1k[i]) < 1e-5, "k[\(i)]: \(r0k[i]) vs \(r1k[i])")
+            }
+        }
+    }
+
+    @Test("ropePartialMany f32 — T=3 matches three sequential ropePartial calls")
+    func ropePartialManyMatchesSequential() {
+        autoreleasepool {
+            let t = 3
+            let nHeads = 2
+            let headDim = 4
+            let rotaryDim = 2
+            let rowStride = nHeads * headDim
+            let total = t * rowStride
+            let data: [Float] = (0 ..< total).map { Float($0 + 1) * 0.1 }
+            // Reference: T sequential single-token rotations against
+            // T separate buffers (positions 0, 1, 2).
+            var refRows: [[Float]] = []
+            for tt in 0 ..< t {
+                let slice = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+                slice.copyIn(from: Array(data[tt * rowStride ..< (tt + 1) * rowStride]))
+                runAndWait { cb in
+                    Ops.ropePartial(
+                        slice, position: tt, headDim: headDim, rotaryDim: rotaryDim,
+                        thetaBase: 10000, on: cb)
+                }
+                refRows.append(slice.toArray(as: Float.self))
+            }
+            // Batched: single dispatch with positions [0, 1, 2].
+            let qk = Tensor.empty(shape: [t, nHeads, headDim], dtype: .f32)
+            qk.copyIn(from: data)
+            let positions = Tensor.empty(shape: [t], dtype: .u32)
+            positions.copyIn(from: (0 ..< t).map { UInt32($0) })
+            runAndWait { cb in
+                Ops.ropePartialMany(
+                    qk, positions: positions,
+                    t: t, nHeads: nHeads,
+                    headDim: headDim, rotaryDim: rotaryDim,
+                    rowStride: rowStride,
+                    thetaBase: 10000, on: cb)
+            }
+            let got = qk.toArray(as: Float.self)
+            for tt in 0 ..< t {
+                let row = refRows[tt]
+                for i in 0 ..< rowStride {
+                    #expect(
+                        abs(got[tt * rowStride + i] - row[i]) < 1e-5,
+                        "t=\(tt) i=\(i): \(got[tt * rowStride + i]) vs \(row[i])")
+                }
+            }
         }
     }
 
@@ -226,6 +313,29 @@ struct OpsTests {
             runAndWait { cb in out = Ops.gather(table: table, tokenIds: ids, on: cb) }
             #expect(out.shape == [2, 2])
             #expect(out.toArray(as: Float.self) == [30, 31, 10, 11])
+        }
+    }
+
+    @Test("gatherTwo f32 — two ids streams against one table on one encoder")
+    func gatherTwoF32() {
+        autoreleasepool {
+            let table = Tensor.empty(shape: [3, 2], dtype: .f32)
+            table.copyIn(from: [Float(10), 11, 20, 21, 30, 31])
+            let ids1 = Tensor.empty(shape: [2], dtype: .u32)
+            ids1.copyIn(from: [UInt32(2), 0])
+            let ids2 = Tensor.empty(shape: [3], dtype: .u32)
+            ids2.copyIn(from: [UInt32(1), 1, 2])
+            let out1 = Tensor.empty(shape: [2, 2], dtype: .f32)
+            let out2 = Tensor.empty(shape: [3, 2], dtype: .f32)
+            runAndWait { cb in
+                Ops.gatherTwo(
+                    table: table,
+                    ids1: ids1, into: out1,
+                    ids2: ids2, into: out2,
+                    on: cb)
+            }
+            #expect(out1.toArray(as: Float.self) == [30, 31, 10, 11])
+            #expect(out2.toArray(as: Float.self) == [20, 21, 20, 21, 30, 31])
         }
     }
 
@@ -353,6 +463,67 @@ struct OpsTests {
                 #expect(
                     abs(result[i] - expected) < 1e-2,
                     "i=\(i) got \(result[i]) expected \(expected)")
+            }
+        }
+    }
+
+    @Test("rmsNormRowsTwo f32 — matches two sequential rmsNormRows calls")
+    func rmsNormRowsTwoMatchesSequential() {
+        autoreleasepool {
+            let n1 = 128
+            let n2 = 256
+            let rows = 1
+            let xs1: [Float] = (0 ..< n1 * rows).map { Float($0 + 1) }
+            let ws1: [Float] = (0 ..< n1).map { 1.0 + Float($0 % 7) * 0.05 }
+            let xs2: [Float] = (0 ..< n2 * rows).map { Float($0 + 1) * 0.3 }
+            let ws2: [Float] = (0 ..< n2).map { 1.0 + Float($0 % 11) * 0.03 }
+            // Reference: two sequential single-row rmsNormRows calls.
+            let x1Ref = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            x1Ref.copyIn(from: xs1)
+            let w1Ref = Tensor.empty(shape: [n1], dtype: .f32)
+            w1Ref.copyIn(from: ws1)
+            let x2Ref = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            x2Ref.copyIn(from: xs2)
+            let w2Ref = Tensor.empty(shape: [n2], dtype: .f32)
+            w2Ref.copyIn(from: ws2)
+            var ref1: Tensor!
+            var ref2: Tensor!
+            runAndWait { cb in
+                ref1 = Ops.rmsNormRows(
+                    x1Ref, weight: w1Ref, eps: 1e-6,
+                    nRows: rows, rowSize: n1, on: cb)
+                ref2 = Ops.rmsNormRows(
+                    x2Ref, weight: w2Ref, eps: 1e-6,
+                    nRows: rows, rowSize: n2, on: cb)
+            }
+            // Batched: same eps so the wrapper shares one alloc.
+            let x1 = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            x1.copyIn(from: xs1)
+            let w1 = Tensor.empty(shape: [n1], dtype: .f32)
+            w1.copyIn(from: ws1)
+            let x2 = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            x2.copyIn(from: xs2)
+            let w2 = Tensor.empty(shape: [n2], dtype: .f32)
+            w2.copyIn(from: ws2)
+            let out1 = Tensor.empty(shape: [rows, n1], dtype: .f32)
+            let out2 = Tensor.empty(shape: [rows, n2], dtype: .f32)
+            runAndWait { cb in
+                Ops.rmsNormRowsTwo(
+                    x1, weight: w1, eps1: 1e-6,
+                    nRows1: rows, rowSize1: n1, into: out1,
+                    x2, weight: w2, eps2: 1e-6,
+                    nRows2: rows, rowSize2: n2, into: out2,
+                    on: cb)
+            }
+            let r1Ref = ref1.toArray(as: Float.self)
+            let r2Ref = ref2.toArray(as: Float.self)
+            let r1 = out1.toArray(as: Float.self)
+            let r2 = out2.toArray(as: Float.self)
+            for i in 0 ..< n1 {
+                #expect(abs(r1[i] - r1Ref[i]) < 1e-4, "norm1[\(i)]: \(r1[i]) vs \(r1Ref[i])")
+            }
+            for i in 0 ..< n2 {
+                #expect(abs(r2[i] - r2Ref[i]) < 1e-4, "norm2[\(i)]: \(r2[i]) vs \(r2Ref[i])")
             }
         }
     }
@@ -923,6 +1094,222 @@ struct OpsTests {
             let cmd = Device.shared.makeCommandBuffer()
             // Full (non-causal) mode → every query attends all 4 V rows,
             // so each output element is mean(0,1,2,3) = 1.5.
+            let out = Ops.sdpaMulti(
+                q: q, k: k, v: v,
+                nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                causal: false, scale: scale, on: cmd)
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let result = out.toArray(as: Float.self)
+            #expect(result.count == nQuery * nQHeads * headDim)
+            for value in result {
+                #expect(abs(value - 1.5) < 1e-3, "expected mean V = 1.5, got \(value)")
+            }
+        }
+    }
+
+    @Test("sdpaDecode2Pass f32 — blocks=32 matches single-pass sdpaDecode")
+    func sdpaDecode2PassMatchesSinglePass() {
+        autoreleasepool {
+            // pass2 hardcodes a 32-lane block reduction, so blocks
+            // must be ≥ 32 and a multiple of 32 — anything smaller
+            // silently emits zero output.
+            let D = 128
+            let blocks = 32
+            let kvStride = 64
+            let nKV = 64
+            let nQHeads = 2
+            let nKVHeads = 1
+            let q = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            var qData = [Float](repeating: 0, count: nQHeads * D)
+            for h in 0 ..< nQHeads {
+                qData[h * D] = Float(h + 1)
+                qData[h * D + 1] = 0.5
+            }
+            q.copyIn(from: qData)
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            var kData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for p in 0 ..< nKV {
+                kData[p * D] = Float(p + 1) * 0.05
+                kData[p * D + 1] = 0.1
+            }
+            k.copyIn(from: kData)
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, D], dtype: .f32)
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * D)
+            for p in 0 ..< nKV {
+                for d in 0 ..< D {
+                    vData[p * D + d] = Float((p + 1) * (d + 1)) * 0.01
+                }
+            }
+            v.copyIn(from: vData)
+            // Reference.
+            var refOut: Tensor!
+            runAndWait { cb in
+                refOut = Ops.sdpaDecode(
+                    q: q, k: k, v: v,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads,
+                    headDim: D, nKV: nKV, kvStride: kvStride,
+                    scale: 1.0, on: cb)
+            }
+            // 2-pass.
+            let partialO = Tensor.empty(shape: [nQHeads, blocks, D], dtype: .f32)
+            let partialM = Tensor.empty(shape: [nQHeads, blocks], dtype: .f32)
+            let partialL = Tensor.empty(shape: [nQHeads, blocks], dtype: .f32)
+            let out = Tensor.empty(shape: [nQHeads, D], dtype: .f32)
+            partialO.zero()
+            partialM.zero()
+            partialL.zero()
+            out.zero()
+            runAndWait { cb in
+                Ops.sdpaDecode2Pass(
+                    q: q, k: k, v: v,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: D,
+                    nKV: nKV, kvStride: kvStride, blocks: blocks,
+                    scale: 1.0,
+                    partialO: partialO, partialM: partialM, partialL: partialL,
+                    into: out, on: cb)
+            }
+            let r = out.toArray(as: Float.self)
+            let ref = refOut.toArray(as: Float.self)
+            for i in 0 ..< nQHeads * D {
+                #expect(abs(r[i] - ref[i]) < 1e-2, "i=\(i): \(r[i]) vs \(ref[i])")
+            }
+        }
+    }
+
+    @Test("sdpaMultiTreeMask — all-zero mask reproduces non-causal sdpaMulti output")
+    func sdpaMultiTreeMaskAllowAll() {
+        autoreleasepool {
+            // An all-zero additive mask permits every position →
+            // attention behaves exactly like causal=false sdpaMulti.
+            let headDim = 128
+            let nQHeads = 2
+            let nKVHeads = 1
+            let baseKV = 0
+            let nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0 ..< nQuery * nQHeads * headDim).map { Float($0 % 7) * 0.1 })
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0 ..< kvStride {
+                for d in 0 ..< headDim { vData[t * headDim + d] = Float(t) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+            // Reference: plain non-causal sdpaMulti.
+            var refOut: Tensor!
+            runAndWait { cb in
+                refOut = Ops.sdpaMulti(
+                    q: q, k: k, v: v,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                    causal: false, scale: scale, on: cb)
+            }
+            // Tree-mask path: all-zero mask = permit everywhere.
+            let mask = Tensor.empty(shape: [nQuery, nQuery], dtype: .f32)
+            mask.copyIn(from: [Float](repeating: 0, count: nQuery * nQuery))
+            var got: Tensor!
+            runAndWait { cb in
+                got = Ops.sdpaMultiTreeMask(
+                    q: q, k: k, v: v, mask: mask,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                    scale: scale, on: cb)
+            }
+            let r = refOut.toArray(as: Float.self)
+            let g = got.toArray(as: Float.self)
+            for i in 0 ..< r.count {
+                #expect(abs(r[i] - g[i]) < 1e-3, "i=\(i): \(g[i]) vs \(r[i])")
+            }
+        }
+    }
+
+    @Test("sdpaMultiTreeMask — diagonal -inf mask isolates each query to its own row")
+    func sdpaMultiTreeMaskDiagonalOnly() {
+        autoreleasepool {
+            // Mask = -inf off the diagonal, 0 on the diagonal → each
+            // query attends only its own KV slot (assuming the cache
+            // is full and queries are appended at the end). Outputs
+            // collapse to a copy of the matching V row.
+            let headDim = 128
+            let nQHeads = 1
+            let nKVHeads = 1
+            let baseKV = 0
+            let nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+            // Make every Q row identical and every K row identical so
+            // attention only depends on the mask, not the dot products.
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: [Float](repeating: 0.5, count: nQuery * nQHeads * headDim))
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+            // V row t holds the constant value `t`.
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0 ..< kvStride {
+                for d in 0 ..< headDim { vData[t * headDim + d] = Float(t + 1) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+            let neg: Float = -1e9
+            var maskData = [Float](repeating: neg, count: nQuery * nQuery)
+            for i in 0 ..< nQuery { maskData[i * nQuery + i] = 0 }
+            let mask = Tensor.empty(shape: [nQuery, nQuery], dtype: .f32)
+            mask.copyIn(from: maskData)
+            var got: Tensor!
+            runAndWait { cb in
+                got = Ops.sdpaMultiTreeMask(
+                    q: q, k: k, v: v, mask: mask,
+                    nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    baseKV: baseKV, nQuery: nQuery, kvStride: kvStride,
+                    scale: scale, on: cb)
+            }
+            let g = got.toArray(as: Float.self)
+            for qIdx in 0 ..< nQuery {
+                let expected = Float(qIdx + 1)
+                for d in 0 ..< headDim {
+                    #expect(
+                        abs(g[qIdx * headDim + d] - expected) < 1e-3,
+                        "q=\(qIdx) d=\(d): \(g[qIdx * headDim + d]) vs \(expected)")
+                }
+            }
+        }
+    }
+
+    @Test("sdpaMulti — head_dim 256 routes to d256 kernel (uniform K → mean V)")
+    func sdpaMultiHeadDim256UniformKMeansV() {
+        autoreleasepool {
+            // Identical to the d=128 uniform-K test but at head_dim=256
+            // (Qwen3.6-A3B full-attention layers). Verifies the d256
+            // routing exists and the kernel produces the same uniform-
+            // attention result as the d128 path.
+            let headDim = 256
+            let nQHeads = 2
+            let nKVHeads = 1
+            let baseKV = 0
+            let nQuery = 4
+            let kvStride = baseKV + nQuery
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nQuery, nQHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0 ..< nQuery * nQHeads * headDim).map { Float($0 % 7) * 0.1 })
+
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(from: [Float](repeating: 0.5, count: nKVHeads * kvStride * headDim))
+
+            var vData = [Float](repeating: 0, count: nKVHeads * kvStride * headDim)
+            for t in 0 ..< kvStride {
+                for d in 0 ..< headDim { vData[t * headDim + d] = Float(t) }
+            }
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(from: vData)
+
+            let cmd = Device.shared.makeCommandBuffer()
             let out = Ops.sdpaMulti(
                 q: q, k: k, v: v,
                 nQHeads: nQHeads, nKVHeads: nKVHeads, headDim: headDim,
