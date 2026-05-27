@@ -69,6 +69,11 @@ public final class ConvStateCache: @unchecked Sendable {
 
     /// Copy `state` into a fresh (or cached) snapshot tensor. Used by
     /// spec-decode to roll back the conv rolling window on draft reject.
+    ///
+    /// Reuse contract: this method returns a single per-instance
+    /// scratch tensor. Calling `snapshot()` a second time before
+    /// `restore(from:)` will overwrite the prior snapshot. Nested or
+    /// concurrent snapshot usage on the same cache is not supported.
     public func snapshot(device: Device = .shared) -> Tensor {
         let shape = [kernelSize - 1, nChannels]
         if cachedSnapshot == nil

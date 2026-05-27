@@ -142,6 +142,11 @@ public final class GDNStateCache: LayerCacheProtocol, @unchecked Sendable {
     /// Copy `current` into a fresh (or cached) snapshot tensor. Used
     /// by spec-decode to roll back the recurrent state on draft reject.
     /// Returns the snapshot tensor; caller stores it until needed.
+    ///
+    /// Reuse contract: this method returns a single per-instance
+    /// scratch tensor. Calling `snapshot()` a second time before
+    /// `restore(from:)` will overwrite the prior snapshot. Nested or
+    /// concurrent snapshot usage on the same cache is not supported.
     public func snapshot(device: Device = .shared) -> Tensor {
         let shape = [numValueHeads, valueHeadDim, keyHeadDim]
         if cachedSnapshot == nil {
