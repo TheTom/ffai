@@ -777,7 +777,7 @@ public final class Qwen35DenseMLP: Module {
         return out
     }
 
-    /// down(silu(gate(x)) * up(x)). ITER 16: use fused Ops.swiglu —
+    /// down(silu(gate(x)) * up(x)). Uses fused `Ops.swiglu` —
     /// one dispatch vs silu + mul = two dispatches.
     func forward(_ xNorm: Tensor, cmd: MTLCommandBuffer) -> Tensor {
         let g = gateProj(xNorm, on: cmd)
@@ -824,14 +824,14 @@ public final class Qwen35MoEFFN: Module {
     let sharedExpertGate: AnyLinear
     let hidden: Int
 
-    /// ITER 26/82 (PR10): cached shared-expert scratches. The single-
-    /// token forward fans gate+up + expert-gate qmms through one shared
-    /// encoder; pre-allocating the outputs at instance level avoids per-
-    /// token Tensor.empty allocations.
+    /// Cached shared-expert scratches. The single-token forward fans
+    /// gate+up + expert-gate qmms through one shared encoder; pre-
+    /// allocating the outputs at instance level avoids per-token
+    /// Tensor.empty allocations.
     private var sharedSgScratch: Tensor?
     private var sharedSuScratch: Tensor?
     private var sharedGateLogitScratch: Tensor?
-    /// ITER 34: cached `result` output for the GPU fan-out.
+    /// Cached `result` output for the GPU fan-out.
     private var sharedResultScratch: Tensor?
 
     init(
@@ -871,8 +871,8 @@ public final class Qwen35MoEFFN: Module {
     /// shared expert + the final add run on fresh private buffers, so
     /// the returned tensor never depends on the now-dead `cmd`.
     ///
-    /// ITER 66 (PR10): optional `residual` parameter folds the post-FFN
-    /// residual add into the final `sigmoidScalarFMA` dispatch (becomes
+    /// Optional `residual` parameter folds the post-FFN residual add
+    /// into the final `sigmoidScalarFMA` dispatch (becomes
     /// `sigmoidScalarFMAResidual`). When `residual != nil`, the returned
     /// tensor already includes `residual + routed + sigmoid(gate)·sharedOut`
     /// and the caller MUST NOT do its own `Ops.add(residual, ffnOut)`.
@@ -888,12 +888,10 @@ public final class Qwen35MoEFFN: Module {
             cmd: cmd, device: device)
         // Shared expert on a fresh buffer.
         let work = device.makeCommandBuffer()
-        // ITER 26: batch sharedGate + sharedUp qmms onto one shared
-        // encoder via dequantGemvInt4Two when both are int4.
-        // ITER 82: also fold sharedExpertGate (an int4 qmm producing a
-        // single scalar from the same `xNorm`) into the SAME shared
-        // encoder via dequantGemvInt4Three. Saves another encoder
-        // begin/end per MoE layer × 40 ≈ 40 pairs / decode token.
+        // Batch sharedGate + sharedUp + sharedExpertGate (3 int4 qmms
+        // sharing the same `xNorm`) onto ONE shared encoder via
+        // dequantGemvInt4Three. Saves ~40 encoder begin/end pairs per
+        // decode token on Qwen3.6-A3B (40 layers × one pair each).
         let sg: Tensor
         let su: Tensor
         let gateLogit: Tensor
@@ -958,13 +956,13 @@ public final class Qwen35MoEFFN: Module {
             su = sharedUpProj(xNorm, on: work)
             gateLogit = sharedExpertGate(xNorm, on: work)
         }
-        // ITER 16: fused SwiGLU.
+        // Fused SwiGLU.
         let sharedInner = Ops.swiglu(gate: sg, up: su, on: work)
         let sharedOut = sharedDownProj(sharedInner, on: work)
         work.commit()
 
         // GPU fan-out: `out = routed + sigmoid(gateLogit) * sharedOut`
-        // (+ residual when ITER 66 is in play) in one dispatch.
+        // (+ residual when the caller passes one) in one dispatch.
         let fmaCmd = device.makeCommandBuffer()
         if sharedResultScratch == nil
             || sharedResultScratch!.dtype != routed.dtype
@@ -975,7 +973,7 @@ public final class Qwen35MoEFFN: Module {
         }
         let result = sharedResultScratch!
         if let residual = residual {
-            // ITER 66: fused 4-input. result = residual + routed +
+            // Fused 4-input. result = residual + routed +
             // sigmoid(gateLogit) · sharedOut. Saves 1 dispatch + 1
             // [hidden] DRAM roundtrip vs sigmoidScalarFMA then Ops.add.
             Ops.sigmoidScalarFMAResidual(
@@ -1013,7 +1011,7 @@ public final class Qwen35MoEFFN: Module {
         let xRows = xNormFlat.reshaped(to: [t, hidden])
         let sgAll = sharedGateProj.callMany(xRows, t: t, on: work, device: device)
         let suAll = sharedUpProj.callMany(xRows, t: t, on: work, device: device)
-        // ITER 16: fused SwiGLU.
+        // Fused SwiGLU.
         let sharedInnerAll = Ops.swiglu(gate: sgAll, up: suAll, on: work)
         let sharedOutAll = sharedDownProj.callMany(
             sharedInnerAll, t: t,
@@ -1206,12 +1204,12 @@ public final class Qwen35GDNMixer: Module {
     let yF32Scratch: Tensor
     let yGatedScratch: Tensor
 
-    /// ITER 23 (PR10): batched 4-projection input fast path. When all 4
-    /// inProj are QuantizedLinear int4 with same groupSize, the mixer
-    /// routes through `Ops.dequantGemvInt4Four` — 4 qmms on one shared
+    /// Batched 4-projection input fast path. When all 4 inProj are
+    /// QuantizedLinear int4 with same groupSize, the mixer routes
+    /// through `Ops.dequantGemvInt4Four` — 4 qmms on one shared
     /// encoder. Saves 3 encoder begin/end pairs per GDN layer × 30 ≈
-    /// 1.5 ms/token. Allocated scratch buffers are pinned via the
-    /// residency set in init (ITER 27).
+    /// 1.5 ms/token. Allocated scratch buffers are pinned in the
+    /// device residency set in init.
     private var batchedInputProj:
         (
             qW: Tensor, qS: Tensor, qB: Tensor,
@@ -1224,8 +1222,8 @@ public final class Qwen35GDNMixer: Module {
     private var zScratch: Tensor?
     private var bRawScratch: Tensor?
     private var aRawScratch: Tensor?
-    /// ITER 95 (PR10): single-dispatch `ffai_batched_4_qgemv_fast` fast
-    /// path. Constraints: in_dim%512==0, each out_dim%8==0, groupSize=64.
+    /// Single-dispatch `ffai_batched_4_qgemv_fast` fast path.
+    /// Constraints: in_dim%512==0, each out_dim%8==0, groupSize=64.
     private var fused4Eligible: Bool = false
 
     init(
@@ -1275,9 +1273,9 @@ public final class Qwen35GDNMixer: Module {
         self.aLogTF32 = makeF32Tensor35(aLog, device: device)
         self.dtBiasTF32 = makeF32Tensor35(dtBias, device: device)
         self.epsBufFused = makeF32Tensor35([eps], device: device)
-        // ITER 19 (PR10): fused-prep is DEFAULT ON for Qwen3.6-A3B. The
-        // legacy host-loop path lives behind `FFAI_GDN_NO_FUSED_PREP=1`
-        // for precision comparison.
+        // Fused-prep is DEFAULT ON for Qwen3.6-A3B. The legacy host-loop
+        // path lives behind `FFAI_GDN_NO_FUSED_PREP=1` for precision
+        // comparison.
         self.fused =
             ProcessInfo.processInfo.environment["FFAI_GDN_NO_FUSED_PREP"] == nil
 
@@ -1292,9 +1290,10 @@ public final class Qwen35GDNMixer: Module {
             dtype: .f32, device: device)
         self.yGatedScratch = Tensor.empty(shape: [valueDim], dtype: dtype, device: device)
 
-        // ITER 23 (PR10): set up the batched 4-projection input fast
-        // path when all 4 inProj are QuantizedLinear int4 with same
-        // groupSize. ITER 27: pin scratches in the residency set.
+        // Set up the batched 4-projection input fast path when all 4
+        // inProj are QuantizedLinear int4 with the same groupSize, and
+        // pin scratches in the device residency set so Metal skips
+        // per-encoder residency revalidation.
         if let qQL = inProjQKV.inner as? QuantizedLinear,
             let zQL = inProjZ.inner as? QuantizedLinear,
             let bQL = inProjB.inner as? QuantizedLinear,
@@ -1311,7 +1310,7 @@ public final class Qwen35GDNMixer: Module {
                 aW: aQL.weight, aS: aQL.scales, aB: aQL.biases,
                 groupSize: qQL.groupSize
             )
-            // ITER 95: single-dispatch fast path eligibility.
+            // Single-dispatch fast path eligibility.
             let inDim = qQL.weight.shape[1] * 8
             if inDim % 512 == 0
                 && convDim % 8 == 0 && valueDim % 8 == 0
@@ -1329,7 +1328,7 @@ public final class Qwen35GDNMixer: Module {
                 shape: [numValueHeads], dtype: dtype, device: device)
             self.aRawScratch = Tensor.empty(
                 shape: [numValueHeads], dtype: dtype, device: device)
-            // ITER 27: pin scratch buffers + fused-path constants so Metal
+            // Pin scratch buffers + fused-path constants so Metal
             // skips per-encoder residency revalidation.
             device.markWeightsResident([
                 qkvScratch!.buffer, zScratch!.buffer,
@@ -1375,10 +1374,10 @@ public final class Qwen35GDNMixer: Module {
         cmd: MTLCommandBuffer, device: Device
     ) -> Tensor {
         // ── GPU phase 1: projections + conv + SiLU ────────────────────
-        // ITER 23 (PR10): 4-projection shared-encoder fast path when all
-        // inProj are int4 QuantizedLinear with same groupSize. Saves 3
-        // encoder begin/end pairs per GDN layer × 30 ≈ 1.5 ms/token.
-        // ITER 95: single-dispatch fast path via `batched4QgemvInt4Fast`
+        // 4-projection shared-encoder fast path when all inProj are int4
+        // QuantizedLinear with the same groupSize. Saves 3 encoder
+        // begin/end pairs per GDN layer × 30 ≈ 1.5 ms/token. Upgrades
+        // to a single-dispatch fast path via `batched4QgemvInt4Fast`
         // when constraints match (out_dim%8, in_dim%512, groupSize=64).
         let qkv: Tensor
         let z: Tensor
@@ -1417,11 +1416,11 @@ public final class Qwen35GDNMixer: Module {
             x: qkv, w: convW, b: convB,
             state: cache.conv.state, into: convOutScratch,
             nChannels: convDim, kernelSize: convKernel, on: cmd)
-        // ITER 81 (PR10): in the fused path the convOut silu + cast to
-        // f32 fuse with the aRaw / bRaw casts via
-        // `siluCastF32PlusCastF32Two` later on the same shared encoder.
-        // Outside the fused path the legacy host phase still needs the
-        // bf16 silu output, so compute it eagerly there.
+        // In the fused path the convOut silu + cast to f32 fuse with
+        // the aRaw / bRaw casts via `siluCastF32PlusCastF32Two` later
+        // on the same shared encoder. Outside the fused path the
+        // legacy host phase still needs the bf16 silu output, so
+        // compute it eagerly there.
         let convAct: Tensor
         if fused {
             // Fused path: skip the silu here; the combined
@@ -1457,10 +1456,10 @@ public final class Qwen35GDNMixer: Module {
             // fused step runs the recurrence in fp32 against the
             // existing fp32 state slots, matching the canonical
             // precision of the legacy path.
-            // ITER 81 (PR10): collapse silu+cast (convOut → f32) AND
-            // the two plain casts (aRaw, bRaw → f32) onto ONE shared
-            // encoder. Saves 1 encoder begin/end per GDN layer × 30 ≈
-            // 30 pairs per decode token.
+            // Collapse silu+cast (convOut → f32) AND the two plain
+            // casts (aRaw, bRaw → f32) onto ONE shared encoder. Saves
+            // 1 encoder begin/end per GDN layer × 30 ≈ 30 pairs per
+            // decode token.
             Ops.siluCastF32PlusCastF32Two(
                 siluIn: convOutScratch, into: convActF32Scratch,
                 aRaw, into: aRawF32Scratch,
@@ -1651,8 +1650,8 @@ public final class Qwen35GDNMixer: Module {
             "Qwen35GDNMixer.forwardMany: xNormFlat size \(xNormFlat.elementCount) ≠ T·hidden = \(t * hidden)"
         )
 
-        // PR10: chunked prep+recurrence is the default route. Replaces
-        // the per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
+        // Chunked prep+recurrence is the default route. Replaces the
+        // per-token T-loop body with one `Ops.gatedDeltaPrepChunk`
         // dispatch — state register-resident across the full T-sweep.
         // Opt out via FFAI_GDN_NO_PREP_CHUNK=1 for A/B benching.
         if ProcessInfo.processInfo.environment["FFAI_GDN_NO_PREP_CHUNK"] == nil {
@@ -1669,9 +1668,8 @@ public final class Qwen35GDNMixer: Module {
         let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
         let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
 
-        // ITER 87 (PR10) preview: a_raw / b_raw → f32 once via
-        // shared-encoder `castToF32Two`, then per-row slices alias into
-        // the pre-cast f32 storage.
+        // a_raw / b_raw → f32 once via shared-encoder `castToF32Two`,
+        // then per-row slices alias into the pre-cast f32 storage.
         let aRawF32All = Tensor.empty(
             shape: [t * numValueHeads], dtype: .f32, device: device)
         let bRawF32All = Tensor.empty(
@@ -1749,7 +1747,7 @@ public final class Qwen35GDNMixer: Module {
     /// once, sweeps T tokens, stores state once. State traffic per layer
     /// drops from `T × (load + store)` to `1 × (load + store)`.
     ///
-    /// Conv1d still loops T times unless ITER 99's batched
+    /// Conv1d still loops T times unless the batched
     /// `conv1dCausalStepSiluCastMany` kernel applies (convKernel == 4),
     /// in which case all T conv1d_steps fuse with silu+cast into ONE
     /// dispatch and conv state stays in per-channel registers.
@@ -1773,8 +1771,8 @@ public final class Qwen35GDNMixer: Module {
         let bRawAll = inProjB.callMany(xNormFlat, t: t, on: cmd, device: device)
         let aRawAll = inProjA.callMany(xNormFlat, t: t, on: cmd, device: device)
 
-        // ITER 87 (PR10): a_raw / b_raw → f32 once on ONE shared encoder
-        // via `castToF32Two`. Saves one encoder begin/end pair per GDN
+        // a_raw / b_raw → f32 once on ONE shared encoder via
+        // `castToF32Two`. Saves one encoder begin/end pair per GDN
         // layer × 30 = 30 pairs/prefill.
         let aRawF32All = Tensor.empty(
             shape: [t * numValueHeads], dtype: .f32, device: device)
@@ -1786,7 +1784,7 @@ public final class Qwen35GDNMixer: Module {
             on: cmd)
 
         // ── Conv1d + silu+cast → `[T, convDim]` f32 staging buffer ──────
-        // ITER 99 (PR10): when conv_kernel = 4, the batched
+        // When conv_kernel = 4, the batched
         // `conv1dCausalStepSiluCastMany` kernel sweeps all T tokens in
         // ONE dispatch with the conv state held in per-channel registers
         // across the sweep — state read once at start, written once at
@@ -1856,8 +1854,8 @@ public final class Qwen35GDNMixer: Module {
         for _ in 0 ..< t { cache.advance() }
 
         // ── Mixer norm T-batched (one dispatch across T·Hv rows) ────────
-        // ITER (PR10): `gatedMixerNormMany` collapses T per-row
-        // dispatches into one shared-encoder dispatch.
+        // `gatedMixerNormMany` collapses T per-row dispatches into one
+        // shared-encoder dispatch.
         let yGatedAll = Tensor.empty(
             shape: [t * valueDim], dtype: dt, device: device)
         Ops.gatedMixerNormMany(
@@ -1894,14 +1892,14 @@ public final class Qwen35AttentionMixer: Module {
     let ropeTheta: Float
     let attnOutputGate: Bool
     let scale: Float
-    /// ITER 22 (PR10): cached row-index tensors for sliceHeadHalves35.
-    /// The indices are constant per `nHeads` (even rows = queries, odd
-    /// rows = gates) — previously rebuilt + memcpy'd into a fresh
-    /// MTLBuffer per attn layer per decode token.
+    /// Cached row-index tensors for sliceHeadHalves35. The indices are
+    /// constant per `nHeads` (even rows = queries, odd rows = gates) —
+    /// previously rebuilt + memcpy'd into a fresh MTLBuffer per attn
+    /// layer per decode token.
     let sliceFirstIdx: Tensor?  // [nHeads] u32 — 0, 2, 4, ...
     let sliceSecondIdx: Tensor?  // [nHeads] u32 — 1, 3, 5, ...
-    /// ITER 24 (PR10): batched QKV-projection fast-path detection. When
-    /// all 3 projections (q, k, v) are QuantizedLinear int4 with same
+    /// Batched QKV-projection fast-path detection. When all 3
+    /// projections (q, k, v) are QuantizedLinear int4 with the same
     /// groupSize, the mixer routes through `Ops.dequantGemvInt4Three`
     /// — 3 qmms on one shared encoder.
     private var batchedQKV:
@@ -1914,25 +1912,25 @@ public final class Qwen35AttentionMixer: Module {
     private var qOutScratch: Tensor?
     private var kOutScratch: Tensor?
     private var vOutScratch: Tensor?
-    /// ITER 78 (PR10): fused-QKV single-dispatch fast path. When set,
-    /// `forward` uses `Ops.batchedQkvQgemvInt4Fast` (1 dispatch) instead
-    /// of `dequantGemvInt4Three` (3 dispatches on shared encoder).
+    /// Fused-QKV single-dispatch fast path. When set, `forward` uses
+    /// `Ops.batchedQkvQgemvInt4Fast` (1 dispatch) instead of
+    /// `dequantGemvInt4Three` (3 dispatches on shared encoder).
     /// Backing scratch is one contiguous `[qDim+kDim+vDim]` buffer.
     private var fusedQKVEligible: Bool = false
     private var qkvFusedScratch: Tensor?
-    /// ITER 35 (PR10): cached q_norm + k_norm outputs (was fresh per call).
+    /// Cached q_norm + k_norm outputs (was fresh per call).
     private var qNormedScratch: Tensor?
     private var kNormedScratch: Tensor?
-    /// ITER 40 (PR10): cached sliceHeadHalves35 gather outputs.
+    /// Cached sliceHeadHalves35 gather outputs.
     private var queriesScratch: Tensor?
     private var gateSliceScratch: Tensor?
-    /// ITER 43 (PR10): cached sdpaDecode output + sigmoidMul output.
+    /// Cached sdpaDecode output + sigmoidMul output.
     private var attnOutScratch: Tensor?
     private var attnFlatGatedScratch: Tensor?
-    /// ITER 53 (PR10): cached Flash-Decoding 2-pass partial buffers.
-    /// Allocated lazily on first 2-pass dispatch (when kv.length ≥
-    /// threshold). Sized for (nHeads, blocks=32, headDim) — ~192KB
-    /// per attn layer on Qwen3.6 bf16.
+    /// Cached Flash-Decoding 2-pass partial buffers. Allocated lazily
+    /// on first 2-pass dispatch (when kv.length ≥ threshold). Sized for
+    /// (nHeads, blocks=32, headDim) — ~192KB per attn layer on
+    /// Qwen3.6 bf16.
     private var partialOScratch: Tensor?
     private var partialMScratch: Tensor?
     private var partialLScratch: Tensor?
@@ -1967,7 +1965,7 @@ public final class Qwen35AttentionMixer: Module {
         self.attnOutputGate = attnOutputGate
         self.scale = 1.0 / Float(Double(headDim).squareRoot())
         if attnOutputGate {
-            // ITER 22: pre-build the row-index tensors for the gate split
+            // Pre-build the row-index tensors for the gate-split
             // gather. Even rows = queries, odd rows = gates.
             var firstRows = [UInt32](repeating: 0, count: nHeads)
             var secondRows = [UInt32](repeating: 0, count: nHeads)
@@ -1987,13 +1985,13 @@ public final class Qwen35AttentionMixer: Module {
                 buffer: firstBuf, offset: 0, shape: [nHeads], dtype: .u32)
             self.sliceSecondIdx = Tensor(
                 buffer: secondBuf, offset: 0, shape: [nHeads], dtype: .u32)
-            // ITER 28: pin idx scratches to the residency set.
+            // Pin idx scratches to the residency set.
             device.markWeightsResident([firstBuf, secondBuf])
         } else {
             self.sliceFirstIdx = nil
             self.sliceSecondIdx = nil
         }
-        // ITER 24: detect batched-qkv fast path.
+        // Detect batched-qkv fast path.
         if let qQL = qProj.inner as? QuantizedLinear,
             let kQL = kProj.inner as? QuantizedLinear,
             let vQL = vProj.inner as? QuantizedLinear,
@@ -2006,8 +2004,8 @@ public final class Qwen35AttentionMixer: Module {
                 vW: vQL.weight, vS: vQL.scales, vB: vQL.biases,
                 groupSize: qQL.groupSize
             )
-            // ITER 78: fused single-dispatch QKV gemv. Constraints:
-            // in_dim multiple of 512, each out_dim multiple of 8,
+            // Fused single-dispatch QKV gemv. Constraints: in_dim
+            // multiple of 512, each out_dim multiple of 8,
             // group_size=64.
             let inDim = qQL.weight.shape[1] * 8
             let qDim = qQL.weight.shape[0]
@@ -2044,9 +2042,9 @@ public final class Qwen35AttentionMixer: Module {
         // q_proj projects 2× heads when attn_output_gate is set: the
         // first `nHeads · headDim` elements are the queries, the second
         // half is the per-head sigmoid gate.
-        // ITER 24 (PR10): batch q+k+v projections into one encoder when
-        // all 3 are QuantizedLinear int4. ITER 78: when constraints
-        // match, fuse all three into a single dispatch.
+        // Batch q+k+v projections into one encoder when all 3 are
+        // QuantizedLinear int4; when the fast-path constraints match,
+        // fuse all three into a single dispatch.
         let qOut: Tensor
         let kPre: Tensor
         let vPre: Tensor
@@ -2055,7 +2053,7 @@ public final class Qwen35AttentionMixer: Module {
             let kDim = bq.kW.shape[0]
             let vDim = bq.vW.shape[0]
             if fusedQKVEligible {
-                // ITER 78: ONE dispatch into a [qDim+kDim+vDim] scratch.
+                // ONE dispatch into a [qDim+kDim+vDim] scratch.
                 // qOut / kPre / vPre are offset views into the same buffer.
                 let total = qDim + kDim + vDim
                 if qkvFusedScratch == nil
@@ -2080,7 +2078,7 @@ public final class Qwen35AttentionMixer: Module {
                     outQ: qDim, outK: kDim, outV: vDim,
                     on: cmd, into: qkvFusedScratch!)
             } else {
-                // Legacy 3-dispatch shared-encoder path (ITER 24).
+                // Legacy 3-dispatch shared-encoder path.
                 if qOutScratch == nil || qOutScratch!.elementCount != qDim {
                     qOutScratch = Tensor.empty(
                         shape: [qDim], dtype: xNorm.dtype, device: device)
@@ -2113,7 +2111,7 @@ public final class Qwen35AttentionMixer: Module {
         if attnOutputGate {
             // Layout is [nHeads, 2 · headDim] — per head the first
             // `headDim` is the query, the next `headDim` the gate.
-            // ITER 22: use cached idx tensors.
+            // Use cached idx tensors.
             let q2 = qOut.reshaped(to: [nHeads, 2 * headDim])
             let table = q2.reshaped(to: [nHeads * 2, headDim])
             if queriesScratch == nil
@@ -2125,8 +2123,8 @@ public final class Qwen35AttentionMixer: Module {
                 gateSliceScratch = Tensor.empty(
                     shape: [nHeads, headDim], dtype: qOut.dtype, device: device)
             }
-            // ITER 65: batched two-gather on shared encoder, saves
-            // 1 encoder begin/end pair per attn layer × 10 = ~170 µs/token.
+            // Batched two-gather on shared encoder, saves 1 encoder
+            // begin/end pair per attn layer × 10 = ~170 µs/token.
             Ops.gatherTwo(
                 table: table,
                 ids1: sliceFirstIdx!, into: queriesScratch!,
@@ -2142,7 +2140,7 @@ public final class Qwen35AttentionMixer: Module {
         let v = vPre
 
         // Per-head q_norm / k_norm (weighted RMSNorm over headDim).
-        // ITER 12 + ITER 35: shared encoder + cached scratches.
+        // Shared encoder + cached scratches.
         if qNormedScratch == nil
             || qNormedScratch!.elementCount != queries.elementCount
             || qNormedScratch!.dtype != queries.dtype
@@ -2162,7 +2160,7 @@ public final class Qwen35AttentionMixer: Module {
             on: cmd)
 
         // Partial RoPE — rotate only the first `rotaryDim` dims of each
-        // head, in place. ITER 21: q + k on shared encoder.
+        // head, in place. q + k on shared encoder.
         Ops.ropePartialTwo(
             qNormed, kNormed, position: position,
             headDim: headDim, rotaryDim: rotaryDim,
@@ -2174,7 +2172,7 @@ public final class Qwen35AttentionMixer: Module {
             vFlat: v.reshaped(to: [nKVHeads, headDim]), on: cmd)
 
         let (cacheK, cacheV) = kv.prepareForAttention(on: cmd)
-        // ITER 43: cached sdpaDecode output + sigmoidMul output scratches.
+        // Cached sdpaDecode output + sigmoidMul output scratches.
         if attnOutScratch == nil
             || attnOutScratch!.elementCount != nHeads * headDim
             || attnOutScratch!.dtype != qNormed.dtype
@@ -2184,9 +2182,9 @@ public final class Qwen35AttentionMixer: Module {
             attnFlatGatedScratch = Tensor.empty(
                 shape: [nHeads * headDim], dtype: qNormed.dtype, device: device)
         }
-        // ITER 53: Flash-Decoding 2-pass at long KV. Splits KV across
-        // `blocks` threadgroups in pass1, merges in pass2. Wins over
-        // single-pass when nKV ≥ ~1024 (default threshold); env var
+        // Flash-Decoding 2-pass at long KV. Splits KV across `blocks`
+        // threadgroups in pass1, merges in pass2. Wins over single-pass
+        // when nKV ≥ ~1024 (default threshold); env var
         // `FFAI_SDPA_2PASS_THRESHOLD` overrides.
         let attnOut: Tensor
         if kv.length >= sdpa2PassThreshold {
@@ -2222,8 +2220,8 @@ public final class Qwen35AttentionMixer: Module {
         }
 
         // Gated output: attnOut * sigmoid(gate), then o_proj.
-        // ITER 11 + 40: fused sigmoidMul via mt_sigmoid_mul into cached
-        // scratch — saves 1 encoder per attn layer × 10 ≈ 170 µs/token.
+        // Fused sigmoidMul via mt_sigmoid_mul into cached scratch —
+        // saves 1 encoder per attn layer × 10 ≈ 170 µs/token.
         var attnFlat = attnOut.reshaped(to: [nHeads * headDim])
         if let gate {
             attnFlat = Ops.sigmoidMul(
@@ -2264,12 +2262,12 @@ public final class Qwen35AttentionMixer: Module {
         let kvDim = nKVHeads * headDim
 
         // ── Projections — fused QKV qmm when constraints match ──────────
-        // ITER 88 (PR10): `Ops.batchedQkvQmmFast` produces all three
-        // Q/K/V projections in ONE dispatch when the three QuantizedLinear
-        // projections share `bits=4`, `groupSize=64`, and `in_dim%512==0`
-        // / `out_*%8==0`. Replaces 3 `callMany` qmm encoders with 1 fused
+        // `Ops.batchedQkvQmmFast` produces all three Q/K/V projections
+        // in ONE dispatch when the three QuantizedLinear projections
+        // share `bits=4`, `groupSize=64`, and `in_dim%512==0` /
+        // `out_*%8==0`. Replaces 3 `callMany` qmm encoders with 1 fused
         // encoder. Predicate is the same `fusedQKVEligible` flag the
-        // single-token path uses (ITER 78).
+        // single-token path uses.
         let qOut: Tensor
         let kOut: Tensor
         let vOut: Tensor
@@ -2299,7 +2297,7 @@ public final class Qwen35AttentionMixer: Module {
         }
 
         // ── Gate split — one shared-encoder gather (vs T) when
-        // attnOutputGate. ITER 74: both halves on a shared encoder via
+        // attnOutputGate. Both halves run on a shared encoder via
         // sliceHeadHalvesManyBoth35.
         let queriesFlat: Tensor  // `[T, nHeads, headDim]` flat
         let gateFlat: Tensor?  // `[T, nHeads, headDim]` flat
@@ -2316,10 +2314,10 @@ public final class Qwen35AttentionMixer: Module {
         }
 
         // ── Q/K norm — one shared encoder over (T·nHeads) + (T·nKVHeads)
-        // rows. ITER 83 (PR10): collapse the two separate `rmsNormRows`
-        // dispatches into one `rmsNormRowsTwo` shared encoder, mirroring
-        // the single-token `forward` path (ITER 12+35). Saves 1 encoder
-        // begin/end per attn-layer prefill call.
+        // rows. Collapses the two separate `rmsNormRows` dispatches into
+        // one `rmsNormRowsTwo` shared encoder, mirroring the single-
+        // token `forward` path. Saves 1 encoder begin/end per attn-
+        // layer prefill call.
         let qNormed = Tensor.empty(
             shape: queriesFlat.shape, dtype: queriesFlat.dtype, device: device)
         let kNormed = Tensor.empty(
@@ -2332,10 +2330,8 @@ public final class Qwen35AttentionMixer: Module {
             on: cmd)
 
         // ── Batched RoPE over all T tokens on ONE shared encoder.
-        // ITER 84: pair Q+K RoPE for each row on the SAME shared encoder
-        // via `ropePartialTwo`. ITER 97: replace the T-loop of
-        // `Ops.ropePartialTwo` calls with ONE `Ops.ropePartialManyTwo`
-        // dispatch over all T tokens. Saves T-1 encoder begin/end pairs
+        // `Ops.ropePartialManyTwo` pairs Q+K RoPE for each of the T
+        // rows in a single dispatch — saves T-1 encoder begin/end pairs
         // per attn layer × 10 ≈ 5100 fewer dispatches at T=512.
         let positions = device.makeBuffer(length: t * 4)
         let positionsPtr = positions.contents().bindMemory(
@@ -2350,7 +2346,7 @@ public final class Qwen35AttentionMixer: Module {
             headDim: headDim, rotaryDim: rotaryDim,
             thetaBase: ropeTheta, on: cmd)
 
-        // ── KV append — ITER 98: batched K+V cache append. Reserves T
+        // ── KV append — batched K+V cache append. Reserves T
         // sequential physical slots on host under lengthLock, then writes
         // K/V for all T tokens via ONE shared encoder + 2 dispatches (vs
         // the T-loop of `kvCacheUpdateKV` paired-encoder calls).
@@ -2361,8 +2357,8 @@ public final class Qwen35AttentionMixer: Module {
             kFlat: kNormed, vFlat: vOut, t: t,
             positions: appendPositions, on: cmd)
 
-        // ── SDPA — ITER 90 / 93: fuse the T-token causal attention into
-        // ONE `Ops.sdpaMulti` dispatch. d=128 wraps `ffai_sdpa_multi`;
+        // ── SDPA — fuse the T-token causal attention into ONE
+        // `Ops.sdpaMulti` dispatch. d=128 wraps `ffai_sdpa_multi`;
         // d=256 (Qwen3.6-A3B full-attention layers) wraps
         // `ffai_sdpa_multi_d256` — same semantics, head_dim-256 2-phase
         // output reduction internally. T-loop `sdpaDecode` fallback only
@@ -2400,8 +2396,8 @@ public final class Qwen35AttentionMixer: Module {
             attnAll = attnAllScratch
         }
 
-        // ── Gated output * o_proj — ITER 14: use fused sigmoidMul on
-        // the prefill path (same kernel as the single-token ITER 11).
+        // ── Gated output * o_proj — fused sigmoidMul on the prefill
+        // path (same kernel as the single-token forward path).
         var attnFlat = attnAll
         if let gateFlat {
             attnFlat = Ops.sigmoidMul(attnFlat, gateFlat, on: cmd)
@@ -2705,7 +2701,7 @@ public final class Qwen35AttentionLayer: Module, DecoderLayer {
     }
 }
 
-// ─── ITER 76 (PR10): finalNorm + lmHead fused dispatch helper ───────
+// ─── finalNorm + lmHead fused dispatch helper ───────────────────────
 //
 // Replaces the 2-dispatch chain `finalNorm(h)` + `lmHead(normed)` with
 // a single `Ops.rmsNormQgemvInt4Fast` dispatch when the lmHead's
@@ -2823,8 +2819,8 @@ private func qwen35ApplyFFN(
         }
         return result
     case .moe(let moe):
-        // Qwen35MoEFFN.forward commits `cmd`. ITER 66 (PR10): fold the
-        // post-FFN residual add into the final sigmoidScalarFMA via
+        // Qwen35MoEFFN.forward commits `cmd`. Folds the post-FFN
+        // residual add into the final sigmoidScalarFMA via
         // `sigmoidScalarFMAResidual` — when this is taken the returned
         // tensor already includes `postMix + routed + sigmoid·shared`.
         return moe.forward(
@@ -3003,8 +2999,8 @@ public final class Qwen35Model: LanguageModel {
         }
 
         // Final norm + lm_head queue onto the caller's pristine `cmd`.
-        // ITER 76 (PR10): fused rmsNorm+qgemv when lmHead is 4-bit
-        // QuantizedLinear with constraints; falls back otherwise.
+        // Fused rmsNorm+qgemv when lmHead is 4-bit QuantizedLinear with
+        // matching constraints; falls back otherwise.
         return qwen35FinalNormLmHead(
             h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
@@ -3241,8 +3237,8 @@ public final class Qwen35Model: LanguageModel {
 
         // ── Final norm + lm_head ─────────────────────────────────────────
         // Two output shapes (see _forwardManyBatched docstring):
-        //   * returnAllLogits == false: logits of the LAST row only.
-        //     ITER 77 (PR10) fused via qwen35FinalNormLmHead.
+        //   * returnAllLogits == false: logits of the LAST row only,
+        //     fused via qwen35FinalNormLmHead.
         //   * returnAllLogits == true: batched RMSNorm over T rows +
         //     batched lm_head — the spec-decode verify path needs
         //     per-position logits.
@@ -3310,8 +3306,8 @@ public final class Qwen35Model: LanguageModel {
             workCmd.waitUntilCompleted()
         }
 
-        // ITER 79 (PR10): fused finalNorm+lmHead on the VLM embed-input
-        // forward path too.
+        // Fused finalNorm+lmHead on the VLM embed-input forward path
+        // too.
         return qwen35FinalNormLmHead(
             h: h, finalNorm: finalNorm, lmHead: lmHead, on: cmd)
     }
@@ -3461,11 +3457,11 @@ private func sliceHeadHalves35(
     return gathered.reshaped(to: [nHeads * headDim])
 }
 
-/// T-batched both-halves variant (ITER 74). Returns `(queriesFlat,
-/// gateFlat)` — both `[T·nHeads·headDim]` flat — using a single
-/// shared-encoder `Ops.gatherTwo` dispatch over the two interleaved
-/// row sets. Replaces two back-to-back `sliceHeadHalvesMany35` calls
-/// in `forwardMany` with one encoder begin/end pair.
+/// T-batched both-halves variant. Returns `(queriesFlat, gateFlat)`
+/// — both `[T·nHeads·headDim]` flat — using a single shared-encoder
+/// `Ops.gatherTwo` dispatch over the two interleaved row sets.
+/// Replaces two back-to-back `sliceHeadHalvesMany35` calls in
+/// `forwardMany` with one encoder begin/end pair.
 private func sliceHeadHalvesManyBoth35(
     _ q2T: Tensor, t: Int,
     nHeads: Int, headDim: Int,

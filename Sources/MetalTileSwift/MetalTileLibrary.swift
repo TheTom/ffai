@@ -88,9 +88,9 @@ public final class MetalTileLibrary: @unchecked Sendable {
             return parsed
         }
         // 64 lets the Metal driver pipeline more cmd-buffers in flight
-        // before applying backpressure. PR10 ITER 20 measured the bump
-        // 16 → 64 as a 2-3% prefill T=512 win on Qwen3.6-A3B / M5 Max
-        // by absorbing the per-cmd-buffer encode latency across more
+        // before applying backpressure. Measured as a 2-3% prefill
+        // T=512 win on Qwen3.6-A3B / M5 Max vs the 16 default — the
+        // bump absorbs per-cmd-buffer encode latency across more
         // concurrent submissions. Set FFAI_MAX_COMMAND_BUFFERS to
         // override for triage.
         return 64

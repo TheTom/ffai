@@ -399,32 +399,32 @@ public final class MoELayer: Module, DecoderLayer {
     public let enableBGEMM: Bool
     public let useBm8Env: Bool
     public let useM1Env: Bool
-    /// ITER 64 (PR10): additional env-flag caches.
+    /// Additional env-flag caches.
     let noDequantGate: Bool
     let gpuRouterEnabled: Bool
     let forceBGEMMAtT1: Bool
     let noBGEMMBm64: Bool
 
-    /// ITER 15/42 (PR10): lazy dequant of the gate weight + cached output.
-    /// Skipped when `gate.inner` is not a 8-bit QuantizedLinear or env
+    /// Lazy dequant of the gate weight + cached output. Skipped when
+    /// `gate.inner` is not a 8-bit QuantizedLinear or env
     /// `FFAI_MOE_NO_DEQUANT_GATE=1` is set.
     private var dequantizedGateCache: Tensor?
     private var dequantizedGateCacheKN: Tensor?
     private var dequantizedGateAttempted = false
     private var gateLogitsScratch: Tensor?
 
-    /// ITER 41 (PR10): cached scratches for the per-expert weighted-sum
-    /// loop at decode T=1.
+    /// Cached scratches for the per-expert weighted-sum loop at
+    /// decode T=1.
     private var accumulatorScratch: Tensor?
     private var topKScalarsBuf: MTLBuffer?
-    /// ITER 32 / 36 / 38 (PR10): cached per-expert g/u/inner/down outputs.
+    /// Cached per-expert g/u/inner/down outputs.
     private var expertGScratches: [Tensor] = []
     private var expertUScratches: [Tensor] = []
     private var expertInnerScratches: [Tensor] = []
     private var expertOutScratches: [Tensor] = []
-    /// ITER 56 (PR10): GPU MoE router scratches — written once per layer
-    /// per token by `mt_moe_router_topk`, then consumed by the per-slot
-    /// indexed qmms and the scalarFMAChain8.
+    /// GPU MoE router scratches — written once per layer per token by
+    /// `mt_moe_router_topk`, then consumed by the per-slot indexed qmms
+    /// and the scalarFMAChain8.
     private var routerIndicesScratch: Tensor?
     private var routerWeightsScratch: Tensor?
 
@@ -488,9 +488,9 @@ public final class MoELayer: Module, DecoderLayer {
         self.useBm8Env = env["FFAI_MOE_BGEMM_BM8"] != nil
         self.useM1Env = env["FFAI_MOE_M1"] != nil
         self.noDequantGate = env["FFAI_MOE_NO_DEQUANT_GATE"] != nil
-        // ITER 80 (PR10): default GPU router ON now that ITER 72's
-        // end-to-end correctness pinning is in place across bf16/f16/f32.
-        // Opt out with `FFAI_MOE_GPU_ROUTER=0`. The win: 40 ×
+        // Default GPU router ON — end-to-end correctness is pinned
+        // across bf16/f16/f32 by the integration suite. Opt out with
+        // `FFAI_MOE_GPU_ROUTER=0`. The win: 40 ×
         // `waitUntilCompleted` per decode token → 0.
         self.gpuRouterEnabled = env["FFAI_MOE_GPU_ROUTER"] != "0"
         self.forceBGEMMAtT1 = env["FFAI_MOE_BGEMM_FORCE_T1"] != nil
@@ -539,9 +539,9 @@ public final class MoELayer: Module, DecoderLayer {
         // ── 1. Gate gemv on the caller's command buffer ──────────────
         let logitsTensor = gate(h, on: cmd)
 
-        // ── 2a. ITER 56 (PR10): GPU MoE router fast path ─────────────
-        // When `FFAI_MOE_GPU_ROUTER=1` (default ON per ITER 80) AND the
-        // layer has stacked int4 expert layout AND routing matches
+        // ── 2a. GPU MoE router fast path ──────────────────────────────
+        // When `FFAI_MOE_GPU_ROUTER=1` (default ON) AND the layer has
+        // stacked int4 expert layout AND routing matches
         // `mt_moe_router_topk`'s assumptions (softmax-then-topK + Qwen-
         // MoE-style renorm, topK=8), skip the CPU sync entirely. The
         // router writes topK indices + weights to a GPU buffer; per-
@@ -691,9 +691,9 @@ public final class MoELayer: Module, DecoderLayer {
         // gateLogitsAll shape: [T, nExperts]
 
         // ── 2. Routing — GPU fast path or CPU sync ──────────────────────
-        // ITER 92 (PR10): when router config matches `mt_moe_router_topk`'s
-        // semantic envelope (softmax → topK + Qwen-MoE renorm, no expert
-        // bias, k=8), run the T-batched router on GPU via
+        // When router config matches `mt_moe_router_topk`'s semantic
+        // envelope (softmax → topK + Qwen-MoE renorm, no expert bias,
+        // k=8), run the T-batched router on GPU via
         // `Ops.moeRouterTopKMany`. Eliminates the T-parallel host
         // `router.route` loop (~50 ms of CPU work per prefill at T=512 ×
         // 40 MoE layers). One commit+wait still needed to read indices +
@@ -858,9 +858,9 @@ public final class MoELayer: Module, DecoderLayer {
         //     2.69× T=32 win.
         //   - mTotal ≤ 8 + `FFAI_MOE_BGEMM_BM8=1` → bm8 (decode T=1
         //     fallback).
-        // ITER 73 (PR10): bm64_mpp default-on for mTotal ≥ 1024 (refreshed
-        // bench: crossover sits between mTotal=512 bm16 +19% and
-        // mTotal=1024 bm64 +18%). Opt out via FFAI_MOE_BGEMM_NO_BM64=1.
+        // bm64_mpp default-on for mTotal ≥ 1024. Crossover sits between
+        // mTotal=512 (bm16 +19%) and mTotal=1024 (bm64 +18%). Opt out
+        // via FFAI_MOE_BGEMM_NO_BM64=1.
         let useBm64 = mTotal >= 1024 && !self.noBGEMMBm64
         let useBm8 = !useBm64 && topK <= 8 && useBm8Env && mTotal <= 8
         let bgemm:
@@ -1147,13 +1147,12 @@ public final class MoELayer: Module, DecoderLayer {
         return downProj(inner, on: cmd)
     }
 
-    /// ITER 56 (PR10): GPU MoE router decode path. Replaces the
+    /// GPU MoE router decode path. Replaces the
     /// `cmd.commit + waitUntilCompleted` sync with a full-GPU pipeline:
     /// router writes topK indices + weights to GPU buffers; per-slot
     /// indexed qmms (gate/up phase + down phase) batch onto shared
     /// encoders; final accumulation via `scalarFMAChain8` (or the fused
-    /// `moeDownSwigluAccumInt4Chain8` kernel when constraints allow,
-    /// ITER 94).
+    /// `moeDownSwigluAccumInt4Chain8` kernel when constraints allow).
     ///
     /// Predicated by `decode` callers — the layer must have stackedInt4
     /// experts with matching dtype, router must be softmax-then-topK
@@ -1202,10 +1201,10 @@ public final class MoELayer: Module, DecoderLayer {
             normTopkProb: router.normTopKProb,
             on: cmd)
 
-        // ITER 58 (PR10): batched per-expert indexed qmms on ONE encoder
-        // per phase. Gate (8 calls) + up (8 calls) share inDim/outDim/
-        // groupSize → one Many encoder. Down (8 calls) has different
-        // out_dim → second Many encoder.
+        // Batched per-expert indexed qmms on ONE encoder per phase.
+        // Gate (8 calls) + up (8 calls) share inDim/outDim/groupSize →
+        // one Many encoder. Down (8 calls) has different out_dim →
+        // second Many encoder.
         var expertIdxScratches: [Tensor] = []
         expertIdxScratches.reserveCapacity(router.topK)
         for slot in 0 ..< router.topK {
@@ -1248,14 +1247,13 @@ public final class MoELayer: Module, DecoderLayer {
             inputs: ins, expertIndices: idxs, outputs: outs0,
             groupSize: stacked.groupSize, on: cmd)
 
-        // ITER 94 (PR10): fuse phase 1b (swigluMany), phase 2 (8 down
-        // indexed-gemvs), and phase 3 (scalarFMAChain8) into ONE
-        // dispatch via `ffai_moe_down_swiglu_accum_int4_chain8`. Per-
-        // slot `inner` is staged in 3 KiB threadgroup memory, never
-        // spilling to global memory. Kernel constraint:
-        // moeIntermediate ≤ 768 + groupSize == 64. Qwen3.6-A3B has
-        // exactly 768 so this matches; fall back to the 3-dispatch
-        // chain (ITER 29/30/31, 38/39, ITER 47) for any larger configs.
+        // Fuse phase 1b (swigluMany), phase 2 (8 down indexed-gemvs),
+        // and phase 3 (scalarFMAChain8) into ONE dispatch via
+        // `ffai_moe_down_swiglu_accum_int4_chain8`. Per-slot `inner` is
+        // staged in 3 KiB threadgroup memory, never spilling to global
+        // memory. Kernel constraint: moeIntermediate ≤ 768 + groupSize
+        // == 64. Qwen3.6-A3B has exactly 768 so this matches; fall back
+        // to the 3-dispatch chain for any larger configs.
         let gs = Array(expertGScratches.prefix(router.topK))
         let us = Array(expertUScratches.prefix(router.topK))
         let acc = accumulatorScratch!
