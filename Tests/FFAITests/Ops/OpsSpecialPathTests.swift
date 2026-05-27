@@ -471,6 +471,76 @@ struct OpsSpecialPathTests {
         }
     }
 
+    // MARK: - sdpaDecode2Pass
+
+    @Test("sdpaDecode2Pass f32 — blocks=32 matches single-pass sdpaDecode")
+    func sdpaDecode2PassMatchesSinglePass() {
+        autoreleasepool {
+            // Pin the dispatch geometry contract that PR #10 violated:
+            // the wrapper preconditions blocks ≥ 32 && blocks % 32 == 0
+            // (pass-2 hardcodes a 32-lane block-merge). Cross-check that
+            // at the minimal legal `blocks=32`, the two-pass output
+            // matches the canonical single-pass `sdpaDecode` element-
+            // for-element within bf16-tier tolerance.
+            let nHeads = 4
+            let nKVHeads = 2
+            let headDim = 128  // a supported single-pass dim
+            let nKV = 64
+            let kvStride = 64
+            let blocks = 32  // the minimum legal value
+            let scale = 1.0 / Float(Double(headDim).squareRoot())
+
+            let q = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            q.copyIn(from: (0 ..< nHeads * headDim).map { Float($0 % 17) * 0.1 - 0.5 })
+            let k = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            k.copyIn(
+                from: (0 ..< nKVHeads * kvStride * headDim).map {
+                    Float($0 % 13) * 0.05 - 0.3
+                })
+            let v = Tensor.empty(shape: [nKVHeads, kvStride, headDim], dtype: .f32)
+            v.copyIn(
+                from: (0 ..< nKVHeads * kvStride * headDim).map {
+                    Float($0 % 11) * 0.07 - 0.4
+                })
+
+            // Single-pass reference.
+            let outRef = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            runAndWait { cb in
+                _ = Ops.sdpaDecode(
+                    q: q, k: k, v: v,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: nKV, kvStride: kvStride,
+                    scale: scale, on: cb, into: outRef)
+            }
+
+            // Two-pass under test.
+            let partialO = Tensor.empty(
+                shape: [nHeads, blocks, headDim], dtype: .f32)
+            let partialM = Tensor.empty(shape: [nHeads, blocks], dtype: .f32)
+            let partialL = Tensor.empty(shape: [nHeads, blocks], dtype: .f32)
+            let out = Tensor.empty(shape: [nHeads, headDim], dtype: .f32)
+            runAndWait { cb in
+                Ops.sdpaDecode2Pass(
+                    q: q, k: k, v: v,
+                    nQHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim,
+                    nKV: nKV, kvStride: kvStride, blocks: blocks,
+                    scale: scale,
+                    partialO: partialO, partialM: partialM, partialL: partialL,
+                    into: out, on: cb)
+            }
+
+            let ref = outRef.toArray(as: Float.self)
+            let got = out.toArray(as: Float.self)
+            #expect(ref.count == got.count)
+            for i in 0 ..< ref.count {
+                #expect(
+                    abs(got[i] - ref[i]) < 1e-4,
+                    "row=\(i / headDim) d=\(i % headDim): two-pass \(got[i]) vs single-pass \(ref[i])"
+                )
+            }
+        }
+    }
+
     // MARK: - KV cache append
 
     @Test("kvCacheUpdateKVMany f32 — writes T rows at the right positions")
