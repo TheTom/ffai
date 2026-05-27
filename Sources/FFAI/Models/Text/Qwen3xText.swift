@@ -2782,7 +2782,6 @@ private func qwen35ApplyFFNMany(
     cmd: MTLCommandBuffer, device: Device,
     preNormed: Tensor? = nil
 ) -> Tensor {
-    let dt = postMix.dtype
     // Post-norm over T rows of [hidden]. One rmsNormRows kernel —
     // unless the caller already produced the normed tensor via the
     // fused `mt_add_rms_norm` kernel.

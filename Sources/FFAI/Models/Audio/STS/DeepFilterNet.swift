@@ -741,7 +741,6 @@ extension DeepFilterNetModel {
 
         // emb: flatten e3 from [1, e3C, nT, e3F] → [1, nT, e3C*e3F].
         var emb = bchwTobtf(e3, B: B, C: e3C, T: nT, F: e3F)  // [nT, e3C*e3F]
-        let cembDim = cemb[0 ..< (cemb.count / nT)].count  // output dim per time step
         // Merge: add or concat.
         if config.encConcat {
             emb = zip(emb, cemb).map { $0 + $1 }  // placeholder — proper concat below
@@ -772,12 +771,12 @@ extension DeepFilterNetModel {
             emb, T: nT, prefix: "enc.emb_gru", hiddenSize: config.embHiddenDim, linearOut: true)
 
         // ── ERB Decoder ───────────────────────────────────────────────────
-        var embDec = try squeezedGRU(
+        let embDec = try squeezedGRU(
             emb, T: nT, prefix: "erb_dec.emb_gru", hiddenSize: config.embHiddenDim, linearOut: true)
         let embDecDim = embDec.count / nT
         // Project to [1, embDecDim/e3F, nT, e3F] BCHW.
         let embDecC = embDecDim / max(1, e3F)
-        var embDecBCHW = tfToBchw(embDec, T: nT, dim: embDecDim, newC: embDecC, F: e3F)
+        let embDecBCHW = tfToBchw(embDec, T: nT, dim: embDecDim, newC: embDecC, F: e3F)
 
         var d3 = addBCHW(
             relu4D(try pathwayConv(e3, B: B, C: e3C, T: nT, F: e3F, prefix: "erb_dec.conv3p")),
@@ -792,7 +791,6 @@ extension DeepFilterNetModel {
             try transposeBlock(
                 d2, B: B, C: d3C, T: nT, F: e2F, prefix: "erb_dec.convt2", fstride: 2))
         let d2C = d3C
-        let d2F = e2F * 2
 
         var d1 = addBCHW(
             relu4D(try pathwayConv(e1, B: B, C: e1C, T: nT, F: e1F, prefix: "erb_dec.conv1p")),
@@ -801,9 +799,8 @@ extension DeepFilterNetModel {
             try transposeBlock(
                 d1, B: B, C: d2C, T: nT, F: e1F, prefix: "erb_dec.convt1", fstride: 2))
         let d1C = d2C
-        let d1F = e1F * 2
 
-        var d0 = addBCHW(
+        let d0 = addBCHW(
             relu4D(try pathwayConv(e0, B: B, C: e0C, T: nT, F: e0F, prefix: "erb_dec.conv0p")),
             alignTime(d1, C: d1C, T: nT, F: e0F), B: B, C: d1C, T: nT, F: e0F)
         var maskBCHW = try outputConv(d0, B: B, C: d1C, T: nT, F: e0F, prefix: "erb_dec.conv0_out")
@@ -865,7 +862,6 @@ extension DeepFilterNetModel {
             dfGruOut, T: nT, prefix: nil, weightKey: "df_dec.df_out.0.weight")
         for i in dfOut.indices { dfOut[i] = tanhf(dfOut[i]) }
         // Reshape to [nT, nbDf, dfOrder*2].
-        let dfCoefDim = config.nbDf * config.dfOrder * 2
 
         // Add c0pFlat (as [nT, nbDf, dfOrder*2] after proper reshape).
         let minLen = min(dfOut.count, c0pFlat.count)
@@ -919,7 +915,6 @@ extension DeepFilterNetModel {
         let nbDf = config.nbDf
         let dfOrder = config.dfOrder
         let padLeft = dfOrder - 1 - config.dfLookahead
-        let padRight = config.dfLookahead
 
         var outReal = [Float](repeating: 0, count: nT * nbDf)
         var outImag = [Float](repeating: 0, count: nT * nbDf)
@@ -1118,7 +1113,6 @@ extension DeepFilterNetModel {
         weight: [Float], outC: Int, kT: Int, kF: Int,
         bias: [Float]?, fstride: Int, lookahead: Int
     ) -> [Float] {
-        let inPerGroup = C / max(1, outC > 0 ? weight.count / (outC * kT * kF) : 1)
         // True inPerGroup from weight shape.
         let inCPerGroup = weight.count / (outC * kT * kF)
         let groups = max(1, C / max(1, inCPerGroup))
@@ -1132,9 +1126,7 @@ extension DeepFilterNetModel {
         // Time crop for negative rawLeft (shouldn't happen for lookahead ≤ kT-1).
         let timeCrop = max(0, -rawLeft)
         let effectiveT = T - timeCrop
-        let paddedT = effectiveT + timePadLeft + timePadRight
         let outT = max(0, effectiveT + timePadLeft + timePadRight - kT + 1)
-        let paddedF = F + 2 * freqPad
         let outF = max(0, (F + 2 * freqPad - kF) / fstride + 1)
 
         var out = [Float](repeating: 0, count: B * outC * outT * outF)
@@ -1149,7 +1141,6 @@ extension DeepFilterNetModel {
             let oc = rem / outT
             let ot = rem % outT
             let g = oc / outCPerGroup
-            let ocLocal = oc % outCPerGroup
 
             for of in 0 ..< outF {
                 var acc: Float = 0
@@ -1209,7 +1200,6 @@ extension DeepFilterNetModel {
                             for inf2 in 0 ..< F {
                                 let xVal = x[b * C * T * F + inC_idx * T * F + it * F + inf2]
                                 for kt in 0 ..< kT {
-                                    let ot = it - kt + (kT - 1) - paddingT + (kT - 1)
                                     // Simplified: just add contribution.
                                     let ot2 = it + (kT - 1) - kt
                                     guard ot2 >= 0, ot2 < outT else { continue }
@@ -1295,7 +1285,6 @@ extension DeepFilterNetModel {
         }
         guard let shape = weights.shapes[key], shape.count == 3 else {
             // Fallback: treat as plain linear [outDim, inDim].
-            let inDim = x.count / T
             return linear(x, T: T, weight: w, bias: nil)
         }
         // Shape: [groups, inPerGroup, outPerGroup]
@@ -1396,10 +1385,9 @@ extension DeepFilterNetModel {
         hiddenSize: Int, linearOut: Bool
     ) throws -> [Float] {
         // Linear in.
-        guard let linInW = weights["\(prefix).linear_in.0.weight"] else {
+        guard weights["\(prefix).linear_in.0.weight"] != nil else {
             throw DeepFilterNetError.missingWeightKey("\(prefix).linear_in.0.weight")
         }
-        let inDim = x.count / T
         var y = try groupedLinear(x, T: T, prefix: nil, weightKey: "\(prefix).linear_in.0.weight")
         for i in y.indices { y[i] = max(0, y[i]) }  // ReLU
 
@@ -1408,7 +1396,6 @@ extension DeepFilterNetModel {
         while true {
             let wihKey = "\(prefix).gru.weight_ih_l\(layer)"
             guard weights[wihKey] != nil else { break }
-            let whhKey = "\(prefix).gru.weight_hh_l\(layer)"
             let bihKey = "\(prefix).gru.bias_ih_l\(layer)"
             let bhhKey = "\(prefix).gru.bias_hh_l\(layer)"
             guard let bih = weights[bihKey], let bhh = weights[bhhKey] else {
@@ -1432,7 +1419,7 @@ extension DeepFilterNetModel {
         }
 
         // Optional linear out.
-        if linearOut, let linOutW = weights["\(prefix).linear_out.0.weight"] {
+        if linearOut, weights["\(prefix).linear_out.0.weight"] != nil {
             y = try groupedLinear(y, T: T, prefix: nil, weightKey: "\(prefix).linear_out.0.weight")
             for i in y.indices { y[i] = max(0, y[i]) }  // ReLU
         }
@@ -1523,7 +1510,7 @@ extension DeepFilterNetModel {
     }
 
     func outputConv(_ x: [Float], B: Int, C: Int, T: Int, F: Int, prefix: String) throws -> [Float] {
-        var y = try conv2dLayer(
+        let y = try conv2dLayer(
             x, B: B, C: C, T: T, F: F,
             weightKey: "\(prefix).0.weight", bias: nil, fstride: 1, lookahead: 0)
         let outC = convShape(prefix: prefix, main: 0).outC

@@ -641,7 +641,7 @@ final class FireRedDFSMN: Sendable {
         let T = features.count
         guard T > 0 else { return [] }
         // Flatten to [T × idim] row-major.
-        var x = features.flatMap { $0 }
+        let x = features.flatMap { $0 }
 
         // fc1: idim → H, ReLU.
         var h = fc1.applyRows(x, rows: T)
@@ -702,7 +702,6 @@ enum FireRedVADPostprocessor {
             // The upstream does full convolution then boundary-corrects;
             // cumulative average over the first windowSize-1 frames is
             // equivalent to the boundary correction applied there.
-            let start = max(0, i - windowSize + 1)
             if i >= windowSize {
                 windowSum -= probs[i - windowSize]
                 smoothed[i] = windowSum / Float(windowSize)
@@ -1163,7 +1162,6 @@ public final class FireRedVADModel: @unchecked Sendable {
             case 0x80: _ = readByte()  // PROTO
             case 0x28: marks.append(stack.count)  // MARK
             case 0x2E: return  // STOP
-            case 0x28: break  // duplicate MARK (handled above)
             // Push values
             case 0x4E: stack.append(.none_val)  // NONE
             case 0x89: stack.append(.bool(false))  // NEWFALSE
@@ -1263,7 +1261,7 @@ public final class FireRedVADModel: @unchecked Sendable {
             case 0x52:  // REDUCE (fn, args) → call
                 guard stack.count >= 2 else { break }
                 let args = stack.removeLast()
-                let fn = stack.removeLast()
+                _ = stack.removeLast()
                 // If this is a PersistId call (the storage tuple), extract the id + count.
                 // The storage PersistId fires as a result pushed onto the stack marked
                 // .storage(id, count).
@@ -1289,7 +1287,7 @@ public final class FireRedVADModel: @unchecked Sendable {
                 stack.append(.reduced)
             case 0x62:  // BUILD (obj, state) — sets state on top-1
                 guard stack.count >= 2 else { break }
-                let state = stack.removeLast()
+                _ = stack.removeLast()
                 // If the top is a tensor being built, try to extract shape.
                 _ = stack.removeLast()
                 // The tensor is built from (storage, offset, shape, stride, …).
@@ -1326,7 +1324,6 @@ public final class FireRedVADModel: @unchecked Sendable {
                 _ = stack.popLast()
             case 0x32:  // POP_MARK
                 if let markIdx = marks.popLast() { stack.removeSubrange(markIdx...) }
-            case 0x32: break  // duplicate
             default: break
             }
 

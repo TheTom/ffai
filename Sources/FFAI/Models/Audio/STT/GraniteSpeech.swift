@@ -1630,13 +1630,13 @@ public final class GraniteSpeechModel: Module {
         let dstPtr = dst.buffer.contents().advanced(by: dst.offset)
         switch dst.dtype {
         case .f32:
-            src.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 4) }
+            _ = src.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 4) }
         case .f16:
             let bits = src.map { float32ToFloat16($0) }
-            bits.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 2) }
+            _ = bits.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 2) }
         case .bf16:
             let bits = src.map { float32ToBFloat16($0) }
-            bits.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 2) }
+            _ = bits.withUnsafeBytes { memcpy(dstPtr, $0.baseAddress!, src.count * 2) }
         default:
             fatalError("copyF32ToTensor: unsupported dtype \(dst.dtype)")
         }

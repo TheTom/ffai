@@ -60,7 +60,18 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
-            path: "Sources/FFAI"
+            path: "Sources/FFAI",
+            swiftSettings: [
+                // Opt into Accelerate's ILP64 CBLAS interface
+                // (`cblas_sgemm` / `cblas_sgemv` were deprecated in
+                // macOS 13.3 in favour of this set of headers). Without
+                // it every audio/vision DSP file that wraps a BLAS call
+                // gets a deprecation warning per build pass. `_ILP64`
+                // is required by the new header to enable the 64-bit
+                // size_t-shaped BLAS_INDEX type.
+                .define("ACCELERATE_NEW_LAPACK"),
+                .define("ACCELERATE_LAPACK_ILP64"),
+            ]
         ),
 
         // CLI: ffai --model <id-or-path> --prompt "..."

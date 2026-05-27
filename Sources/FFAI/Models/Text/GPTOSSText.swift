@@ -80,7 +80,7 @@ public struct GPTOSSMoEVariant: GPTOSSVariant, ReasoningCapable {
         topK: 0,
         minP: 0.0,
         repetitionPenalty: 1.0,
-        reasoningLevel: .none
+        reasoningLevel: ReasoningLevel.none
     )
 
     public static func loadModel(
