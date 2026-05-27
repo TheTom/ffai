@@ -1896,6 +1896,13 @@ public enum Ops {
             "Ops.batchedQkvQgemvInt4Fast: w_* must be u32-packed")
         let packedPerRow = wQ.shape[1]
         let inDim = packedPerRow * 8
+        // K and V share the same in_dim as Q — the kernel reads ONE x row
+        // and walks all three weight tensors at that packed width. A
+        // mis-packed wK/wV would silently miscompute the K/V projections.
+        precondition(
+            wK.shape[1] == packedPerRow && wV.shape[1] == packedPerRow,
+            "Ops.batchedQkvQgemvInt4Fast: wK/wV packed width (\(wK.shape[1])/\(wV.shape[1])) must equal wQ (\(packedPerRow))"
+        )
         precondition(
             x.elementCount == inDim,
             "Ops.batchedQkvQgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
@@ -2003,6 +2010,13 @@ public enum Ops {
             "Ops.batchedQkvQmmFast: w_* must be u32-packed")
         let packedPerRow = wQ.shape[1]
         let inDim = packedPerRow * 8
+        // K and V share the same in_dim as Q — the kernel reads ONE x row
+        // and walks all three weight tensors at that packed width. A
+        // mis-packed wK/wV would silently miscompute the K/V projections.
+        precondition(
+            wK.shape[1] == packedPerRow && wV.shape[1] == packedPerRow,
+            "Ops.batchedQkvQmmFast: wK/wV packed width (\(wK.shape[1])/\(wV.shape[1])) must equal wQ (\(packedPerRow))"
+        )
         precondition(
             x.elementCount == m * inDim,
             "Ops.batchedQkvQmmFast: x.elementCount \(x.elementCount) ≠ M·inDim \(m * inDim)")
@@ -2122,6 +2136,14 @@ public enum Ops {
             "Ops.batched4QgemvInt4Fast: w_* must be u32-packed")
         let packedPerRow = wA.shape[1]
         let inDim = packedPerRow * 8
+        // All four weight tensors share the same in_dim — the kernel reads
+        // ONE x row and walks all four at that packed width. A mis-packed
+        // wB/wC/wD would silently miscompute its branch's output.
+        precondition(
+            wB.shape[1] == packedPerRow && wC.shape[1] == packedPerRow
+                && wD.shape[1] == packedPerRow,
+            "Ops.batched4QgemvInt4Fast: wB/wC/wD packed width must equal wA (\(packedPerRow))"
+        )
         precondition(
             x.elementCount == inDim,
             "Ops.batched4QgemvInt4Fast: x.elementCount \(x.elementCount) ≠ inDim \(inDim)")
@@ -2244,6 +2266,14 @@ public enum Ops {
             "Ops.batched4QmmFast: w_* must be u32-packed")
         let packedPerRow = wA.shape[1]
         let inDim = packedPerRow * 8
+        // All four weight tensors share the same in_dim — the kernel reads
+        // ONE x row and walks all four at that packed width. A mis-packed
+        // wB/wC/wD would silently miscompute its branch's output.
+        precondition(
+            wB.shape[1] == packedPerRow && wC.shape[1] == packedPerRow
+                && wD.shape[1] == packedPerRow,
+            "Ops.batched4QmmFast: wB/wC/wD packed width must equal wA (\(packedPerRow))"
+        )
         precondition(
             x.elementCount == m * inDim,
             "Ops.batched4QmmFast: x size \(x.elementCount) ≠ M·inDim \(m * inDim)")
