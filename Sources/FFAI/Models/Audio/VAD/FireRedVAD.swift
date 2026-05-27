@@ -1128,9 +1128,11 @@ public final class FireRedVADModel: @unchecked Sendable {
             return lo | (hi << 8)
         }
         func readUInt32LE() -> Int {
-            let v =
-                Int(pkl[pos]) | (Int(pkl[pos + 1]) << 8) | (Int(pkl[pos + 2]) << 16)
-                | (Int(pkl[pos + 3]) << 24)
+            // 4-byte LE read via a loop — same compile-time
+            // workaround as BINUNICODE8 above (Swift 5.10 type checker
+            // chokes on the inline 4-way Int(...) | <<shift expression).
+            var v = 0
+            for i in 0 ..< 4 { v |= Int(pkl[pos + i]) << (8 * i) }
             pos += 4
             return v
         }
@@ -1199,13 +1201,14 @@ public final class FireRedVADModel: @unchecked Sendable {
             case 0x8C:  // SHORT_BINUNICODE len1
                 stack.append(.str(readLen1String()))
             case 0x8D:  // BINUNICODE8
-                let nLo32 =
-                    Int(pkl[pos]) | (Int(pkl[pos + 1]) << 8)
-                    | (Int(pkl[pos + 2]) << 16) | (Int(pkl[pos + 3]) << 24)
-                let nHi32 =
-                    (Int(pkl[pos + 4]) << 32) | (Int(pkl[pos + 5]) << 40)
-                    | (Int(pkl[pos + 6]) << 48) | (Int(pkl[pos + 7]) << 56)
-                let n = nLo32 | nHi32
+                // Read 8 bytes little-endian into an Int. The full
+                // expression `Int(pkl[pos]) | ... | (Int(pkl[pos+7]) <<
+                // 56)` trips Swift 5.10's type checker with "unable to
+                // type-check in reasonable time" on the CI toolchain
+                // (Xcode 16.4); the loop form is identical at runtime
+                // and compiles in ~no time.
+                var n = 0
+                for i in 0 ..< 8 { n |= Int(pkl[pos + i]) << (8 * i) }
                 pos += 8
                 let s = String(bytes: pkl[pos ..< (pos + n)], encoding: .utf8) ?? ""
                 pos += n
