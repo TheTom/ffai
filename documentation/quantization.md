@@ -1,6 +1,6 @@
 # Quantization
 
-FFAI supports the **mlx-format** affine group-quantized weight layout at every bit width MLX itself ships: 3 / 4 / 5 / 6 / 8.
+FFAI supports the **mlx-format** affine group-quantized weight layout at every bit width MLX itself ships, plus 2-bit: **2** / 3 / 4 / 5 / 6 / 8.
 
 This is **weight-only** quantization — it shrinks the on-disk + on-GPU footprint of the model and (usually) speeds up decode by lowering memory-bandwidth pressure. It's a different axis from **[KV cache quantization](kv-cache.md)**, which compresses the attention K/V tensors at runtime (the affine 4/8-bit and AURA compressed KV caches both ship today).
 
@@ -14,6 +14,7 @@ This is **weight-only** quantization — it shrinks the on-disk + on-GPU footpri
 | **5-bit** | 32 / 64 / 128 | ✅ | Byte-level pack — 8 weights per 5 bytes. |
 | **4-bit** | 32 / 64 / 128 | ✅ | Eight weights per uint32. The mlx-community standard. |
 | **3-bit** | 32 / 64 / 128 | ✅ | Byte-level pack — 8 weights per 3 bytes. |
+| **2-bit** | 64 | ✅ | Sixteen weights per uint32 (`pack_factor = 16`). Below the coherence threshold on sub-1B-param models — use only for kernel testing or on much larger models. mlx-community ships `*-mixed_2_6` / `*-mixed_3_4` variants at small sizes instead of pure 2-bit. |
 
 mlx-community ships `*-3bit`, `*-4bit`, `*-5bit`, `*-6bit`, `*-8bit` variants of most models; see [models.md](models.md) for the curated set we regression-sweep.
 
@@ -84,12 +85,28 @@ The loader reads `config.json`, sees `quantization.bits = 4`, and routes the lin
 
 GPT-OSS-20B publishes its MoE experts **MXFP4**-quantized (Microscaling FP4 with FP8-block scales) while the attention / router / embedding / lm_head tensors stay mlx affine-quantized. FFAI handles this via a load-time **transcode** path ([`GPTOSSMoE.swift`](../Sources/FFAI/Models/GPTOSSMoE.swift)): the MXFP4 experts are converted to FFAI's affine-int4 format at load, so the decode kernels are the same `dequant_gemv_4` path the rest of the model uses — no separate MXFP4 inference kernel. `nvfp4` is not handled.
 
+## Per-tensor mixed-bit conversions
+
+`ffai convert` writes per-tensor-class bit-widths in a single pass:
+
+```bash
+# 4-bit linears + 4-bit embedding + 8-bit untied lm_head + bf16 vision tower:
+ffai convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
+
+# 2-bit text path + 2-bit embedding, vision stays bf16 (default):
+ffai convert <repo> --bits 2 --embedding-bits 2
+```
+
+The loader's per-tensor bit-width detection (`deriveAffineQuantBits`) handles the resulting mixed layout without per-tensor entries in `config.json` — each `name.weight` / `name.scales` / `name.biases` triplet's shape determines its bit-width at load time. The top-level `quantization.bits` written into `config.json` records the `--bits` value (the canonical text-path width); the other widths are inferred per tensor at load. See [`using-the-cli.md` → `convert`](using-the-cli.md#convert--quantize-a-checkpoint-to-mlx-affine-format) for the full flag table.
+
+Vision-tower quantization is intentionally off by default (`--vision-bits` omitted). FFAI's VL towers — Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM — all run plain `Linear`, not `QuantizedLinear`, so a quantized tower would crash the loader. Set `--vision-bits` only when wiring a new VL tower that consumes `QuantizedLinear`.
+
 ## What's not supported (yet)
 
-- **2-bit affine quantization** — the Ops-layer 2-bit affine quantize / dequantize wrappers exist (parity sweep across f32/f16/bf16) but the inference-side `dequant_gemv_2bit` kernel + loader path haven't landed. Tracked in [`planning/plan.md`](../planning/plan.md).
 - **GGUF** quantizations (`Q4_K_M`, `Q5_K_M`, `Q8_0`, …) — different binary layout, different per-block scales, different tensor naming. Planned: a per-arch name mapper alongside the GGUF reader. Not currently scheduled.
 - **Native mxfp4 / nvfp4 inference** — FFAI transcodes GPT-OSS's MXFP4 experts to affine-int4 at load (see above). A native MXFP4-scale-layout decode kernel — keeping the FP8-block scales rather than transcoding — is not implemented. `nvfp4` is not handled at all.
-- **Mixed-bit per-layer** — config-driven per-layer bit budgets (`quantization_config` block). Planned alongside the autotuner.
+- **3 / 5 / 6-bit conversion via `ffai convert`** — the *inference* kernels exist (`dequant_gemv_int{3,5,6}` ship from metaltile; loader path is plumbed via `Ops.dequantGemv` and `QuantizedLinear`), but the convert driver currently only emits the clean pack-factor widths `{2, 4, 8}`. The odd-width pack format is well-defined and the kernels are tested; wiring it through `ffai convert` is a separate piece of work. Load existing mlx-community / unsloth `*-3bit` / `*-5bit` / `*-6bit` checkpoints in the meantime.
+- **Per-layer (not just per-role) bit budgets** — the per-tensor-class flags cover the common case (text vs embedding vs lm_head vs vision tower). True per-layer recipes — e.g. "first 4 attention layers at 2-bit, rest at 4-bit" — need a config file format and are planned alongside the autotuner.
 
 ## See also
 

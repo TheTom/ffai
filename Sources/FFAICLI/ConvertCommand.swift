@@ -13,12 +13,25 @@
 // limitations under the License.
 //
 // `ffai convert` — quantize a bf16/fp16 HuggingFace checkpoint to
-// MLX 4-bit affine format using FFAI's own GPU kernels.
+// MLX affine format using FFAI's own GPU kernels.
+//
+// Bit-widths are per-tensor-class: `--bits` controls the attention +
+// MLP linears (the bulk of the model), and `--embedding-bits` /
+// `--lm-head-bits` / `--vision-bits` override the bit-width for those
+// specific tensors. Each `--*-bits` flag is optional — leave it off to
+// keep that tensor full-precision (mlx-lm convention).
 //
 // Examples:
 //   ffai convert HuggingFaceTB/SmolLM2-360M-Instruct --bits 4
-//   ffai convert HuggingFaceTB/SmolLM2-360M-Instruct --bits 4 \
-//       --output /tmp/smollm-4bit --quantize-embeddings
+//
+//   # Quantize text + embeddings (both at 4-bit), keep lm_head untied
+//   # at 8-bit and vision at full precision (default):
+//   ffai convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
+//
+//   # Mixed: text + embed at 2-bit, vision tower at 4-bit (requires
+//   # a VL tower that consumes QuantizedLinear — none ship today):
+//   ffai convert <vlm> --bits 2 --embedding-bits 2 --vision-bits 4
+//
 //   ffai convert /local/path/to/model --bits 8 --output /tmp/out
 //   ffai convert mlx-community/Llama-3.2-1B-4bit --upload-repo ekryski/my-4bit
 
@@ -36,7 +49,9 @@ struct ConvertCommand: AsyncParsableCommand {
         help: "HF repo id (e.g. HuggingFaceTB/SmolLM2-360M-Instruct) or local directory path.")
     var source: String
 
-    @Option(name: .shortAndLong, help: "Bits per weight: 2, 4, or 8.")
+    @Option(
+        name: .shortAndLong,
+        help: "Bits per weight for the main linear projections (q/k/v/o, gate/up/down): 2, 4, or 8.")
     var bits: Int = 4
 
     @Option(
@@ -48,16 +63,24 @@ struct ConvertCommand: AsyncParsableCommand {
         help: "Upload to HF repo (e.g. ekryski/foo-4bit). Requires `hf` CLI authenticated.")
     var uploadRepo: String?
 
-    @Flag(name: .long, help: "Quantize embed_tokens too (mlx-lm default: skip).")
-    var quantizeEmbeddings: Bool = false
-
-    @Flag(name: .long, help: "Quantize lm_head too (mlx-lm default: skip when tied).")
-    var quantizeLmHead: Bool = false
-
-    @Flag(
+    @Option(
         name: .long,
-        help: "Quantize vision-tower weights too (default: skip — FFAI VL towers use plain Linear).")
-    var quantizeVision: Bool = false
+        help: ArgumentHelp(
+            "Bits for embed_tokens (independent of --bits). Omit to keep full-precision."))
+    var embeddingBits: Int?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Bits for lm_head when untied (independent of --bits). Omit to keep full-precision."))
+    var lmHeadBits: Int?
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Bits for vision-tower weights (independent of --bits). Omit to keep full-precision —"
+                + " FFAI VL towers run plain Linear today, so vision quantization is a future hook."))
+    var visionBits: Int?
 
     @Option(name: .long, help: "Revision (branch/tag/commit) to download from HF. Default: main.")
     var revision: String = "main"
@@ -96,9 +119,9 @@ struct ConvertCommand: AsyncParsableCommand {
         // ─── Build options ───────────────────────────────────────────
         var opts = ConvertOptions()
         opts.bits = bits
-        opts.quantizeEmbeddings = quantizeEmbeddings
-        opts.quantizeLmHead = quantizeLmHead
-        opts.quantizeVision = quantizeVision
+        opts.embeddingBits = embeddingBits
+        opts.lmHeadBits = lmHeadBits
+        opts.visionBits = visionBits
 
         // ─── Run conversion ──────────────────────────────────────────
         // Swift 6 strict concurrency: the progress closure is @Sendable so

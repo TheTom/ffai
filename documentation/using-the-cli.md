@@ -100,9 +100,11 @@ This is the diagnostic that found the Gemma 3 bf16 GELU NaN in two runs (one to 
 
 Common cross-cutting flags (`--stats`, `--debug`, `--profiling`) are documented in [observability.md](observability.md).
 
-### `convert` — quantize a checkpoint to MLX 4-bit
+### `convert` — quantize a checkpoint to MLX affine format
 
 `ffai convert` quantizes a bf16/fp16 HuggingFace checkpoint to MLX affine-quantized format (the same `.weight` + `.scales` + `.biases` triplet layout that `mlx-community/*-4bit` checkpoints use) and writes the result as a drop-in directory `Model.load(...)` can consume. The quantize work runs through FFAI's own `QuantizedOps.quantizeAffine` GPU kernel — there is **no dependency on Python, `mlx-lm`, or `mlx-vlm`** at conversion time.
+
+Bit-widths are **per-tensor-class**. The main `--bits` flag controls the attention + MLP linear projections (the bulk of the model); `--embedding-bits`, `--lm-head-bits`, and `--vision-bits` independently override the bit-width for those specific roles. Each `--*-bits` flag is optional — omit it to keep that tensor full-precision (the mlx-lm convention).
 
 ```bash
 # Pull a bf16 repo, quantize to 4-bit, drop the result in
@@ -119,6 +121,9 @@ ffai convert /path/to/my-finetune --output /path/to/my-finetune-4bit
 
 # 8-bit instead of 4-bit (also runs through QuantizedOps.quantizeAffine).
 ffai convert mlx-community/gemma-3-1b-it-bf16 --bits 8
+
+# Mixed precision: text + embeddings at 4-bit, untied lm_head at 8-bit.
+ffai convert <repo> --bits 4 --embedding-bits 4 --lm-head-bits 8
 ```
 
 End-to-end on the SmolLM2-360M case: download → quantize → write → upload measures at **~1.4 seconds**.
@@ -128,17 +133,20 @@ End-to-end on the SmolLM2-360M case: download → quantize → write → upload 
 | Flag | Default | Meaning |
 |---|---|---|
 | `<source>` (positional) | — | HF repo id (`org/repo`) or local directory path. Local paths must start with `/`, `./`, `../`, or `~`. |
-| `-b` / `--bits` | `4` | Bits per weight. Currently `4`. Other widths (`2`, `8`) are kernel-level supported but should be validated per-model before relying on them. |
+| `-b` / `--bits` | `4` | Bits per weight for the **main linear projections** (q/k/v/o, gate/up/down, MoE experts). Supported: `2`, `4`, `8` — the affine-quantize kernels' clean pack-factor path. |
 | `--output` | `~/.cache/ffai/converts/<safe-name>-<bits>bit` | Destination directory. Created if missing; overwrites if present. |
 | `--upload-repo` | — | After convert, shell out to `hf upload <repo> <output-dir>`. Requires the `hf` CLI authenticated with write access to `<repo>`. The local output is kept regardless of upload outcome. |
-| `--quantize-embeddings` | off | Also quantize `embed_tokens.weight`. Off by default to match mlx-lm convention; turn on for further size reduction at a small quality cost. |
-| `--quantize-lm-head` | off | Also quantize `lm_head.weight`. Off by default; mlx-lm skips this because most models tie `lm_head` to `embed_tokens` and quantizing the tied pair compounds error. |
+| `--embedding-bits` | — (skip) | Bit-width for the token embedding table. Omit to keep `embed_tokens.weight` full-precision (mlx-lm default); pass `2` / `4` / `8` to quantize independently of `--bits`. |
+| `--lm-head-bits` | — (skip) | Bit-width for `lm_head.weight` when the checkpoint ships an untied head. Tied-embedding models reuse the embedding triplet, so this knob only matters for untied heads (Qwen 3.6, some Gemma). |
+| `--vision-bits` | — (skip) | Bit-width for vision-tower weights (matches `.visual.*` / `vision_tower.*` / `vision_model.*` prefixes). Default keeps the tower full-precision because FFAI's VL towers (Qwen 3-VL / 3.5-VL, Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM) consume plain `Linear`, not `QuantizedLinear` — set only when wiring a new tower that supports quantized weights. |
 | `--revision` | `main` | HF revision (branch / tag / commit) to download. |
+
+Per-tensor mixing is loader-friendly: FFAI's `loadLinear` / `loadEmbedding` derive each weight's bit-width from its saved shape via `deriveAffineQuantBits`, so a checkpoint with 4-bit linears + 8-bit lm_head loads correctly without per-tensor entries in `config.json`. The top-level `quantization.bits` written to `config.json` records `--bits` as the canonical value.
 
 #### What gets quantized vs copied through
 
-- **Quantized**: every 2D weight matrix whose name ends in `.weight` whose last dim divides `64` (the kernel's group_size constraint) and isn't one of `embed_tokens.weight` / `lm_head.weight` (unless the matching `--quantize-…` flag is set). The triplet `name.weight` (packed u32) + `name.scales` (bf16) + `name.biases` (bf16) is written to the output.
-- **Copied unchanged**: 1D norms, conv1d kernels, biases, RoPE `inv_freq` tables, anything that isn't a Linear-shaped 2D weight.
+- **Quantized**: every 2D weight matrix whose name ends in `.weight` whose last dim divides `64` (the kernel's group_size constraint) and the bit-width's pack factor (16 / 8 / 4 for 2 / 4 / 8 bits). Role routing (`embed_tokens.weight`, `lm_head.weight`, vision-tower prefixes) picks the per-tensor bit-width from the `--*-bits` overrides; everything else uses `--bits`. The triplet `name.weight` (packed u32) + `name.scales` (bf16) + `name.biases` (bf16) is written to the output.
+- **Copied unchanged**: 1D norms, conv1d kernels, biases, RoPE `inv_freq` tables, anything that isn't a Linear-shaped 2D weight. Also: any tensor whose role has no `--*-bits` override (embeddings / lm_head / vision tower default to skip).
 - **Patched**: `config.json` gets `quantization` (mlx-lm convention) and `quantization_config` (transformers convention) blocks added, both with `{bits, group_size: 64, mode: "affine"}`. Other config keys are preserved. Non-finite numbers (Python `json.allow_nan=True` artifacts — e.g. NemotronH's `time_step_limit: [0.0, Infinity]`) are sanitized to JSON-legal sentinels (`1e308` / `NSNull`) so `JSONSerialization` can re-encode the dict.
 - **Copied alongside**: `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `chat_template.jinja`, `tokenizer.model`, `vocab.txt`, `merges.txt`, and any other top-level `*.json` / `*.txt` file in the source. HF Hub snapshot directories store these as relative symlinks into a `blobs/` store — the convert resolves the symlinks before copying so the destination is self-contained.
 

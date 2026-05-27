@@ -42,25 +42,46 @@ import Foundation
 import Metal
 
 /// Options controlling quantization behaviour.
+///
+/// Bit-widths are per-tensor-class. The default text path (`bits`)
+/// covers the attention + MLP linears (q/k/v/o, gate/up/down, MoE
+/// experts). The three `*Bits` optionals override it for specific
+/// roles — `nil` means "keep this tensor in its source dtype (don't
+/// quantize)". Each accepts any value the affine-quantize kernels can
+/// handle (today: 2 / 4 / 8 — the clean pack-factor path; 3 / 5 / 6
+/// use a different odd-width packing that the convert driver does
+/// not write yet).
+///
+/// A single conversion can mix bit-widths — FFAI's `loadLinear` /
+/// `loadEmbedding` derive the per-tensor bit-width from the saved
+/// shapes via `deriveAffineQuantBits`, so mixed checkpoints load
+/// correctly without per-tensor config.json entries.
 public struct ConvertOptions: Sendable {
-    /// Bit-width ∈ {2, 4, 8}. Default 4.
+    /// Bit-width for the main linear projections (attention + MLP).
+    /// Supported: 2 / 4 / 8. Default 4.
     public var bits: Int = 4
     /// Group size — must be 64 (kernel invariant). Do not change.
     public var groupSize: Int = 64
-    /// Dtype for non-quantized params (scales/biases inherit this from the
-    /// source weight's dtype; this field governs unquantized pass-throughs).
+    /// Dtype for non-quantized params (scales/biases inherit from the
+    /// source weight's dtype; this field governs unquantized pass-
+    /// throughs).
     public var dtype: DType = .bf16
-    /// Quantize the token embedding table too (mlx-lm default: false).
-    public var quantizeEmbeddings: Bool = false
-    /// Quantize the lm_head projection too (mlx-lm default: false — usually
-    /// tied to embed_tokens, so quantizing would double the error for the
-    /// output distribution).
-    public var quantizeLmHead: Bool = false
-    /// Quantize the vision tower's Linears too (mlx-lm default: false —
-    /// FFAI's VL towers run plain `Linear`, not `QuantizedLinear`, so
-    /// quantized vision weights would crash the loader. Vision-tower
-    /// params are a small fraction of the model size anyway).
-    public var quantizeVision: Bool = false
+    /// Bit-width for the token embedding table. `nil` (the default)
+    /// keeps it full-precision (mlx-lm convention). Set to 2 / 4 / 8
+    /// to quantize independently of the main `bits`.
+    public var embeddingBits: Int? = nil
+    /// Bit-width for the `lm_head` projection. `nil` (the default)
+    /// keeps it full-precision; when `lm_head` is tied to the
+    /// embedding the loader reuses the embedding triplet, so this
+    /// knob only matters for untied heads (Qwen3.6, some Gemma).
+    public var lmHeadBits: Int? = nil
+    /// Bit-width for vision-tower weights. `nil` (the default) keeps
+    /// the tower full-precision — FFAI's VL towers (Qwen3VL / Qwen3.5-VL,
+    /// Pixtral, SigLIP, Idefics3, MiniCPM-V, FastVLM) use plain
+    /// `Linear`, not `QuantizedLinear`, so quantizing vision weights
+    /// crashes the loader. Set only when wiring a new VL tower that
+    /// consumes `QuantizedLinear`.
+    public var visionBits: Int? = nil
 
     public init() {}
 }
@@ -105,10 +126,19 @@ public enum ConvertDriver {
         options: ConvertOptions = ConvertOptions(),
         progress: (@Sendable (String) -> Void)? = nil
     ) throws {
-        // Validate bit-width before doing any I/O so the error surfaces
-        // early rather than partway through a multi-GB conversion.
-        guard QuantizedOpsValidation.packFactor(forBits: options.bits) != nil else {
-            throw ConvertDriverError.unsupportedBits(options.bits)
+        // Validate every requested bit-width up front so a bad override
+        // surfaces before we touch the GPU or open the writer.
+        for (label, bits) in [
+            ("--bits", Optional.some(options.bits)),
+            ("--embedding-bits", options.embeddingBits),
+            ("--lm-head-bits", options.lmHeadBits),
+            ("--vision-bits", options.visionBits),
+        ] {
+            guard let b = bits else { continue }
+            if QuantizedOpsValidation.packFactor(forBits: b) == nil {
+                throw ConvertDriverError.unsupportedBits(b)
+            }
+            _ = label  // label is for future error messages
         }
 
         // Create the output directory (including parents).
@@ -134,20 +164,20 @@ public enum ConvertDriver {
 
         // Process tensors in sorted key order (deterministic output).
         let allKeys = bundle.allKeys.sorted()
-        let pf = QuantizedOpsValidation.packFactor(forBits: options.bits)!
 
         for key in allKeys {
             let entry = try bundle.tensor(named: key)
 
-            if shouldQuantize(
-                key: key, tensor: entry,
-                options: options, packFactor: pf)
-            {
+            if let bits = effectiveBits(key: key, tensor: entry, options: options) {
                 // ─── Quantize this weight ────────────────────────────
-                progress?("quantizing \(key) \(entry.shape)")
+                // Per-tensor bit-width — the `bits` value here may differ
+                // from `options.bits` when an `embeddingBits` /
+                // `lmHeadBits` / `visionBits` override applied.
+                let pf = QuantizedOpsValidation.packFactor(forBits: bits)!
+                progress?("quantizing \(key) \(entry.shape) @ \(bits)bit")
                 let (packedBytes, scalesBytes, biasesBytes) = try quantizeTensor(
                     entry, key: key, options: options,
-                    packFactor: pf, device: device)
+                    bits: bits, packFactor: pf, device: device)
 
                 // The weight key in the output is unchanged (e.g.
                 // "model.layers.0.self_attn.q_proj.weight"). The triplet
@@ -190,74 +220,74 @@ public enum ConvertDriver {
 
     // ─── Quantization eligibility ────────────────────────────────────
 
-    /// Decide whether a tensor should be quantized. Follows mlx-lm rules:
-    /// only 2D Linear-shaped weights where the inner dim is divisible by
-    /// both group_size and pack_factor. Norm weights are always kept full-
-    /// precision; embeddings and lm_head follow the option flags.
-    private static func shouldQuantize(
-        key: String, tensor: Tensor,
-        options: ConvertOptions, packFactor: Int
-    ) -> Bool {
-        // Must be a 2D weight.
-        guard tensor.shape.count == 2, key.hasSuffix(".weight") else { return false }
+    /// Pick the bit-width to use for `key`. `nil` means "skip
+    /// quantization, pass this tensor through unchanged" (norms, 1D
+    /// weights, tensors whose role opts out via a `nil` override).
+    ///
+    /// Routing:
+    ///   * `embed_tokens.weight` / `embeddings.weight` → `embeddingBits`
+    ///   * `lm_head.weight`                           → `lmHeadBits`
+    ///   * vision-tower keys (matches `.visual.` / `visual.` /
+    ///     `vision_tower.` / `vision_model.` prefixes used across
+    ///     Qwen3VL / Qwen3.5-VL / Pixtral / SigLIP / Idefics3 /
+    ///     MiniCPM-V / FastVLM)              → `visionBits`
+    ///   * everything else (attention + MLP)          → `bits`
+    ///
+    /// After role routing the shape is rechecked: a tensor only quantizes
+    /// if it is 2D, ends in `.weight`, and its inner dim is divisible by
+    /// both `group_size` and the chosen bit-width's `packFactor`. Norm
+    /// weights short-circuit here (1D) so they always pass through.
+    private static func effectiveBits(
+        key: String, tensor: Tensor, options: ConvertOptions
+    ) -> Int? {
+        // Must be a 2D `.weight` tensor to be eligible at all. Norms,
+        // biases, conv1d kernels, etc. fall through unquantized.
+        guard tensor.shape.count == 2, key.hasSuffix(".weight") else { return nil }
 
-        let inDim = tensor.shape[1]
-
-        // Inner dim must be divisible by group_size (hard kernel constraint)
-        // and by pack_factor (packing constraint).
-        guard inDim.isMultiple(of: options.groupSize),
-            inDim.isMultiple(of: packFactor)
-        else { return false }
-
-        // Norm layers: never quantize (tiny + numerically critical).
-        // Match both `layernorm.weight` and `norm.weight` suffixes used
-        // by different architectures.
+        // Norm layers (1D usually, but guard explicitly): never quantize.
         if key.hasSuffix("norm.weight") || key.hasSuffix("layernorm.weight") {
-            return false
+            return nil
         }
 
-        // Embedding table: skip unless explicitly requested.
+        // Pick the role-specific bit-width.
+        let roleBits: Int?
         if key.contains("embed_tokens.weight") || key.contains("embeddings.weight") {
-            return options.quantizeEmbeddings
+            roleBits = options.embeddingBits
+        } else if key.contains("lm_head.weight") {
+            roleBits = options.lmHeadBits
+        } else if key.contains(".visual.") || key.hasPrefix("visual.")
+            || key.contains("vision_tower.") || key.contains("vision_model.")
+        {
+            roleBits = options.visionBits
+        } else {
+            roleBits = options.bits
         }
+        guard let bits = roleBits else { return nil }
 
-        // lm_head: skip unless explicitly requested (usually tied to
-        // embed_tokens, so quantizing it would apply error twice).
-        if key.contains("lm_head.weight") {
-            return options.quantizeLmHead
+        // Shape feasibility for the chosen bit-width.
+        guard let pf = QuantizedOpsValidation.packFactor(forBits: bits) else { return nil }
+        let inDim = tensor.shape[1]
+        guard inDim.isMultiple(of: options.groupSize), inDim.isMultiple(of: pf) else {
+            return nil
         }
-
-        // Vision tower weights — skip unless explicitly requested.
-        // FFAI's VL towers (Qwen3VL, Pixtral, SigLIP, Idefics3, etc.)
-        // use plain `Linear`, not `QuantizedLinear`, so quantized vision
-        // weights crash the tower loader. mlx-lm follows the same
-        // convention. Matches the common HF storage prefixes:
-        //   `model.visual.*` (Qwen3-VL, Qwen3.5-VL)
-        //   `vision_tower.*` (newer Qwen3-VL, MiniCPM-V, Pixtral, SigLIP)
-        //   `vision_model.*` (older HF transformers convention)
-        //   `visual.*`       (some older Qwen / Qwen2-VL drops)
-        if !options.quantizeVision {
-            if key.contains(".visual.") || key.hasPrefix("visual.")
-                || key.contains("vision_tower.") || key.contains("vision_model.")
-            {
-                return false
-            }
-        }
-
-        return true
+        return bits
     }
 
     // ─── Per-tensor quantization ─────────────────────────────────────
 
-    /// GPU-quantize a single 2D weight tensor. Returns raw bytes for the
-    /// packed weight, scales, and biases buffers — ready for the writer.
+    /// GPU-quantize a single 2D weight tensor to `bits` bits per code.
+    /// Returns raw bytes for the packed weight, scales, and biases
+    /// buffers — ready for the writer.
     ///
-    /// The kernel operates on a flat [numel] view of the weight; the
-    /// original [out, in] shape is preserved at the caller level via
-    /// `packedShape` / `scalesShape`.
+    /// The kernel operates on a flat `[numel]` view of the weight; the
+    /// original `[out, in]` shape is preserved at the caller level via
+    /// `packedShape` / `scalesShape`. `bits` here may differ from
+    /// `options.bits` when an embedding / lm_head / vision override
+    /// applied — every per-tensor knob runs through this same path,
+    /// just with a different `bits` + `packFactor`.
     private static func quantizeTensor(
         _ src: Tensor, key: String,
-        options: ConvertOptions, packFactor: Int,
+        options: ConvertOptions, bits: Int, packFactor: Int,
         device: Device
     ) throws -> (packed: Data, scales: Data, biases: Data) {
         let numel = src.elementCount
@@ -280,7 +310,7 @@ public enum ConvertDriver {
         QuantizedOps.quantizeAffine(
             weight: flat,
             packed: packed, scales: scales, biases: biases,
-            bits: options.bits, groupSize: options.groupSize,
+            bits: bits, groupSize: options.groupSize,
             on: cb)
         cb.commit()
         cb.waitUntilCompleted()
