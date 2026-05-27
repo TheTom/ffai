@@ -1186,7 +1186,9 @@ extension DeepFilterNetModel {
         let outCPerGroup = outCW
         let outC = groups * outCPerGroup
 
-        let paddingT = kT - 1
+        // paddingT (kT - 1) would normally be the explicit pad on the time
+        // axis but the reference loop below baked the same offset directly
+        // into `ot2 = it + (kT - 1) - kt`, so the variable was never read.
         let paddingF = kF / 2
         let outT = T  // stride=1 for time
         let outF = (F - 1) * fstride - 2 * paddingF + kF + paddingF
@@ -1339,12 +1341,15 @@ extension DeepFilterNetModel {
         // Batch project input: gxAll[T, 3H] = x @ wihT + bih.
         var gxAll = [Float](repeating: 0, count: T * h3)
         // matmul: [T, inDim] x [inDim, h3] → [T, h3]
+        // ILP64 (`ACCELERATE_NEW_LAPACK` + `ACCELERATE_LAPACK_ILP64`) widens
+        // every BLAS_INDEX argument from `Int32` to `Int`, so leading-dim
+        // and shape arguments are now `Int`-typed.
         cblas_sgemm(
             CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            Int32(T), Int32(h3), Int32(inDim),
-            1.0, x, Int32(inDim),
-            wihT, Int32(h3),
-            0.0, &gxAll, Int32(h3)
+            Int(T), Int(h3), Int(inDim),
+            1.0, x, Int(inDim),
+            wihT, Int(h3),
+            0.0, &gxAll, Int(h3)
         )
         // Add bias.
         for t in 0 ..< T {
@@ -1359,8 +1364,8 @@ extension DeepFilterNetModel {
             // gh = state @ whhT.
             cblas_sgemv(
                 CblasRowMajor, CblasNoTrans,
-                Int32(h3), Int32(hiddenSize),
-                1.0, whhT, Int32(hiddenSize),
+                Int(h3), Int(hiddenSize),
+                1.0, whhT, Int(hiddenSize),
                 state, 1, 0.0, &gh, 1
             )
             for j in 0 ..< h3 { gh[j] += bhh[j] }

@@ -69,8 +69,17 @@ let package = Package(
                 // gets a deprecation warning per build pass. `_ILP64`
                 // is required by the new header to enable the 64-bit
                 // size_t-shaped BLAS_INDEX type.
-                .define("ACCELERATE_NEW_LAPACK"),
-                .define("ACCELERATE_LAPACK_ILP64"),
+                //
+                // These must reach clang (which compiles the imported
+                // Accelerate headers), so `.unsafeFlags(["-Xcc", ...])`
+                // is required — `.define(...)` only forwards to swiftc
+                // for `#if SWIFT_…` and does nothing for the C side.
+                .unsafeFlags([
+                    "-Xcc",
+                    "-DACCELERATE_NEW_LAPACK",
+                    "-Xcc",
+                    "-DACCELERATE_LAPACK_ILP64",
+                ])
             ]
         ),
 

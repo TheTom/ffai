@@ -735,10 +735,12 @@ public final class MoELayer: Module, DecoderLayer {
             let logitsHost = gateLogitsAll.toFloatArray()
             routings.withUnsafeMutableBufferPointer { buf in
                 // `nonisolated(unsafe)`: each iteration writes a disjoint
-                // `buf[r]`; `router` is a class with read-only state for
-                // the duration of this call.
+                // `buf[r]`. `router` is already Sendable (its state is
+                // read-only for the duration of this call) so the local
+                // capture needs no extra qualifier — only the raw pointer
+                // does, since Swift can't reason about disjoint writes.
                 nonisolated(unsafe) let bufPtr = buf.baseAddress!
-                nonisolated(unsafe) let routerLocal = router
+                let routerLocal = router
                 DispatchQueue.concurrentPerform(iterations: t) { r in
                     let start = r * nExperts
                     let rowLogits = Array(logitsHost[start ..< (start + nExperts)])
