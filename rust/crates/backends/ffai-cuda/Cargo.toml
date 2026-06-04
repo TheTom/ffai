@@ -79,3 +79,11 @@ required-features = ["cuda"]
 [[test]]
 name = "olmoe"
 required-features = ["cuda"]
+
+[[test]]
+name = "vit_ops"
+required-features = ["cuda"]
+
+[[test]]
+name = "siglip"
+required-features = ["cuda"]

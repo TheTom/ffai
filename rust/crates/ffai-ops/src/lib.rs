@@ -18,7 +18,7 @@
 //! lookup and are stubbed for now.
 
 use ffai_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
-use metaltile_core::ir::{BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
+use metaltile_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
 use metaltile_core::shape::Shape;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -450,10 +450,45 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-/// Dense matmul `a @ b`. General cooperative-matmul kernel (prefill); routes
-/// to [`gemv`] when `b` is a vector. Full tiled path wired later.
-pub fn matmul(_dev: &dyn Device, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
-    Err(Error::Unimplemented("ffai_ops::matmul (cooperative tiled path pending)"))
+/// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
+/// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
+/// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel
+/// `ffai_gemm` (weight read once per tile, reused across the row block — the
+/// many-token path that a `gemv`-per-row would re-stream). Requires
+/// `in_dim % 16 == 0` (the K-tile contract); row/out-dim edges are handled
+/// in-kernel. This is the matmul the prefill + VLM/ViT towers run on.
+pub fn matmul(dev: &dyn Device, weight: &Tensor, input: &Tensor) -> Result<Tensor> {
+    if weight.shape.len() != 2 {
+        return Err(Error::Msg(format!("matmul: weight must be 2-D, got {:?}", weight.shape)));
+    }
+    let (out_dim, in_dim) = (weight.shape[0], weight.shape[1]);
+    let rows = input.elem_count() / in_dim;
+    if input.elem_count() != rows * in_dim {
+        return Err(Error::Msg(format!("matmul: input {:?} not a multiple of in_dim {in_dim}", input.shape)));
+    }
+    if in_dim % 16 != 0 {
+        return Err(Error::Msg(format!("matmul: in_dim {in_dim} must be a multiple of 16")));
+    }
+    let k = lookup("ffai_gemm", weight.dtype)?;
+    let out = Tensor::empty(dev, vec![rows, out_dim], weight.dtype)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(32), (rows as u32).div_ceil(32), 1],
+        block: [1024, 1, 1],
+    };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(input.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(in_dim as u32),
+            u(out_dim as u32),
+            u(rows as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
 }
 
 /// DeepSeek-V4 MLA decode attention: d512 SDPA with a per-head learnable
@@ -571,6 +606,78 @@ fn elementwise_kernel(
 /// SiLU activation `out = x * sigmoid(x)`, elementwise. Dispatches `mt_silu`.
 pub fn silu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     elementwise_kernel(dev, "mt_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
+}
+
+/// Build an Elementwise `out[i] = act(a[i])` kernel for `dtype`. (`mt_gelu`
+/// is bench-only in the metaltile corpus — no registered correctness test — so
+/// we hand-build the IR the same way `binop_kernel` does for add/mul.)
+fn unary_act_kernel(name: &str, dtype: DType, kind: ActKind) -> Kernel {
+    let mut k = Kernel::new(name);
+    for (pname, is_out) in [("a", false), ("c", true)] {
+        k.params.push(Param {
+            name: pname.into(),
+            dtype,
+            shape: Shape::scalar(),
+            is_output: is_out,
+            kind: ParamKind::Tensor,
+        });
+    }
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(
+        Op::Load { src: "a".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None },
+        ValueId::new(1),
+    );
+    k.body.push_op(Op::Activation { kind, value: ValueId::new(1) }, ValueId::new(2));
+    k.body.push_op_no_result(Op::Store {
+        dst: "c".into(),
+        indices: vec![IndexExpr::Value(ValueId::new(0))],
+        value: ValueId::new(2),
+        mask: None,
+    });
+    k
+}
+
+/// GELU activation (PyTorch tanh approximation, = `gelu_pytorch_tanh`),
+/// elementwise. Hand-built `Activation(Gelu)` kernel. Used by ViT / SigLIP /
+/// CLIP towers and the GELU-MLP LLM families.
+pub fn gelu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
+    let k = unary_act_kernel("mt_gelu", x.dtype, ActKind::Gelu);
+    let n = x.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[Binding::Buffer(x.buffer.clone()), Binding::Buffer(out.buffer.clone())],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// LayerNorm `out = (x - mean) / sqrt(var + eps) * w + b`, normalized over the
+/// last dim. Mean-subtracting + bias (unlike RMSNorm). Dispatches the
+/// Reduction-mode `mt_layer_norm` (one threadgroup per row, block = n/4 — needs
+/// the row width `n` divisible by `4·lsize`; ViT/SigLIP widths are). Used by
+/// every transformer with LayerNorm (vision towers, BERT-style, GPT-2, …).
+pub fn layer_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
+    let n = *x.shape.last().ok_or_else(|| Error::Msg("layer_norm: scalar input".into()))?;
+    let rows = x.elem_count() / n;
+    let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
+    let eps_buf = dev.upload(&eps.to_le_bytes())?;
+    let k = lookup("mt_layer_norm", x.dtype)?;
+    let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(weight.buffer.clone()),
+            Binding::Buffer(bias.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf),
+            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
 }
 
 /// Fused SwiGLU `out = silu(gate) * up`, elementwise. Dispatches `mt_swiglu`.
