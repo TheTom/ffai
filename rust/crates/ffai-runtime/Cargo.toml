@@ -7,5 +7,3 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ffai-core.workspace = true
-ffai-models.workspace = true

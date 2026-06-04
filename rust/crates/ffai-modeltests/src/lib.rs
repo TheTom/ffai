@@ -77,7 +77,7 @@ pub fn verify_gpt2(d: &dyn Device, plat: &str) {
     let xf = layer_norm(d, &up(&x, vec![hid]),
         &up(&g("ln_f.weight"), vec![hid]), &up(&g("ln_f.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&wte, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
+    let argmax = ffai_runtime::argmax(&logits);
     eprintln!("GPT-2-124M full forward on {plat}: argmax = {argmax} (HF = 198)");
     assert_eq!(argmax, 198, "GPT-2 argmax != HF 198");
     eprintln!("✅ Full real GPT-2 forward matches HF on the shared engine ({plat}) — one shared forward, both backends.");
@@ -140,7 +140,7 @@ pub fn verify_mamba2(d: &dyn Device, plat: &str) {
     let xf = rms_norm(d, &up(&x), &up(&g("backbone.norm_f.weight")), eps).unwrap();
     let lm = upm(&embed, vec![vocab, hid]);
     let logits = dl(&gemv(d, &lm, &xf).unwrap(), vocab);
-    let argmax = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
+    let argmax = ffai_runtime::argmax(&logits);
     eprintln!("Mamba2-130m full forward on {plat}: argmax = {argmax} (HF = 310)");
     assert_eq!(argmax, 310, "Mamba2 argmax != HF 310");
     eprintln!("✅ Full real Mamba2-130m forward matches HF on the shared engine ({plat}).");
@@ -201,7 +201,7 @@ pub fn verify_pythia(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("gpt_neox.final_layer_norm.weight"), vec![hid]), &up(&g("gpt_neox.final_layer_norm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("embed_out.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
+    let argmax = ffai_runtime::argmax(&logits);
     eprintln!("Pythia-160m on {plat}: argmax = {argmax} (HF = 285)");
     assert_eq!(argmax, 285, "Pythia argmax != HF 285");
     eprintln!("✅ Pythia-160m matches HF ({plat}).");
@@ -242,7 +242,7 @@ pub fn verify_olmo2(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g("model.norm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("OLMo-2-1B on {plat}: top3 = {:?} (HF = [198,8,13])", &idx[..3]);
     assert_eq!(&idx[..3], &[198usize, 8, 13], "OLMo-2 top-3 != HF");
     eprintln!("✅ OLMo-2-1B matches HF ({plat}).");
@@ -279,7 +279,7 @@ pub fn verify_gptneo(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("transformer.ln_f.weight"), vec![hid]), &up(&g("transformer.ln_f.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&wte, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("GPT-Neo-125M on {plat}: top3 = {:?} (HF = [28,59,91])", &idx[..3]);
     assert_eq!(&idx[..3], &[28usize, 59, 91], "GPT-Neo top-3 != HF");
     eprintln!("✅ GPT-Neo-125M matches HF ({plat}).");
@@ -320,7 +320,7 @@ pub fn verify_gemma2(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g1("model.norm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&embed, vec![vocab, hid]), &xf).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("Gemma-2-2b on {plat}: top3 = {:?} (HF = [9707,235265,110])", &idx[..3]);
     assert_eq!(&idx[..3], &[9707usize, 235265, 110], "Gemma top-3 != HF");
     eprintln!("✅ Gemma-2-2b matches HF ({plat}).");
@@ -356,7 +356,7 @@ pub fn verify_phi(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("model.final_layernorm.weight"), vec![hid]), &up(&g("model.final_layernorm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&add(d, &gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), &up(&g("lm_head.bias"), vec![vocab])).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("Phi-1.5 on {plat}: top3 = {:?} (HF = [11,13,546])", &idx[..3]);
     assert_eq!(&idx[..3], &[11usize, 13, 546], "Phi top-3 != HF");
     eprintln!("✅ Phi-1.5 matches HF ({plat}).");
@@ -395,7 +395,7 @@ pub fn verify_stablelm2(d: &dyn Device, plat: &str) {
     }
     let xf = layer_norm(d, &up(&x, vec![hid]), &up(&g("model.norm.weight"), vec![hid]), &up(&g("model.norm.bias"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("StableLM-2-1.6B on {plat}: top3 = {:?} (HF = [341,11,280])", &idx[..3]);
     assert_eq!(&idx[..3], &[341usize, 11, 280], "StableLM-2 top-3 != HF");
     eprintln!("✅ StableLM-2-1.6B matches HF ({plat}).");
@@ -433,9 +433,9 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
         let exps: Vec<f32> = rl.iter().map(|&z| (z-mx).exp()).collect();
         let sum: f32 = exps.iter().sum();
         let probs: Vec<f32> = exps.iter().map(|&e| e/sum).collect();
-        let mut eidx: Vec<usize> = (0..n_exp).collect(); eidx.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+        let eidx = ffai_runtime::topk(&probs, top_k);
         let mut acc = vec![0.0f32; hid];
-        for &e in &eidx[..top_k] {
+        for &e in &eidx {
             let w = probs[e]; let ep = format!("{p}.mlp.experts.{e}");
             let ge = gemv(d, &upm(&g(&format!("{ep}.gate_proj.weight")), vec![inter, hid]), &xn2).unwrap();
             let ue = gemv(d, &upm(&g(&format!("{ep}.up_proj.weight")), vec![inter, hid]), &xn2).unwrap();
@@ -447,7 +447,7 @@ pub fn verify_olmoe(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x), &up(&g("model.norm.weight")), eps).unwrap();
     let logits = dl(&gemv(d, &upm(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let argmax = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
+    let argmax = ffai_runtime::argmax(&logits);
     eprintln!("OLMoE-1B-7B on {plat}: argmax = {argmax} (HF = 310)");
     assert_eq!(argmax, 310, "OLMoE argmax != HF 310");
     eprintln!("✅ OLMoE-1B-7B (64-expert MoE) matches HF ({plat}).");
@@ -519,7 +519,7 @@ pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
     }
     let xf = rms_norm(d, &up(&x, vec![hid]), &up(&g("model.final_layernorm.weight"), vec![hid]), eps).unwrap();
     let logits = dl(&gemv(d, &up(&g("lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
-    let mut idx: Vec<usize> = (0..vocab).collect(); idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let idx = ffai_runtime::topk(&logits, 3);
     eprintln!("Falcon-H1-0.5B on {plat}: top3 = {:?} (HF = [593,531,587])", &idx[..3]);
     assert_eq!(&idx[..3], &[593usize, 531, 587], "Falcon-H1 top-3 != HF");
     eprintln!("✅ Falcon-H1-0.5B (hybrid Mamba2+attn) matches HF ({plat}).");

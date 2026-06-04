@@ -13,3 +13,4 @@ ffai-core.workspace = true
 ffai-ops.workspace = true
 ffai-loader.workspace = true
 ffai-models.workspace = true
+ffai-runtime.workspace = true

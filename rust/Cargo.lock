@@ -136,6 +136,7 @@ dependencies = [
  "ffai-loader",
  "ffai-models",
  "ffai-ops",
+ "ffai-runtime",
 ]
 
 [[package]]
@@ -153,10 +154,6 @@ dependencies = [
 [[package]]
 name = "ffai-runtime"
 version = "0.1.0"
-dependencies = [
- "ffai-core",
- "ffai-models",
-]
 
 [[package]]
 name = "ffai-vulkan"
