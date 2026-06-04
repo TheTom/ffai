@@ -223,6 +223,45 @@ pub fn matmul(_dev: &dyn Device, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
     Err(Error::Unimplemented("ffai_ops::matmul (cooperative tiled path pending)"))
 }
 
+/// DeepSeek-V4 MLA decode attention: d512 SDPA with a per-head learnable
+/// **attention sink** (a virtual logit that extends the softmax denominator).
+/// `q` is `[n_q_heads, 512]`; `k`/`v` are the latent KV cache
+/// `[n_kv_heads, kv_stride, 512]`; `sink_logit` is `[n_q_heads]` f32.
+/// Dispatches `ffai_sdpa_decode_d512_sink` (tg 512).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_sink(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    sink_logit: &Tensor,
+    n_kv: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    const HD: usize = 512;
+    let n_q_heads = q.elem_count() / HD;
+    let out = Tensor::empty(dev, vec![n_q_heads, HD], q.dtype)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let kern = lookup("ffai_sdpa_decode_d512_sink", q.dtype)?;
+    let bindings = vec![
+        Binding::Buffer(q.buffer.clone()),
+        Binding::Buffer(k.buffer.clone()),
+        Binding::Buffer(v.buffer.clone()),
+        Binding::Buffer(sink_logit.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(HD as u32),
+        u(n_kv),
+        u(kv_stride),
+        u(heads_per_group),
+        Binding::Scalar(scale.to_le_bytes().to_vec()),
+    ];
+    let grid = Grid { grid: [n_q_heads as u32, 1, 1], block: [512, 1, 1] };
+    dev.dispatch(&kern, &bindings, grid)?;
+    Ok(out)
+}
+
 /// Decode-time scaled-dot-product attention for a single query token.
 ///
 /// Layout (matching the kernel): `q` is `[n_q_heads, head_dim]`; `k`/`v` are
