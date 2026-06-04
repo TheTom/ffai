@@ -71,3 +71,7 @@ required-features = ["cuda"]
 [[test]]
 name = "conv1d_test"
 required-features = ["cuda"]
+
+[[test]]
+name = "mamba2"
+required-features = ["cuda"]
