@@ -158,17 +158,19 @@ pub fn mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
 /// `mt_rms_norm_wide` variant lifts this — wired later).
 pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
     let n = *x.shape.last().ok_or_else(|| Error::Msg("rms_norm: scalar input".into()))?;
-    if n % 128 != 0 || n > 4096 {
-        return Err(Error::Msg(format!(
-            "rms_norm: row width {n} must be a multiple of 128 and ≤ 4096 (use the wide variant)"
-        )));
-    }
     let rows = x.elem_count() / n;
-    let k = lookup("mt_rms_norm", x.dtype)?;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let eps_buf = dev.upload(&eps.to_le_bytes())?;
 
-    let grid = Grid { grid: [rows as u32, 1, 1], block: [(n / 4) as u32, 1, 1] };
+    // Fast path: 4 elems/thread, needs n a multiple of 128 and ≤ 4096.
+    // Otherwise the strided wide variant handles any row width.
+    let (kname, block) = if n % 128 == 0 && n <= 4096 {
+        ("mt_rms_norm", (n / 4) as u32)
+    } else {
+        ("mt_rms_norm_wide", 256u32)
+    };
+    let k = lookup(kname, x.dtype)?;
+    let grid = Grid { grid: [rows as u32, 1, 1], block: [block, 1, 1] };
     dev.dispatch(
         &k,
         &[

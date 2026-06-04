@@ -14,11 +14,15 @@ per-model code.
 
 | model | arch detail | CUDA (GB10 / sm_121) | Metal (Apple GPU) | HF argmax (tok 9707) |
 |---|---|:---:|:---:|:---:|
-| Qwen3-0.6B   | qk-norm, tied      | ✅ 21806 | ✅ 21806 | 21806 |
-| Qwen2.5-0.5B | QKV bias, tied     | ✅ 11    | ✅ 11    | 11 |
+| Qwen3-0.6B    | qk-norm, tied, hd128       | ✅ 21806 | ✅ 21806 | 21806 |
+| Qwen2.5-0.5B  | QKV bias, tied, hd64       | ✅ 11    | ✅ 11    | 11 |
+| SmolLM2-135M  | Llama-arch, tied, hidden 576 | ✅ 28  | ✅ 28    | 28 |
 
-Same code path covers (verify as weights are staged): **Llama 3.x, Mistral,
-Yi, Phi, SmolLM(2), Qwen2/2.5/3, Starcoder2, OLMo, InternLM2, Granite3** — all
+Three distinct architectures (qk-norm / QKV-bias / plain-Llama) and a
+non-128-multiple hidden (576, handled by the strided `mt_rms_norm_wide`
+fallback) — all auto-loaded by `load_hf`, identical argmax on CUDA, Metal,
+and HF. Same code path covers the rest of the family as weights are staged:
+**Llama 3.x, Mistral, Yi, Phi, Starcoder2, OLMo, InternLM2, Granite3, …** —
 dense Llama-style transformers differing only by config + the qk-norm/bias
 flags `load_hf` already detects.
 
