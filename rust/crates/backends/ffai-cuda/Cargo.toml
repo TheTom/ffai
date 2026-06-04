@@ -115,3 +115,7 @@ required-features = ["cuda"]
 [[test]]
 name = "whisper_base"
 required-features = ["cuda"]
+
+[[test]]
+name = "smolvlm"
+required-features = ["cuda"]
