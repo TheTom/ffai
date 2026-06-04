@@ -221,6 +221,59 @@ pub fn matmul(_dev: &dyn Device, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
     Err(Error::Unimplemented("ffai_ops::matmul (cooperative tiled path pending)"))
 }
 
+/// Decode-time scaled-dot-product attention for a single query token.
+///
+/// Layout (matching the kernel): `q` is `[n_q_heads, head_dim]`; `k`/`v` are
+/// `[n_kv_heads, kv_stride, head_dim]` (kv cache, `kv_stride` = capacity,
+/// `n_kv` = filled length); `kv_head = q_head / heads_per_group` (GQA). No
+/// attention sink / sliding window (dense causal). Picks the head-dim
+/// specialized kernel variant. Output is `[n_q_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    scale: f32,
+) -> Result<Tensor> {
+    let n_q_heads = q.elem_count() / head_dim;
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+
+    // Per-variant trailing constexprs (everything after head_dim, n_kv,
+    // kv_stride, heads_per_group). Dense path → sink/window disabled.
+    let (name, block, trailing): (&str, u32, Vec<Binding>) = match head_dim {
+        64 => ("ffai_sdpa_decode_d64", 1024, vec![u(0), f(0.0), f(scale)]), // has_sink, sink_logit, scale
+        96 => ("ffai_sdpa_decode_d96", 1024, vec![f(scale)]),
+        128 => ("ffai_sdpa_decode", 1024, vec![u(0), u(0), u(0), f(0.0), f(scale)]), // sink_end, window_start, has_sink, sink_logit, scale
+        256 => ("ffai_sdpa_decode_d256", 1024, vec![u(0), f(0.0), f(scale)]),
+        512 => ("ffai_sdpa_decode_d512", 512, vec![f(scale)]),
+        _ => return Err(Error::Msg(format!("sdpa_decode: unsupported head_dim {head_dim}"))),
+    };
+
+    let kern = lookup(name, q.dtype)?;
+    let mut bindings = vec![
+        Binding::Buffer(q.buffer.clone()),
+        Binding::Buffer(k.buffer.clone()),
+        Binding::Buffer(v.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(head_dim as u32),
+        u(n_kv),
+        u(kv_stride),
+        u(heads_per_group),
+    ];
+    bindings.extend(trailing);
+    let grid = Grid { grid: [n_q_heads as u32, 1, 1], block: [block, 1, 1] };
+    dev.dispatch(&kern, &bindings, grid)?;
+    Ok(out)
+}
+
 /// Run a registered elementwise kernel (Grid3D, one thread per element) with
 /// the given ordered bindings, producing a fresh `out`-shaped output.
 fn elementwise_kernel(

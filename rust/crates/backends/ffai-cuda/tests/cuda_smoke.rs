@@ -293,3 +293,59 @@ fn ffai_ops_transformer_ops_on_cuda() {
     assert!(e <= 1e-5, "softmax mismatch: {e:.2e}");
     eprintln!("ffai_ops::softmax (mt_softmax) on CUDA: OK (max|Δ|={e:.1e})");
 }
+
+/// Decode-time attention (sdpa_decode) on CUDA vs a CPU reference, single
+/// q-head / single kv-head, head_dim=64. The gatekeeper op for a real
+/// transformer forward.
+#[test]
+fn ffai_ops_sdpa_decode_on_cuda() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else {
+        eprintln!("no CUDA device — skipping");
+        return;
+    };
+
+    const HD: usize = 64;
+    const NKV: usize = 128;
+    let scale = 1.0f32 / (HD as f32).sqrt();
+
+    let q: Vec<f32> = (0..HD).map(|d| ((d % 9) as f32 - 4.0) * 0.05).collect();
+    let kc: Vec<f32> = (0..NKV * HD).map(|i| ((i % 17) as f32 - 8.0) * 0.02).collect();
+    let vc: Vec<f32> = (0..NKV * HD).map(|i| ((i % 11) as f32 - 5.0) * 0.03).collect();
+
+    let tq = Tensor::new(dev.upload(&to_bytes(&q)).unwrap(), vec![1, HD], DType::F32);
+    let tk = Tensor::new(dev.upload(&to_bytes(&kc)).unwrap(), vec![NKV, HD], DType::F32);
+    let tv = Tensor::new(dev.upload(&to_bytes(&vc)).unwrap(), vec![NKV, HD], DType::F32);
+
+    // n_kv=128, kv_stride=128 (cache exactly filled), heads_per_group=1.
+    let tout =
+        ffai_ops::sdpa_decode(dev.as_ref(), &tq, &tk, &tv, HD, NKV as u32, NKV as u32, 1, scale)
+            .unwrap();
+    dev.synchronize().unwrap();
+    let mut ob = vec![0u8; HD * 4];
+    dev.download(tout.buffer.as_ref(), &mut ob).unwrap();
+    let got = from_bytes(&ob);
+
+    // CPU reference: scores = scale·(q·k[t]); softmax; out = Σ p[t]·v[t].
+    let mut scores = vec![0.0f32; NKV];
+    for t in 0..NKV {
+        let dot: f32 = (0..HD).map(|d| q[d] * kc[t * HD + d]).sum();
+        scores[t] = scale * dot;
+    }
+    let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+    let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    let mut want = vec![0.0f32; HD];
+    for t in 0..NKV {
+        let p = exps[t] / sum;
+        for d in 0..HD {
+            want[d] += p * vc[t * HD + d];
+        }
+    }
+
+    let mut err = 0.0f32;
+    for d in 0..HD {
+        err = err.max((got[d] - want[d]).abs());
+    }
+    assert!(err <= 1e-4, "sdpa_decode on CUDA mismatch: max|Δ|={err:.3e}");
+    eprintln!("ffai_ops::sdpa_decode (ffai_sdpa_decode_d64) on CUDA: OK (max|Δ|={err:.1e})");
+}
