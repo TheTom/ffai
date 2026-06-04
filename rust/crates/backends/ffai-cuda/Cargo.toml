@@ -87,3 +87,7 @@ required-features = ["cuda"]
 [[test]]
 name = "siglip"
 required-features = ["cuda"]
+
+[[test]]
+name = "whisper"
+required-features = ["cuda"]
