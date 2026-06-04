@@ -35,7 +35,8 @@ doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
 |---|---|:---:|:---:|:---:|
 | GPT-2 124M | LayerNorm-LLM, learned-pos, Conv1D (transposed) weights, gelu_new, tied | ✅ 198 | ✅ 198 | 198 |
 | Pythia-160m | GPT-NeoX: parallel residual, interleaved per-head QKV, partial rotary | ✅ 285 | ✅ 285 | 285 |
-| Gemma-2-2b | √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA hd256, softcaps | ⏳ | ✅ top3 | [9707,235265,110] |
+| Gemma-2-2b | √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA hd256, softcaps | ✅ top3 | ✅ top3 | [9707,235265,110] |
+| Phi-1.5 | single shared norm → parallel attn+MLP, separate q/k/v+bias, partial rotary | ✅ top3 | ✅ top3 | [11,13,546] |
 
 (`load_hf` already covers qk-norm / QKV-bias / plain-Llama / GQA via Qwen3·Qwen2.5·SmolLM2.)
 
@@ -45,7 +46,8 @@ doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
 |---|---|---|
 | MoE — OLMoE / Qwen2-MoE / GPT-OSS / Granite4 | router → top-k → per-expert SwiGLU (+ optional shared expert) | ✅ **full real OLMoE-1B-7B verified vs HF both platforms** (argmax 310 on Metal + CUDA) — 16-layer, 64-expert, top-8, no-renorm (`norm_topk_prob=false`), no shared expert, qk-norm over the *full* 2048 projection, MHA hd128, sharded BF16 checkpoint via the mmap sharded loader. Plus the real Qwen2-MoE block (sigmoid-gated shared expert, max\|Δ\|4.6e-7 both platforms). |
 | DeepSeek-V4 (MLA + DSv4-MoE + mHC) | full novel arch | ✅ **entire compute path + GGUF loader verified** (MLA/MoE/mHC composites both platforms vs CPU; F32/F16/Q8_0/Q2_K/IQ2_XXS dequant vs gguf-py on the 81GB checkpoint). Full 43-layer forward blocked on CSA/HCA sparse-attention (WIP in the reference itself — no correct oracle). |
-| SSM — Mamba2, Jamba, FalconH1, LFM2 | conv1d + SSD selective-scan + gated RMSNorm | ✅ **full real Mamba2-130m verified vs HF both platforms** (argmax 310 on CUDA + Metal) — 24-layer forward: in_proj → conv1d+silu → SSD scan → gated RMSNorm → out_proj, on the shared op layer. |
+| SSM — Mamba2, Jamba, LFM2 | conv1d + SSD selective-scan + gated RMSNorm | ✅ **full real Mamba2-130m verified vs HF both platforms** (argmax 310 on CUDA + Metal) — 24-layer forward: in_proj → conv1d+silu → SSD scan → gated RMSNorm → out_proj, on the shared op layer. |
+| Hybrid SSM+attention — **Falcon-H1**, Jamba, Zamba | per-layer Mamba2 mixer ∥ attention, µP multipliers | ✅ **full real Falcon-H1-0.5B verified vs HF both platforms** (top-3 [593,531,587] on CUDA + Metal) — each of 36 layers runs the Mamba2 mixer AND GQA attention in parallel off one shared norm, summed into the residual, then SwiGLU FFN; all µP multipliers handled exactly. Reuses `conv1d_step`+`ssm_step` and `sdpa_decode` together in one model. |
 | VLM — SigLIP/CLIP towers · Pixtral, SmolVLM2, FastVLM, Idefics3, MiniCPMV | vision tower + projector + the LLM builder | ✅ **full real SigLIP-base vision tower verified vs HF both platforms** (last_hidden_state max\|Δ\| 9e-5 / sum −792.79 vs HF −792.795, Metal + CUDA) — 12-layer bidirectional ViT: patch-embed (conv-as-matmul) + position-embed + LayerNorm + full self-attention + GELU(tanh)-MLP, via the new `matmul`/`layer_norm`/`gelu` ops (all unit-checked vs CPU both platforms). The LLM half is the dense-Llama family above; a VLM = this tower → projector → that LLM. Projector + multimodal stitch pending. |
 | Audio — Whisper · Parakeet, Voxtral, StyleTTS2, … | encoder/decoder + audio front-end | ✅ **full real Whisper-tiny audio encoder verified vs HF both platforms** (last_hidden_state max\|Δ\| 2e-5 / sum 12390.6 vs HF 12390.46, Metal + CUDA) — conv front-end (two Conv1d as im2col + `matmul`) + sinusoidal pos-embed + 4-layer bidirectional transformer (LayerNorm + self-attention + exact-erf GELU-MLP). Same shared op set as the VLM tower; conv-as-im2col-matmul is the reusable audio/vision front-end pattern. |
 
