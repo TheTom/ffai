@@ -113,7 +113,7 @@ public final class PSOCache: @unchecked Sendable {
         // bit-deterministic wrong output (e.g. cos 0.816 vs 0.999 oracle).
         // Live-compile via `makeLibrary(source:)` resolves MPP against the
         // running OS's header, dodging the skew. See ollama #15594, #14432,
-        // llama.cpp PR #16634 for the same class of bug.
+        // (a known upstream Metal-compiler bug of the same class).
         let function: MTLFunction
         if Self.isMppKernel(name) {
             function = try liveCompileMppFunction(name)
