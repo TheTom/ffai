@@ -131,3 +131,7 @@ required-features = ["cuda"]
 [[test]]
 name = "gpt2_generate"
 required-features = ["cuda"]
+
+[[test]]
+name = "gpt2_kvcache"
+required-features = ["cuda"]
