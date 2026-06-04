@@ -173,3 +173,49 @@ pub fn dsv4_moe(dev: &dyn Device, w: &Dsv4Moe, x: &Tensor) -> Result<Tensor> {
 
     Ok(Tensor::new(dev.upload(&tb(&acc))?, vec![hidden], x.dtype))
 }
+
+// ── DeepSeek-V4 mHC layer wrapping ──────────────────────────────────────
+
+/// mHC (hyper-connection) weights for one subblock.
+pub struct MhcWeights {
+    pub hc_fn: Tensor,    // [24, n_hc*hidden] — the mix projection
+    pub hc_scale: [f32; 3], // pre / post / comb scales
+    pub hc_base: Vec<f32>,  // [24]
+}
+
+/// Full DSv4 attention subblock with the 4-channel mHC residual:
+/// `mixes = hc_fn · flatten(state)` → sinkhorn split → collapse(state, pre) →
+/// MLA(x) → expand(blockOut, post, comb, state) → new state `[n_hc, hidden]`.
+/// `n_hc = 4`, `eps`/`iters` are the Sinkhorn params.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_attn_subblock(
+    dev: &dyn Device,
+    cfg: &MlaConfig,
+    mhc: &MhcWeights,
+    mla: &MlaWeights,
+    hc_state: &Tensor, // [n_hc, hidden]
+    position: u32,
+    eps: f32,
+    iters: u32,
+) -> Result<Tensor> {
+    const N_HC: usize = 4;
+    let hidden = cfg.hidden;
+
+    // mHC mix → sinkhorn split (host).
+    let flat = hc_state.reshaped(vec![N_HC * hidden]);
+    let mixes_t = ops::gemv(dev, &mhc.hc_fn, &flat)?; // [24]
+    dev.synchronize()?;
+    let mut mb = vec![0u8; 24 * 4];
+    dev.download(mixes_t.buffer.as_ref(), &mut mb)?;
+    let (pre, post, comb) =
+        ops::dsv4_mhc_sinkhorn_split(&fb(&mb), mhc.hc_scale, &mhc.hc_base, eps, iters);
+
+    let pre_t = Tensor::new(dev.upload(&tb(&pre))?, vec![N_HC], DType::F32);
+    let post_t = Tensor::new(dev.upload(&tb(&post))?, vec![N_HC], DType::F32);
+    let comb_t = Tensor::new(dev.upload(&tb(&comb))?, vec![N_HC * N_HC], DType::F32);
+
+    // collapse → MLA → expand.
+    let x = ops::dsv4_mhc_collapse(dev, hc_state, &pre_t, hidden as u32, N_HC as u32)?;
+    let block_out = mla_attention(dev, cfg, mla, &x, position)?;
+    ops::dsv4_mhc_expand(dev, &block_out, &post_t, &comb_t, hc_state, hidden as u32, N_HC as u32)
+}
