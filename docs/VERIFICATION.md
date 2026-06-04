@@ -30,7 +30,8 @@ flags `load_hf` already detects.
 
 | family | needs | status |
 |---|---|---|
-| MoE — DeepSeek-V4, GPT-OSS, Granite4, Qwen-MoE | router → top-k → per-expert SwiGLU → weighted sum | ✅ **compute path verified both platforms** vs CPU (Metal 1.6e-3, CUDA 1.7e-3); real-model-vs-HF pending large expert weights. DSv4 adds MLA attention (still pending). |
+| MoE — Qwen2-MoE / GPT-OSS / Granite4 | router → top-k → per-expert SwiGLU + shared expert | ✅ **real Qwen2-MoE block verified vs HF both platforms** (Metal 4.6e-7, CUDA 4.6e-7) — softmax→top-k routing, SwiGLU experts, sigmoid-gated shared expert, on real checkpoint weights. |
+| DeepSeek-V4 (MLA + DSv4-MoE + mHC) | full novel arch | ✅ **entire compute path + GGUF loader verified** (MLA/MoE/mHC composites both platforms vs CPU; F32/F16/Q8_0/Q2_K/IQ2_XXS dequant vs gguf-py on the 81GB checkpoint). Full 43-layer forward blocked on CSA/HCA sparse-attention (WIP in the reference itself — no correct oracle). |
 | SSM — Mamba2, Jamba, FalconH1, LFM2 | gated-delta / SSM scan kernels (exist) | builder pending |
 | VLM — Pixtral, SmolVLM2, FastVLM, Idefics3, MiniCPMV | vision tower + projector + the LLM builder | pending |
 | Audio — TTS/STT (Parakeet, Voxtral, StyleTTS2, …) | encoder/decoder + audio front-end | pending |
