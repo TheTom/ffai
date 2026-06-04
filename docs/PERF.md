@@ -8,18 +8,26 @@
 | Metal — resident bufs | 24 tok/s | **17.6 tok/s (57 ms/tok)** | 11s upload + 32s JIT | exact HF match |
 | Metal — old shim | 11 tok/s | 9.4 tok/s (107 ms/tok) | (re-uploaded weights/dispatch) | exact HF match |
 
-## Per-dispatch micro-bench (the Rust-vs-Swift question)
+## Per-dispatch micro-bench — Rust vs Swift, same Apple GPU (settles the FFI-overhead question)
 
-| op (Rust → Metal) | shim | resident | what it is |
-|---|---|---|---|
-| tiny add (4096) | 188 µs | 161 µs | per-dispatch floor = `commit()`+wait |
-| gemv (2048², 16MB wt) | 1868 µs | **178 µs** | shim re-uploaded the weight every call |
+gemv (2048×2048), per-commit = one command buffer per op + wait:
 
-The 10× gemv drop confirms the cost was the **host-shadow shim re-uploading
-weights per dispatch**, now fixed (see below). What remains (~161 µs/dispatch
-floor) is the Metal `commit()`+wait, a driver cost paid identically from Swift —
-the host language is not the variable. Going below it means batching ops into
-fewer command buffers (`dispatch_chain`), not changing host language.
+| path | per-dispatch | batched (N ops / 1 cmd buffer) |
+|---|---|---|
+| Rust → Metal (resident weights) | **178 µs** | (via `dispatch_chain`) |
+| Rust → Metal (old host-shadow shim) | 1868 µs | — |
+| Swift → Metal (native `Ops.gemv`) | **170 µs** | **22 µs/op** |
+
+**Rust and Swift per-dispatch are within ~4%** — both pay the same Metal
+`commit()`+wait, so the host language is not the variable (there's no Swift→Rust
+FFI in the inference path anyway). The earlier 10× Rust gap was purely the
+host-shadow shim re-uploading weights every dispatch, now fixed.
+
+The real lever is **batching**: Swift's 22 µs/op (7.6× faster) comes from
+encoding many ops into one command buffer (its `Ops.gemv(on: cmd)` API). Rust
+gets the same via `dispatch_chain` — the Device trait currently commits per op;
+batching a whole layer into one command buffer is the next win, identical in
+kind to what Swift does. tiny add: 188 µs (shim) → 161 µs (resident).
 
 ## Fixed: resident-buffer fast path (was a host-shadow copy-in/out shim)
 
