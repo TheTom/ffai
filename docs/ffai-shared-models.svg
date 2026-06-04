@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1180" viewBox="0 0 1500 1180" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .title { font-size: 32px; font-weight: 700; fill: #0f172a; }
+      .sub   { font-size: 16px; fill: #64748b; }
+      .h     { font-size: 21px; font-weight: 700; fill: #0f172a; }
+      .lbl   { font-size: 16px; font-weight: 600; fill: #0f172a; }
+      .small { font-size: 13.5px; fill: #334155; }
+      .tiny  { font-size: 12px; fill: #64748b; }
+      .badge { font-size: 12px; font-weight: 700; fill:#fff; }
+      .arr   { stroke: #94a3b8; stroke-width: 2.4; fill: none; marker-end: url(#ah); }
+      .arrG  { stroke: #34d399; stroke-width: 2.6; fill: none; marker-end: url(#ahg); }
+    </style>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/></marker>
+    <marker id="ahg" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#34d399"/></marker>
+  </defs>
+
+  <rect width="1500" height="1180" fill="#f8fafc"/>
+  <text x="56" y="56" class="title">FFAI — models as a shared layer (target)</text>
+  <text x="56" y="82" class="sub">write each model ONCE (Rust) · run on every backend · Swift app calls in · zero per-platform duplication</text>
+
+  <!-- ===== Swift app shell (top-left) ===== -->
+  <rect x="56" y="118" width="430" height="150" rx="14" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="76" y="148" class="h" fill="#1d4ed8">Swift app (Apple)</text>
+  <text x="76" y="176" class="small">SwiftUI · AVFoundation capture · CoreML</text>
+  <text x="76" y="198" class="small">iPhone · iPad · Mac packaging</text>
+  <text x="76" y="226" class="small" font-weight="600">calls the shared engine via ffai-ffi (C-ABI)</text>
+  <text x="76" y="248" class="tiny">native Apple bits stay Swift; inference goes to Rust</text>
+
+  <!-- oracle note -->
+  <rect x="516" y="118" width="430" height="150" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="536" y="148" class="h" fill="#475569">Swift models = the oracle</text>
+  <text x="536" y="176" class="small">the existing ~35 Swift forward passes</text>
+  <text x="536" y="198" class="small">validate each Rust port bit-for-bit,</text>
+  <text x="536" y="220" class="small">then retire for inference.</text>
+  <text x="536" y="248" class="tiny">no throwaway work — they're the ground truth</text>
+
+  <!-- arrow swift -> models -->
+  <path d="M271,268 L271,300" class="arr"/>
+  <path d="M731,268 C731,290 530,290 510,300" class="arr" stroke-dasharray="5 4"/>
+  <text x="690" y="292" class="tiny" fill="#94a3b8">diff vs</text>
+
+  <!-- ===== SHARED: models ===== -->
+  <rect x="56" y="300" width="1388" height="150" rx="14" fill="#ecfdf5" stroke="#10b981" stroke-width="2.6"/>
+  <rect x="1296" y="306" width="140" height="22" rx="11" fill="#059669"/>
+  <text x="1312" y="322" class="badge">WRITTEN ONCE</text>
+  <text x="76" y="332" class="h" fill="#047857">ffai-models (Rust) — one codebase</text>
+  <text x="76" y="362" class="small">35 families collapse to ~6–10 block-builders + per-model config (like ggml):</text>
+  <text x="76" y="386" class="small" font-weight="600">transformer-LLM builder</text>
+  <text x="76" y="406" class="tiny">Llama · Qwen · Gemma · Mistral · Yi · Phi · SmolLM · Starcoder · OLMo …</text>
+  <rect x="520" y="372" width="270" height="46" rx="8" fill="#ffffff" stroke="#a7f3d0"/>
+  <text x="534" y="392" class="small" font-weight="600">MoE / MLA builder</text>
+  <text x="534" y="410" class="tiny">DeepSeek-V4 · GPT-OSS · Granite4</text>
+  <rect x="800" y="372" width="250" height="46" rx="8" fill="#ffffff" stroke="#a7f3d0"/>
+  <text x="814" y="392" class="small" font-weight="600">SSM builder</text>
+  <text x="814" y="410" class="tiny">Mamba2 · Jamba · FalconH1 · LFM2</text>
+  <rect x="1060" y="372" width="300" height="46" rx="8" fill="#ffffff" stroke="#a7f3d0"/>
+  <text x="1074" y="392" class="small" font-weight="600">VLM / Audio builders</text>
+  <text x="1074" y="410" class="tiny">Pixtral · SmolVLM2 · FastVLM · TTS/STT</text>
+
+  <path d="M750,450 L750,486" class="arrG"/>
+
+  <!-- ===== SHARED: ops seam ===== -->
+  <rect x="56" y="486" width="1388" height="66" rx="12" fill="#d1fae5" stroke="#10b981" stroke-width="2"/>
+  <text x="76" y="514" class="h" fill="#047857">ffai-ops — the op seam</text>
+  <text x="76" y="538" class="small">rms_norm · matmul · attention · rope · softmax · sampling  →  builds metaltile Kernel IR</text>
+  <text x="1180" y="525" class="tiny" fill="#047857">add/mul real today;</text>
+  <text x="1180" y="542" class="tiny" fill="#047857">heavy ops = next step</text>
+
+  <path d="M750,552 L750,588" class="arrG"/>
+
+  <!-- ===== SHARED: device trait ===== -->
+  <rect x="56" y="588" width="1388" height="58" rx="12" fill="#fde68a" stroke="#f59e0b" stroke-width="2.2"/>
+  <text x="76" y="624" class="h" fill="#92400e">ffai-core — one Device trait  (alloc · upload · dispatch · sync)</text>
+
+  <!-- arrows to backends -->
+  <path d="M270,646 L270,690" class="arr"/>
+  <path d="M580,646 L580,690" class="arr"/>
+  <path d="M890,646 L890,690" class="arr"/>
+  <path d="M1200,646 L1200,690" class="arr"/>
+
+  <!-- ===== backends ===== -->
+  <rect x="120" y="690" width="300" height="86" rx="10" fill="#dcfce7" stroke="#22c55e" stroke-width="2"/>
+  <text x="140" y="718" class="lbl" fill="#15803d">ffai-cuda</text>
+  <text x="140" y="740" class="small">REAL · GB10 sm_121</text>
+  <text x="140" y="760" class="tiny">NVRTC → PTX → driver</text>
+
+  <rect x="440" y="690" width="300" height="86" rx="10" fill="#fef9c3" stroke="#eab308" stroke-width="2"/>
+  <text x="460" y="718" class="lbl" fill="#854d0e">ffai-metal (metal-rs)</text>
+  <text x="460" y="740" class="small" font-weight="700" fill="#b45309">THE KEY PIECE TO BUILD</text>
+  <text x="460" y="760" class="tiny">makes Apple run the shared Rust models</text>
+
+  <rect x="760" y="690" width="280" height="86" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="780" y="718" class="lbl">ffai-vulkan</text>
+  <text x="780" y="740" class="small">portable GPUs</text>
+  <text x="780" y="760" class="tiny">SPIR-V (metaltile target next)</text>
+
+  <rect x="1060" y="690" width="280" height="86" rx="10" fill="#ffffff" stroke="#e2e8f0" stroke-dasharray="4 3"/>
+  <text x="1080" y="718" class="lbl" fill="#94a3b8">ffai-rocm …</text>
+  <text x="1080" y="740" class="small" fill="#94a3b8">AMD</text>
+  <text x="1080" y="760" class="tiny">one crate = one backend</text>
+
+  <!-- hardware -->
+  <path d="M270,776 L270,806" class="arr"/>
+  <path d="M590,776 L590,806" class="arr"/>
+  <path d="M900,776 L900,806" class="arr"/>
+  <path d="M1200,776 L1200,806" class="arr"/>
+  <text x="232" y="828" class="lbl">NVIDIA</text>
+  <text x="540" y="828" class="lbl">Apple GPU</text>
+  <text x="838" y="828" class="lbl">AMD / Intel / Android</text>
+  <text x="1150" y="828" class="lbl">…</text>
+
+  <!-- metaltile kernels feed backends -->
+  <rect x="56" y="868" width="1388" height="78" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2.4"/>
+  <text x="76" y="896" class="h" fill="#047857">metaltile — shared kernels (one IR → MSL · CUDA/PTX · SPIR-V)</text>
+  <text x="76" y="922" class="small">the kernels every backend runs · 4164/4164 bit-accurate on GB10 · already shared</text>
+  <path d="M300,868 C300,840 280,800 270,778" class="arrG" stroke-dasharray="5 4"/>
+  <text x="305" y="850" class="tiny" fill="#047857">feeds the Device backends</text>
+
+  <!-- payoff -->
+  <rect x="56" y="978" width="1388" height="150" rx="14" fill="#f0fdf4" stroke="#86efac" stroke-width="1.8"/>
+  <text x="76" y="1008" class="h" fill="#166534">No duplication</text>
+  <text x="76" y="1038" class="small">• Each model lives in ONE file (Rust). CUDA, Metal, Vulkan, ROCm all run the same code — the backend swaps underneath.</text>
+  <text x="76" y="1062" class="small">• Adding a GPU vendor = one backend crate, not 35 model rewrites. Adding a model = one builder, every GPU gets it free.</text>
+  <text x="76" y="1086" class="small">• Swift stays native for the iPhone app + is the bit-exact oracle the ports are checked against.</text>
+  <text x="76" y="1110" class="small" font-weight="600" fill="#166534">Cost: port ~6–10 builders (not 35) once + build the metal-rs backend. Then models are genuinely shared.</text>
+</svg>

@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1680" height="1120" viewBox="0 0 1680 1120" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .title  { font-size: 34px; font-weight: 700; fill: #0f172a; }
+      .sub    { font-size: 16px; fill: #64748b; }
+      .panel  { font-size: 24px; font-weight: 700; fill: #0f172a; }
+      .lbl    { font-size: 16px; font-weight: 600; fill: #0f172a; }
+      .small  { font-size: 13.5px; fill: #334155; }
+      .tiny   { font-size: 12px; fill: #64748b; }
+      .badge  { font-size: 12px; font-weight: 700; }
+      .arr    { stroke: #94a3b8; stroke-width: 2.2; fill: none; marker-end: url(#ah); }
+    </style>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <rect width="1680" height="1120" fill="#f8fafc"/>
+  <text x="60" y="58" class="title">FFAI — F*cking Fast AI</text>
+  <text x="60" y="84" class="sub">before: Swift, Apple-only  ·  after: one product, two engines, every GPU — shared kernels</text>
+
+  <!-- divider -->
+  <line x1="840" y1="110" x2="840" y2="1080" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="6 6"/>
+
+  <!-- ============================ BEFORE ============================ -->
+  <text x="60" y="150" class="panel">BEFORE</text>
+  <text x="60" y="174" class="sub">Swift inference library, native Metal</text>
+
+  <!-- swift engine box -->
+  <rect x="60" y="196" width="700" height="470" rx="14" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="80" y="226" class="lbl" fill="#1d4ed8">FFAI (Swift)</text>
+
+  <rect x="84" y="244" width="652" height="78" rx="9" fill="#ffffff" stroke="#bfdbfe"/>
+  <text x="100" y="270" class="lbl">~35 model families  ·  Vision  ·  Audio</text>
+  <text x="100" y="292" class="small">Llama · Qwen · Gemma · Nemotron · DeepSeek-V4 · Mamba · MoE …</text>
+  <text x="100" y="311" class="tiny">forward passes, written in Swift</text>
+
+  <rect x="84" y="334" width="652" height="96" rx="9" fill="#ffffff" stroke="#bfdbfe"/>
+  <text x="100" y="360" class="lbl">Swift runtime</text>
+  <text x="100" y="383" class="small">Device.swift · BufferPool · Ops · KVCache · Generation · Sampler</text>
+  <text x="100" y="405" class="small">Loaders: GGUF / SafeTensors / HF</text>
+  <text x="100" y="424" class="tiny">all Swift, all Apple</text>
+
+  <rect x="84" y="442" width="652" height="64" rx="9" fill="#ffffff" stroke="#bfdbfe"/>
+  <text x="100" y="468" class="lbl">MetalTileSwift</text>
+  <text x="100" y="490" class="small">pre-compiled kernels.metallib (AOT)  ·  PSOCache</text>
+
+  <!-- metal -->
+  <rect x="84" y="528" width="652" height="56" rx="9" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="100" y="562" class="lbl">Metal → Apple GPU</text>
+
+  <rect x="84" y="600" width="652" height="48" rx="9" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="100" y="630" class="small" font-weight="600">iPhone · iPad · Mac  —  and nothing else</text>
+
+  <!-- metaltile feeds it -->
+  <rect x="60" y="690" width="700" height="64" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2"/>
+  <text x="80" y="716" class="lbl" fill="#047857">metaltile (Rust kernel toolchain)</text>
+  <text x="80" y="738" class="small">one IR → MSL → kernels.metallib</text>
+  <path d="M410,690 L410,650" class="arr"/>
+  <text x="424" y="676" class="tiny">tile build --emit</text>
+
+  <rect x="60" y="800" width="700" height="120" rx="12" fill="#fff7ed" stroke="#fb923c" stroke-width="1.6"/>
+  <text x="80" y="828" class="lbl" fill="#c2410c">The ceiling</text>
+  <text x="80" y="854" class="small">• "Metal" + "Apple" baked into the name and the code.</text>
+  <text x="80" y="877" class="small">• No path to NVIDIA / AMD / portable GPUs.</text>
+  <text x="80" y="900" class="small">• Want CUDA? Rewrite the whole model surface from scratch.</text>
+
+  <!-- ============================ AFTER ============================ -->
+  <text x="880" y="150" class="panel">AFTER</text>
+  <text x="880" y="174" class="sub">two engines, one product, shared kernels</text>
+
+  <!-- SWIFT engine (kept) -->
+  <rect x="880" y="196" width="368" height="300" rx="14" fill="#eff6ff" stroke="#60a5fa" stroke-width="2"/>
+  <text x="900" y="226" class="lbl" fill="#1d4ed8">FFAI (Swift) — unchanged</text>
+  <rect x="755" y="200" width="118" height="22" rx="11" fill="#1d4ed8"/>
+  <text x="763" y="216" class="badge" fill="#ffffff">PRIMARY · APPLE</text>
+  <text x="900" y="252" class="small">~35 models · Vision · Audio · DSv4</text>
+  <text x="900" y="274" class="small">Swift runtime + loaders</text>
+  <text x="900" y="296" class="small">MetalTileSwift (AOT metallib)</text>
+  <rect x="900" y="312" width="328" height="40" rx="8" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="916" y="338" class="small" font-weight="600">Metal → iPhone · iPad · Mac</text>
+  <text x="900" y="384" class="lbl">still first-class · ships today</text>
+  <text x="900" y="408" class="tiny">tests pass · DeepSeek-V4 runs (same as before)</text>
+  <text x="900" y="452" class="tiny" fill="#1d4ed8">can ALSO call the shared Rust layer ↓ (ffai-ffi)</text>
+  <text x="900" y="472" class="tiny">via C-ABI — proven: Swift links libffai_ffi</text>
+
+  <!-- RUST engine (new) -->
+  <rect x="1268" y="196" width="352" height="300" rx="14" fill="#fff7ed" stroke="#fb923c" stroke-width="2"/>
+  <text x="1288" y="226" class="lbl" fill="#c2410c">FFAI (Rust) — new</text>
+  <rect x="1500" y="200" width="112" height="22" rx="11" fill="#c2410c"/>
+  <text x="1508" y="216" class="badge" fill="#ffffff">CROSS-PLATFORM</text>
+  <text x="1288" y="252" class="small">ffai-models / loader / runtime</text>
+  <text x="1288" y="272" class="tiny">backend-neutral (porting in progress)</text>
+  <rect x="1288" y="286" width="312" height="34" rx="8" fill="#ffffff" stroke="#fed7aa"/>
+  <text x="1304" y="308" class="small" font-weight="600">ffai-ops — the op seam (real)</text>
+  <rect x="1288" y="328" width="312" height="34" rx="8" fill="#fde68a" stroke="#f59e0b"/>
+  <text x="1304" y="350" class="lbl">ffai-core: one Device trait</text>
+  <text x="1288" y="384" class="tiny">add/mul proven on GB10 through the trait</text>
+  <text x="1288" y="406" class="tiny">ffai-ffi (C-ABI) → Swift &amp; any C caller</text>
+  <text x="1288" y="428" class="tiny">ffai-cli enumerates live devices</text>
+
+  <!-- shared seam line -->
+  <path d="M1064,496 L1064,540" class="arr"/>
+  <path d="M1444,496 L1444,540" class="arr"/>
+
+  <!-- backends row -->
+  <rect x="880" y="542" width="740" height="120" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.6"/>
+  <text x="900" y="568" class="lbl" fill="#92400e">Backends — one crate each, behind the Device trait</text>
+
+  <rect x="900" y="582" width="168" height="64" rx="9" fill="#dcfce7" stroke="#22c55e" stroke-width="2"/>
+  <text x="916" y="606" class="lbl" fill="#15803d">ffai-cuda</text>
+  <text x="916" y="626" class="small">REAL · GB10 sm_121</text>
+  <text x="916" y="642" class="tiny">NVRTC→PTX→driver</text>
+
+  <rect x="1086" y="582" width="168" height="64" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="1102" y="606" class="lbl">ffai-metal</text>
+  <text x="1102" y="626" class="tiny">stub (metal-rs)</text>
+  <text x="1102" y="642" class="tiny">Swift is primary on Apple</text>
+
+  <rect x="1272" y="582" width="158" height="64" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="1288" y="606" class="lbl">ffai-vulkan</text>
+  <text x="1288" y="626" class="tiny">stub (SPIR-V)</text>
+  <text x="1288" y="642" class="tiny">portable GPUs</text>
+
+  <rect x="1448" y="582" width="152" height="64" rx="9" fill="#ffffff" stroke="#e2e8f0" stroke-dasharray="4 3"/>
+  <text x="1464" y="606" class="lbl" fill="#94a3b8">+ ROCm …</text>
+  <text x="1464" y="626" class="tiny">one crate = one backend</text>
+
+  <!-- hardware -->
+  <rect x="900" y="582" width="0" height="0"/>
+  <text x="900" y="690" class="small" font-weight="600">NVIDIA</text>
+  <text x="1102" y="690" class="small" font-weight="600">Apple</text>
+  <text x="1288" y="690" class="small" font-weight="600">AMD / Intel / Android</text>
+  <path d="M984,646 L984,676" class="arr"/>
+  <path d="M1170,646 L1170,676" class="arr"/>
+  <path d="M1351,646 L1351,676" class="arr"/>
+
+  <!-- shared kernels feed BOTH engines -->
+  <rect x="880" y="720" width="740" height="92" rx="12" fill="#ecfdf5" stroke="#34d399" stroke-width="2.4"/>
+  <text x="900" y="748" class="lbl" fill="#047857">metaltile — shared kernel toolchain (one IR)</text>
+  <text x="900" y="772" class="small">→ MSL (.metallib) for Swift     →  CUDA C++ / PTX for Rust     →  SPIR-V (Vulkan, next)</text>
+  <text x="900" y="794" class="tiny">4164/4164 kernels bit-accurate on GB10 · same kernels both engines run</text>
+  <path d="M1064,720 L1064,668" class="arr"/>
+  <path d="M1240,720 L1240,496" class="arr" stroke-dasharray="5 4"/>
+  <text x="1250" y="610" class="tiny" fill="#047857" transform="rotate(0)">same IR</text>
+
+  <!-- payoff -->
+  <rect x="880" y="836" width="740" height="84" rx="12" fill="#f0fdf4" stroke="#86efac" stroke-width="1.6"/>
+  <text x="900" y="864" class="lbl" fill="#166534">The unlock</text>
+  <text x="900" y="889" class="small">• Swift keeps shipping to iPhone — untouched, primary.</text>
+  <text x="900" y="910" class="small">• Same engine now runs NVIDIA today, AMD/Vulkan next — add a backend, not a rewrite.</text>
+
+  <!-- footer -->
+  <text x="60" y="1040" class="tiny">Proven: Swift suite passes (parity) · DeepSeek-V4 runs on Swift · CUDA + Swift both consume the shared ffai-core/ffai-ops layer · live GB10 through the Device trait.</text>
+  <text x="60" y="1062" class="tiny">github.com/TheTom/ffai (private) — Swift at repo root, Rust engine under rust/, metaltile shared.</text>
+</svg>

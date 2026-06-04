@@ -9,22 +9,28 @@
 
 use ffai_core::{DType, Error, Result};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// One tensor's location + metadata inside a SafeTensors blob.
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub dtype: DType,
     pub shape: Vec<usize>,
+    shard: usize,
     begin: usize,
     end: usize,
 }
 
-/// A memory-resident SafeTensors file. Holds the whole blob; `tensor()`
-/// returns a zero-copy slice of a weight.
-pub struct SafeTensors {
-    bytes: Arc<Vec<u8>>,
+/// One mmap'd `.safetensors` shard: the map + where its data section starts.
+struct Shard {
+    map: memmap2::Mmap,
     data_start: usize,
+}
+
+/// One or more mmap'd `.safetensors` files (single or sharded). `tensor()`
+/// returns a zero-copy slice routed to the right shard. mmap keeps the 14GB+
+/// sharded checkpoints off the heap.
+pub struct SafeTensors {
+    shards: Vec<Shard>,
     index: BTreeMap<String, TensorInfo>,
 }
 
@@ -42,22 +48,23 @@ fn parse_dtype(s: &str) -> Result<DType> {
 }
 
 impl SafeTensors {
-    /// Open + parse a `.safetensors` file (8-byte header length, header JSON,
-    /// then the tightly-packed data section).
-    pub fn open(path: &str) -> Result<Self> {
-        let bytes = std::fs::read(path).map_err(|e| Error::Msg(format!("read {path}: {e}")))?;
-        if bytes.len() < 8 {
+    /// mmap + parse one `.safetensors` shard, merging its tensors into `index`
+    /// tagged with `shard_idx`. Returns the constructed [`Shard`].
+    fn open_shard(path: &str, shard_idx: usize, index: &mut BTreeMap<String, TensorInfo>) -> Result<Shard> {
+        let file = std::fs::File::open(path).map_err(|e| Error::Msg(format!("open {path}: {e}")))?;
+        // SAFETY: read-only file outlives the mapping; treated as immutable bytes.
+        let map = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| Error::Msg(format!("mmap {path}: {e}")))?;
+        if map.len() < 8 {
             return Err(Error::Msg("safetensors: file too small".into()));
         }
-        let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header_len = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
         let header_end = 8 + header_len;
-        let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])
+        let header: serde_json::Value = serde_json::from_slice(&map[8..header_end])
             .map_err(|e| Error::Msg(format!("safetensors header JSON: {e}")))?;
         let obj = header
             .as_object()
             .ok_or_else(|| Error::Msg("safetensors: header not an object".into()))?;
-
-        let mut index = BTreeMap::new();
         for (name, v) in obj {
             if name == "__metadata__" {
                 continue;
@@ -75,10 +82,44 @@ impl SafeTensors {
                 .ok_or_else(|| Error::Msg("missing data_offsets".into()))?;
             let begin = off[0].as_u64().unwrap() as usize;
             let end = off[1].as_u64().unwrap() as usize;
-            index.insert(name.clone(), TensorInfo { dtype, shape, begin, end });
+            index.insert(name.clone(), TensorInfo { dtype, shape, shard: shard_idx, begin, end });
         }
+        Ok(Shard { map, data_start: header_end })
+    }
 
-        Ok(SafeTensors { bytes: Arc::new(bytes), data_start: header_end, index })
+    /// Open + parse a single `.safetensors` file.
+    pub fn open(path: &str) -> Result<Self> {
+        let mut index = BTreeMap::new();
+        let shard = Self::open_shard(path, 0, &mut index)?;
+        Ok(SafeTensors { shards: vec![shard], index })
+    }
+
+    /// Open a model directory: sharded (`model-XXXXX-of-YYYYY.safetensors` per
+    /// `model.safetensors.index.json`) or single (`model.safetensors`). All
+    /// shards are mmap'd and merged into one tensor index.
+    pub fn open_dir(dir: &str) -> Result<Self> {
+        let idx_path = format!("{dir}/model.safetensors.index.json");
+        let files: Vec<String> = if std::path::Path::new(&idx_path).exists() {
+            let txt = std::fs::read_to_string(&idx_path)
+                .map_err(|e| Error::Msg(format!("read {idx_path}: {e}")))?;
+            let j: serde_json::Value = serde_json::from_str(&txt)
+                .map_err(|e| Error::Msg(format!("index json: {e}")))?;
+            let wm = j["weight_map"].as_object()
+                .ok_or_else(|| Error::Msg("index: no weight_map".into()))?;
+            let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for v in wm.values() {
+                if let Some(f) = v.as_str() { set.insert(format!("{dir}/{f}")); }
+            }
+            set.into_iter().collect()
+        } else {
+            vec![format!("{dir}/model.safetensors")]
+        };
+        let mut index = BTreeMap::new();
+        let mut shards = Vec::with_capacity(files.len());
+        for (i, f) in files.iter().enumerate() {
+            shards.push(Self::open_shard(f, i, &mut index)?);
+        }
+        Ok(SafeTensors { shards, index })
     }
 
     pub fn names(&self) -> impl Iterator<Item = &String> {
@@ -95,9 +136,10 @@ impl SafeTensors {
             .index
             .get(name)
             .ok_or_else(|| Error::Msg(format!("safetensors: tensor '{name}' not found")))?;
-        let s = self.data_start + info.begin;
-        let e = self.data_start + info.end;
-        Ok((&self.bytes[s..e], info.dtype, &info.shape))
+        let sh = &self.shards[info.shard];
+        let s = sh.data_start + info.begin;
+        let e = sh.data_start + info.end;
+        Ok((&sh.map[s..e], info.dtype, &info.shape))
     }
 }
 mod iq2xxs_tables;
