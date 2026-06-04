@@ -1,6 +1,6 @@
 [package]
 name = "ffai-metal"
-description = "FFAI Metal backend (Rust, via metal-rs). For running the Rust engine on Apple hardware / cross-validating against Swift FFAI. The Swift path remains the primary iPhone/Apple engine."
+description = "FFAI Metal backend — wraps metaltile-runtime's Context (MSL JIT + dispatch) behind the ffai-core Device trait. Runs the shared Rust models on Apple GPUs (incl. iOS)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,12 @@ repository.workspace = true
 
 [dependencies]
 ffai-core.workspace = true
-# TODO: metal-rs for the real impl, Apple-only.
-# [target.'cfg(target_os = "macos")'.dependencies]
-# metal = "0.29"
+# metaltile-runtime's Context is the public Metal dispatch face. Builds on
+# every platform (Metal code is target_os=macos-gated inside; has_gpu()=false
+# elsewhere), so no feature gating needed here.
+metaltile-runtime.workspace = true
+metaltile-core.workspace = true
+
+[dev-dependencies]
+ffai-ops.workspace = true
+ffai-models.workspace = true
