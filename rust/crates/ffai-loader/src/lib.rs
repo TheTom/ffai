@@ -100,4 +100,5 @@ impl SafeTensors {
         Ok((&self.bytes[s..e], info.dtype, &info.shape))
     }
 }
+mod iq2xxs_tables;
 pub mod gguf;

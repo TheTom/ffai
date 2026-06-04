@@ -9,6 +9,8 @@
 use ffai_core::{Error, Result};
 use std::collections::BTreeMap;
 
+use crate::iq2xxs_tables::{IQ2XXS_GRID, KSIGNS};
+
 /// GGML tensor type (subset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlType {
@@ -241,9 +243,36 @@ impl Gguf {
                 }
                 Ok(out)
             }
-            other => Err(Error::Msg(format!(
-                "dequant '{name}': {other:?} not yet supported (IQ2_XXS pending)"
-            ))),
+            GgmlType::Iq2Xxs => {
+                // block_iq2_xxs (256-elem, 66 bytes): d(f16) + qs[64]. qs is
+                // 8 groups of 8 bytes: 4 grid indices + a u32 of scale(>>28)
+                // and 4×7-bit sign indices into KSIGNS.
+                const QK: usize = 256;
+                let nblocks = n / QK;
+                let b = self.raw(t, nblocks * 66);
+                let mut out = vec![0.0f32; n];
+                for blk in 0..nblocks {
+                    let base = blk * 66;
+                    let d = f16_to_f32(u16::from_le_bytes([b[base], b[base + 1]]));
+                    let qs = &b[base + 2..base + 66]; // 64 bytes
+                    for ib32 in 0..8 {
+                        let g = ib32 * 8;
+                        let aux8 = [qs[g], qs[g + 1], qs[g + 2], qs[g + 3]];
+                        let aux32 = u32::from_le_bytes([qs[g + 4], qs[g + 5], qs[g + 6], qs[g + 7]]);
+                        let db = d * 0.25 * (0.5 + (aux32 >> 28) as f32);
+                        for l in 0..4 {
+                            let grid = &IQ2XXS_GRID[aux8[l] as usize];
+                            let signs = KSIGNS[((aux32 >> (7 * l)) & 127) as usize];
+                            for j in 0..8 {
+                                let s = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                                out[blk * QK + ib32 * 32 + l * 8 + j] = db * grid[j] as f32 * s;
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            other => Err(Error::Msg(format!("dequant '{name}': {other:?} not supported"))),
         }
     }
 }

@@ -36,4 +36,15 @@ fn gguf_parse_and_q8_0_dequant_match_ggufpy() {
     }
     assert!(e2 <= 1e-4, "Q2_K dequant mismatch vs gguf-py: max|Δ|={e2:.3e}");
     eprintln!("✅ GGUF Q2_K dequant matches gguf-py (max|Δ|={e2:.1e})");
+
+    // IQ2_XXS dequant vs gguf-py.
+    let iq = g.dequant_f32("blk.0.ffn_gate_exps.weight").expect("dequant gate_exps");
+    let want3 = [-0.006656f32, -0.006656, 0.006656, 0.020801, 0.006656, 0.006656, 0.006656, 0.020801];
+    eprintln!("rust IQ2_XXS first8 = {:?}", &iq[..8]);
+    let mut e3 = 0.0f32;
+    for i in 0..8 {
+        e3 = e3.max((iq[i] - want3[i]).abs());
+    }
+    assert!(e3 <= 1e-4, "IQ2_XXS dequant mismatch vs gguf-py: max|Δ|={e3:.3e}");
+    eprintln!("✅ GGUF IQ2_XXS dequant matches gguf-py (max|Δ|={e3:.1e}) — all DSv4 quant types covered");
 }
