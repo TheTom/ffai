@@ -204,3 +204,92 @@ fn ffai_ops_rms_norm_and_gemv_on_cuda() {
     assert!(gemv_err <= 1e-3, "gemv on CUDA mismatch: max|Δ|={gemv_err:.3e}");
     eprintln!("ffai_ops::gemv (mt_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
 }
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// The remaining transformer ops via registered kernels: silu, swiglu,
+/// gather (embedding), softmax — all through the shared Device trait on CUDA.
+#[test]
+fn ffai_ops_transformer_ops_on_cuda() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else {
+        eprintln!("no CUDA device — skipping");
+        return;
+    };
+
+    // ── silu ─────────────────────────────────────────────────────────
+    let g: Vec<f32> = (0..1024).map(|i| (i % 21) as f32 * 0.1 - 1.0).collect();
+    let tg = Tensor::new(dev.upload(&to_bytes(&g)).unwrap(), vec![1024], DType::F32);
+    let ts = ffai_ops::silu(dev.as_ref(), &tg).unwrap();
+    dev.synchronize().unwrap();
+    let mut sb = vec![0u8; 1024 * 4];
+    dev.download(ts.buffer.as_ref(), &mut sb).unwrap();
+    let s = from_bytes(&sb);
+    let mut e = 0.0f32;
+    for i in 0..1024 {
+        e = e.max((s[i] - g[i] * sigmoid(g[i])).abs());
+    }
+    assert!(e <= 1e-5, "silu mismatch: {e:.2e}");
+    eprintln!("ffai_ops::silu (mt_silu) on CUDA: OK (max|Δ|={e:.1e})");
+
+    // ── swiglu ───────────────────────────────────────────────────────
+    let up: Vec<f32> = (0..1024).map(|i| (i % 13) as f32 * 0.05).collect();
+    let tu = Tensor::new(dev.upload(&to_bytes(&up)).unwrap(), vec![1024], DType::F32);
+    let tw = ffai_ops::swiglu(dev.as_ref(), &tg, &tu).unwrap();
+    dev.synchronize().unwrap();
+    let mut wb = vec![0u8; 1024 * 4];
+    dev.download(tw.buffer.as_ref(), &mut wb).unwrap();
+    let w = from_bytes(&wb);
+    e = 0.0;
+    for i in 0..1024 {
+        e = e.max((w[i] - g[i] * sigmoid(g[i]) * up[i]).abs());
+    }
+    assert!(e <= 1e-5, "swiglu mismatch: {e:.2e}");
+    eprintln!("ffai_ops::swiglu (mt_swiglu) on CUDA: OK (max|Δ|={e:.1e})");
+
+    // ── gather (embedding) ───────────────────────────────────────────
+    const VOCAB: usize = 8;
+    const DIM: usize = 512;
+    let table: Vec<f32> = (0..VOCAB * DIM).map(|i| i as f32 * 0.001).collect();
+    let ids: [u32; 4] = [2, 5, 0, 7];
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tt = Tensor::new(dev.upload(&to_bytes(&table)).unwrap(), vec![VOCAB, DIM], DType::F32);
+    let ti = Tensor::new(dev.upload(&id_bytes).unwrap(), vec![4], DType::U32);
+    let tge = ffai_ops::gather(dev.as_ref(), &tt, &ti).unwrap();
+    dev.synchronize().unwrap();
+    let mut gb = vec![0u8; 4 * DIM * 4];
+    dev.download(tge.buffer.as_ref(), &mut gb).unwrap();
+    let go = from_bytes(&gb);
+    e = 0.0;
+    for (t, &id) in ids.iter().enumerate() {
+        for d in 0..DIM {
+            e = e.max((go[t * DIM + d] - table[id as usize * DIM + d]).abs());
+        }
+    }
+    assert!(e == 0.0, "gather mismatch: {e:.2e}");
+    eprintln!("ffai_ops::gather (ffai_gather) on CUDA: OK (exact)");
+
+    // ── softmax ──────────────────────────────────────────────────────
+    const ROWS: usize = 2;
+    const NW: usize = 1024;
+    let xs: Vec<f32> = (0..ROWS * NW).map(|i| ((i % 37) as f32 - 18.0) * 0.1).collect();
+    let txs = Tensor::new(dev.upload(&to_bytes(&xs)).unwrap(), vec![ROWS, NW], DType::F32);
+    let tsm = ffai_ops::softmax(dev.as_ref(), &txs).unwrap();
+    dev.synchronize().unwrap();
+    let mut smb = vec![0u8; ROWS * NW * 4];
+    dev.download(tsm.buffer.as_ref(), &mut smb).unwrap();
+    let sm = from_bytes(&smb);
+    e = 0.0;
+    for r in 0..ROWS {
+        let row = &xs[r * NW..(r + 1) * NW];
+        let m = row.iter().cloned().fold(f32::MIN, f32::max);
+        let exps: Vec<f32> = row.iter().map(|v| (v - m).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        for j in 0..NW {
+            e = e.max((sm[r * NW + j] - exps[j] / sum).abs());
+        }
+    }
+    assert!(e <= 1e-5, "softmax mismatch: {e:.2e}");
+    eprintln!("ffai_ops::softmax (mt_softmax) on CUDA: OK (max|Δ|={e:.1e})");
+}

@@ -18,22 +18,46 @@
 //! lookup and are stubbed for now.
 
 use ffai_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
-use metaltile_codegen::all_kernels;
-use metaltile_core::ir::{BinOpKind, IndexExpr, KernelMode, Op, Param, ParamKind, ValueId};
+use metaltile_core::ir::{BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
 use metaltile_core::shape::Shape;
-// Force-link the crate that *registers* the model kernels, so `inventory`
-// collects mt_rms_norm / mt_gemv / … into `all_kernels()`. Without a
-// reference the linker may drop the otherwise-unused dependency.
-use metaltile_std as _;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Cache of resolved kernel IR keyed by (name, dtype). Resolving walks the
+/// whole test registry building setups, which is expensive — a forward pass
+/// dispatches the same handful of kernels hundreds of times, so cache them.
+fn kernel_cache() -> &'static Mutex<HashMap<(String, DType), Kernel>> {
+    static C: OnceLock<Mutex<HashMap<(String, DType), Kernel>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Look up a registered metaltile kernel by name and instantiate its IR for
-/// `dtype`. This is the bridge from a semantic op to the *same* kernel the
-/// Swift side dispatches (generated from the one `#[kernel]` definition).
+/// `dtype`, **with the correct dispatch mode already set**. We pull it from
+/// the test registry (`metaltile_std::all_tests`) rather than the raw kernel
+/// registry: the test/bench setup is where each kernel's `KernelMode`
+/// (Elementwise / Reduction / Grid3D …) is configured, and that mode drives
+/// codegen (e.g. whether `tid` vs `gid` is defined, the `_n_elems` arg). This
+/// is the same path the CUDA corpus dispatches, so we inherit its correctness.
 fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
-    all_kernels()
-        .find(|e| e.name() == name)
-        .map(|e| e.build(&[dtype]))
-        .ok_or_else(|| Error::Msg(format!("kernel '{name}' not registered (link metaltile-std)")))
+    let key = (name.to_string(), dtype);
+    if let Some(k) = kernel_cache().lock().unwrap().get(&key) {
+        return Ok(k.clone());
+    }
+    for entry in metaltile_std::all_tests() {
+        let t = entry.test();
+        if !t.dtypes().contains(&dtype) {
+            continue;
+        }
+        let setup = t.setup(dtype);
+        let k = setup.kernel();
+        if k.name == name {
+            kernel_cache().lock().unwrap().insert(key, k.clone());
+            return Ok(k.clone());
+        }
+    }
+    Err(Error::Msg(format!(
+        "kernel '{name}' [{dtype}] not found in the metaltile test registry"
+    )))
 }
 
 /// Build an Elementwise `out[i] = a[i] <op> b[i]` kernel for `dtype`.
@@ -140,8 +164,7 @@ pub fn rms_norm(dev: &dyn Device, x: &Tensor, weight: &Tensor, eps: f32) -> Resu
         )));
     }
     let rows = x.elem_count() / n;
-    let mut k = lookup("mt_rms_norm", x.dtype)?;
-    k.mode = KernelMode::Reduction; // block-reduction kernel (per-row)
+    let k = lookup("mt_rms_norm", x.dtype)?;
     let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
     let eps_buf = dev.upload(&eps.to_le_bytes())?;
 
@@ -175,8 +198,7 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
             vec.elem_count()
         )));
     }
-    let mut k = lookup("mt_gemv", mat.dtype)?;
-    k.mode = KernelMode::Reduction; // one block per output row, dot-product reduction
+    let k = lookup("mt_gemv", mat.dtype)?;
     let out = Tensor::empty(dev, vec![m], mat.dtype)?;
 
     let grid = Grid { grid: [m as u32, 1, 1], block: [256, 1, 1] };
@@ -199,7 +221,129 @@ pub fn matmul(_dev: &dyn Device, _a: &Tensor, _b: &Tensor) -> Result<Tensor> {
     Err(Error::Unimplemented("ffai_ops::matmul (cooperative tiled path pending)"))
 }
 
-/// Softmax over the last dim. Reduction kernel (pending kernel lookup).
-pub fn softmax(_dev: &dyn Device, _x: &Tensor) -> Result<Tensor> {
-    Err(Error::Unimplemented("ffai_ops::softmax (pending kernel lookup)"))
+/// Run a registered elementwise kernel (Grid3D, one thread per element) with
+/// the given ordered bindings, producing a fresh `out`-shaped output.
+fn elementwise_kernel(
+    dev: &dyn Device,
+    name: &str,
+    dtype: DType,
+    out_shape: Vec<usize>,
+    mut bindings: Vec<Binding>,
+) -> Result<Tensor> {
+    let k = lookup(name, dtype)?;
+    let out = Tensor::empty(dev, out_shape, dtype)?;
+    bindings.push(Binding::Buffer(out.buffer.clone()));
+    let n = out.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    // output binding goes in its signature position — callers pass inputs,
+    // we append the single output last (matches a,…,out param order).
+    dev.dispatch(&k, &bindings, grid)?;
+    Ok(out)
+}
+
+/// SiLU activation `out = x * sigmoid(x)`, elementwise. Dispatches `mt_silu`.
+pub fn silu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    elementwise_kernel(dev, "mt_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
+}
+
+/// Fused SwiGLU `out = silu(gate) * up`, elementwise. Dispatches `mt_swiglu`.
+pub fn swiglu(dev: &dyn Device, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.shape != up.shape {
+        return Err(Error::Msg("swiglu: gate/up shape mismatch".into()));
+    }
+    elementwise_kernel(
+        dev,
+        "mt_swiglu",
+        gate.dtype,
+        gate.shape.clone(),
+        vec![Binding::Buffer(gate.buffer.clone()), Binding::Buffer(up.buffer.clone())],
+    )
+}
+
+/// Embedding gather: `out[t, :] = table[indices[t], :]`. `table` is
+/// `[vocab, dim]`, `indices` is `[n_tokens]` (u32). Dispatches `ffai_gather`.
+pub fn gather(dev: &dyn Device, table: &Tensor, indices: &Tensor) -> Result<Tensor> {
+    if table.shape.len() != 2 {
+        return Err(Error::Msg(format!("gather: table must be 2-D, got {:?}", table.shape)));
+    }
+    let dim = table.shape[1];
+    let n_tokens = indices.elem_count();
+    let k = lookup("ffai_gather", table.dtype)?;
+    let out = Tensor::empty(dev, vec![n_tokens, dim], table.dtype)?;
+    let n = (n_tokens * dim) as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(table.buffer.clone()),
+            Binding::Buffer(indices.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Scalar((dim as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Softmax over the last dim, row-wise. Dispatches `mt_softmax`. Row width
+/// `n` must be a multiple of 1024 (the kernel's 4-elems/thread loop).
+pub fn softmax(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    let n = *x.shape.last().ok_or_else(|| Error::Msg("softmax: scalar input".into()))?;
+    if n % 1024 != 0 {
+        return Err(Error::Msg(format!("softmax: row width {n} must be a multiple of 1024")));
+    }
+    let rows = x.elem_count() / n;
+    let k = lookup("mt_softmax", x.dtype)?;
+    let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
+    let grid = Grid { grid: [rows as u32, 1, 1], block: [256, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Llama-style rotary position embedding applied to a `[n_heads, head_dim]`
+/// Q or K tensor at sequence `position`. Dispatches `ffai_rope_llama`. Pass
+/// the freq-band knobs disabled (`scale_factor=1`, `low=1`, `high=1`,
+/// `orig_max=1e9`) for vanilla RoPE.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_llama(
+    dev: &dyn Device,
+    qk: &Tensor,
+    position: u32,
+    theta_base: f32,
+    scale_factor: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+    original_max_position: f32,
+) -> Result<Tensor> {
+    let head_dim = *qk.shape.last().ok_or_else(|| Error::Msg("rope: scalar input".into()))?;
+    let n_heads = qk.elem_count() / head_dim;
+    let half = head_dim / 2;
+    let k = lookup("ffai_rope_llama", qk.dtype)?;
+    let out = Tensor::empty(dev, qk.shape.clone(), qk.dtype)?;
+    let grid = Grid { grid: [n_heads as u32, half as u32, 1], block: [1, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(qk.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Scalar((head_dim as u32).to_le_bytes().to_vec()),
+            Binding::Scalar((half as u32).to_le_bytes().to_vec()),
+            Binding::Scalar(position.to_le_bytes().to_vec()),
+            Binding::Scalar(theta_base.to_le_bytes().to_vec()),
+            Binding::Scalar(scale_factor.to_le_bytes().to_vec()),
+            Binding::Scalar(low_freq_factor.to_le_bytes().to_vec()),
+            Binding::Scalar(high_freq_factor.to_le_bytes().to_vec()),
+            Binding::Scalar(original_max_position.to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
 }
