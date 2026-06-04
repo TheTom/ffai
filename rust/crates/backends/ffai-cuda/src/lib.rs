@@ -3,44 +3,32 @@
 
 //! # ffai-cuda
 //!
-//! CUDA backend. The real impl (under `--features cuda`) wraps
-//! `metaltile_runtime::CudaDevice` — the NVRTC -> PTX -> driver path that
-//! already runs the full kernel corpus bit-accurately on GB10 — behind the
-//! [`ffai_core::Device`] trait. Without the feature the crate is a stub so
-//! non-CUDA hosts still build the workspace. Skeleton: stub `Device` impl;
-//! the metaltile delegation lands next.
+//! CUDA backend for the FFAI engine. Under `--features cuda` it wraps
+//! `metaltile_runtime::CudaDevice` (NVRTC → PTX → driver) behind the shared
+//! [`ffai_core::Device`] trait — the same seam the Metal/Vulkan backends
+//! implement, so everything above it is backend-agnostic. Without the
+//! feature it is a stub so non-CUDA hosts still build the workspace.
 
-use std::sync::Arc;
-use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+#[cfg(feature = "cuda")]
+mod imp;
+#[cfg(feature = "cuda")]
+pub use imp::{CudaBuffer, CudaDevice};
 
-pub struct CudaDevice {
-    name: String,
+#[cfg(not(feature = "cuda"))]
+mod stub {
+    use ffai_core::{Device, Result};
+    use std::sync::Arc;
+
+    /// Stub: the crate builds on non-CUDA hosts, but no device is available
+    /// until compiled with `--features cuda`.
+    pub struct CudaDevice;
+
+    impl CudaDevice {
+        pub fn create() -> Result<Option<Arc<dyn Device>>> {
+            Ok(None)
+        }
+    }
 }
 
-impl CudaDevice {
-    /// Probe for a CUDA device. Returns `Ok(None)` until the
-    /// metaltile-runtime delegation lands.
-    pub fn create() -> Result<Option<Arc<dyn Device>>> {
-        Ok(None)
-    }
-}
-
-impl Device for CudaDevice {
-    fn backend(&self) -> Backend { Backend::Cuda }
-    fn name(&self) -> &str { &self.name }
-    fn alloc(&self, _len: usize) -> Result<Arc<dyn DeviceBuffer>> {
-        Err(Error::Unimplemented("ffai-cuda::alloc (metaltile-runtime delegation pending)"))
-    }
-    fn upload(&self, _bytes: &[u8]) -> Result<Arc<dyn DeviceBuffer>> {
-        Err(Error::Unimplemented("ffai-cuda::upload"))
-    }
-    fn download(&self, _buf: &dyn DeviceBuffer, _out: &mut [u8]) -> Result<()> {
-        Err(Error::Unimplemented("ffai-cuda::download"))
-    }
-    fn dispatch(&self, _k: &Kernel, _b: &[Binding], _g: Grid) -> Result<()> {
-        Err(Error::Unimplemented("ffai-cuda::dispatch"))
-    }
-    fn synchronize(&self) -> Result<()> {
-        Err(Error::Unimplemented("ffai-cuda::synchronize"))
-    }
-}
+#[cfg(not(feature = "cuda"))]
+pub use stub::CudaDevice;

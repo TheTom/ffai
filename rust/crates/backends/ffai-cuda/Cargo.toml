@@ -12,7 +12,15 @@ metaltile-core.workspace = true
 metaltile-codegen = { workspace = true, optional = true }
 metaltile-runtime = { workspace = true, optional = true }
 
+[dev-dependencies]
+ffai-core.workspace = true
+metaltile-core.workspace = true
+
 [features]
 # Off by default so macOS / non-CUDA hosts build the crate as a stub.
 # `--features cuda` pulls metaltile-runtime's real CUDA device.
 cuda = ["dep:metaltile-runtime", "dep:metaltile-codegen", "metaltile-runtime/cuda"]
+
+[[test]]
+name = "cuda_smoke"
+required-features = ["cuda"]

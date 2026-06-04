@@ -1,0 +1,199 @@
+// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
+// SPDX-License-Identifier: Apache-2.0
+
+//! Real CUDA backend (compiled under `--features cuda`). Wraps
+//! `metaltile_runtime::CudaDevice` — the NVRTC → PTX → driver path that
+//! runs the kernel corpus bit-accurately on GB10 — behind the shared
+//! [`ffai_core::Device`] trait, so the engine layer above is identical to
+//! the Metal/Vulkan paths.
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::os::raw::c_void;
+use std::sync::{Arc, RwLock};
+
+use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+use metaltile_codegen::{CodegenBackend, CudaGenerator};
+use metaltile_core::ir::KernelMode;
+use metaltile_runtime::{CudaDevice as MtCudaDevice, CudaModule, MetalTileError};
+
+fn dispatch_err(e: MetalTileError) -> Error {
+    Error::Dispatch(e.to_string())
+}
+
+/// A compiled module, cached for reuse. The raw `CUmodule` is single-
+/// context; we only ever touch it through its owning device, so the manual
+/// `Send`/`Sync` are sound for our serialized-submission usage.
+struct CachedModule(CudaModule);
+unsafe impl Send for CachedModule {}
+unsafe impl Sync for CachedModule {}
+
+/// CUDA implementation of the shared [`Device`] trait. Holds the metaltile
+/// runtime device in an `Arc` so persistent tensors (which free on drop)
+/// keep the CUDA context alive as long as any buffer is live.
+pub struct CudaDevice {
+    dev: Arc<MtCudaDevice>,
+    name: String,
+    /// Compile-once cache: kernel name → loaded module.
+    modules: RwLock<HashMap<String, Arc<CachedModule>>>,
+}
+
+impl CudaDevice {
+    /// Probe for a CUDA device; `Ok(None)` if none is present.
+    pub fn create() -> Result<Option<Arc<dyn Device>>> {
+        match MtCudaDevice::create().map_err(dispatch_err)? {
+            Some(d) => {
+                let (maj, min) = d.compute_capability();
+                let dev = CudaDevice {
+                    dev: Arc::new(d),
+                    name: format!("CUDA device (sm_{maj}{min})"),
+                    modules: RwLock::new(HashMap::new()),
+                };
+                Ok(Some(Arc::new(dev)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn module_for(&self, kernel: &Kernel) -> Result<Arc<CachedModule>> {
+        if let Some(m) = self.modules.read().unwrap().get(&kernel.name) {
+            return Ok(m.clone());
+        }
+        let cg = CudaGenerator::new();
+        let src = cg
+            .generate(kernel)
+            .map_err(|e| Error::Codegen(format!("{e:?}")))?;
+        let module = self
+            .dev
+            .compile(&src, &format!("{}.cu", kernel.name))
+            .map_err(dispatch_err)?;
+        let cached = Arc::new(CachedModule(module));
+        self.modules
+            .write()
+            .unwrap()
+            .insert(kernel.name.clone(), cached.clone());
+        Ok(cached)
+    }
+}
+
+/// A persistent CUDA allocation. Frees on drop; holds an `Arc` of the
+/// device so the context outlives the buffer.
+pub struct CudaBuffer {
+    ptr: u64,
+    len: usize,
+    dev: Arc<MtCudaDevice>,
+}
+// ptr is a plain integer handle; dev is an Arc. Sound to move/share for our
+// serialized usage.
+unsafe impl Send for CudaBuffer {}
+unsafe impl Sync for CudaBuffer {}
+
+impl DeviceBuffer for CudaBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Drop for CudaBuffer {
+    fn drop(&mut self) {
+        self.dev.free_raw(self.ptr);
+    }
+}
+
+/// Element count of the kernel's first output param, derived from the
+/// binding at that index. Used for the synthetic `_n_elems` Elementwise arg.
+fn first_output_elems(kernel: &Kernel, bindings: &[Binding]) -> u32 {
+    if let Some(i) = kernel.params.iter().position(|p| p.is_output) {
+        let dt = kernel.params[i].dtype.size_bytes().max(1);
+        if let Some(Binding::Buffer(b)) = bindings.get(i) {
+            return (b.len() / dt) as u32;
+        }
+    }
+    0
+}
+
+impl Device for CudaDevice {
+    fn backend(&self) -> Backend {
+        Backend::Cuda
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn alloc(&self, len: usize) -> Result<Arc<dyn DeviceBuffer>> {
+        let ptr = self.dev.alloc_raw(len).map_err(dispatch_err)?;
+        Ok(Arc::new(CudaBuffer { ptr, len, dev: self.dev.clone() }))
+    }
+
+    fn upload(&self, bytes: &[u8]) -> Result<Arc<dyn DeviceBuffer>> {
+        let ptr = self.dev.alloc_raw(bytes.len()).map_err(dispatch_err)?;
+        self.dev.htod(ptr, bytes).map_err(dispatch_err)?;
+        Ok(Arc::new(CudaBuffer { ptr, len: bytes.len(), dev: self.dev.clone() }))
+    }
+
+    fn download(&self, buf: &dyn DeviceBuffer, out: &mut [u8]) -> Result<()> {
+        let cb = buf
+            .as_any()
+            .downcast_ref::<CudaBuffer>()
+            .ok_or_else(|| Error::Msg("download: buffer is not a CudaBuffer".into()))?;
+        self.dev.dtoh(cb.ptr, out).map_err(dispatch_err)
+    }
+
+    fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()> {
+        let module = self.module_for(kernel)?;
+        let func = module.0.function(&kernel.name).map_err(dispatch_err)?;
+        let shared = CudaGenerator::new().shared_bytes(kernel, grid.block[0]) as u32;
+
+        // Marshal kernel args: device ptrs / scalar bytes in binding order,
+        // then the synthetic _n_elems for Elementwise kernels. `ptr_store`
+        // and `scalar_store` back the raw pointers, so they outlive `args`.
+        let mut ptr_store: Vec<u64> = Vec::new();
+        let mut scalar_store: Vec<Vec<u8>> = Vec::new();
+        enum Slot {
+            Ptr(usize),
+            Scalar(usize),
+        }
+        let mut slots: Vec<Slot> = Vec::new();
+        for b in bindings {
+            match b {
+                Binding::Buffer(buf) => {
+                    let cb = buf
+                        .as_any()
+                        .downcast_ref::<CudaBuffer>()
+                        .ok_or_else(|| Error::Msg("dispatch: binding is not a CudaBuffer".into()))?;
+                    slots.push(Slot::Ptr(ptr_store.len()));
+                    ptr_store.push(cb.ptr);
+                }
+                Binding::Scalar(bytes) => {
+                    slots.push(Slot::Scalar(scalar_store.len()));
+                    scalar_store.push(bytes.clone());
+                }
+            }
+        }
+        if kernel.mode == KernelMode::Elementwise {
+            let n = first_output_elems(kernel, bindings);
+            slots.push(Slot::Scalar(scalar_store.len()));
+            scalar_store.push(n.to_le_bytes().to_vec());
+        }
+
+        let mut args: Vec<*mut c_void> = Vec::with_capacity(slots.len());
+        for s in &slots {
+            match s {
+                Slot::Ptr(i) => args.push(&ptr_store[*i] as *const u64 as *mut c_void),
+                Slot::Scalar(i) => args.push(scalar_store[*i].as_ptr() as *mut c_void),
+            }
+        }
+
+        self.dev
+            .launch(func, grid.grid, grid.block, shared, &mut args)
+            .map_err(dispatch_err)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.dev.synchronize().map_err(dispatch_err)
+    }
+}
