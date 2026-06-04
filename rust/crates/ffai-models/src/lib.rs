@@ -21,3 +21,4 @@ pub trait Model: Send + Sync {
 }
 
 pub mod llama;
+pub mod moe;

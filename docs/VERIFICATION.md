@@ -30,7 +30,7 @@ flags `load_hf` already detects.
 
 | family | needs | status |
 |---|---|---|
-| MoE / MLA — DeepSeek-V4, GPT-OSS, Granite4 | expert routing + `moe_gather_qmm` (kernels exist, benched) + MLA attention | builder pending |
+| MoE — DeepSeek-V4, GPT-OSS, Granite4, Qwen-MoE | router → top-k → per-expert SwiGLU → weighted sum | ✅ **compute path verified both platforms** vs CPU (Metal 1.6e-3, CUDA 1.7e-3); real-model-vs-HF pending large expert weights. DSv4 adds MLA attention (still pending). |
 | SSM — Mamba2, Jamba, FalconH1, LFM2 | gated-delta / SSM scan kernels (exist) | builder pending |
 | VLM — Pixtral, SmolVLM2, FastVLM, Idefics3, MiniCPMV | vision tower + projector + the LLM builder | pending |
 | Audio — TTS/STT (Parakeet, Voxtral, StyleTTS2, …) | encoder/decoder + audio front-end | pending |

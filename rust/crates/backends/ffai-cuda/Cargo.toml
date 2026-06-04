@@ -39,3 +39,7 @@ required-features = ["cuda"]
 [[test]]
 name = "hf_model"
 required-features = ["cuda"]
+
+[[test]]
+name = "moe_test"
+required-features = ["cuda"]
