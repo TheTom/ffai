@@ -91,3 +91,15 @@ required-features = ["cuda"]
 [[test]]
 name = "whisper"
 required-features = ["cuda"]
+
+[[test]]
+name = "gpt2"
+required-features = ["cuda"]
+
+[[test]]
+name = "pythia"
+required-features = ["cuda"]
+
+[[test]]
+name = "gemma2"
+required-features = ["cuda"]

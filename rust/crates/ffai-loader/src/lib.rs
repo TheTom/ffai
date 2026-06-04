@@ -34,6 +34,25 @@ pub struct SafeTensors {
     index: BTreeMap<String, TensorInfo>,
 }
 
+/// IEEE half → f32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let out = if exp == 0 {
+        if mant == 0 { sign << 31 } else {
+            let mut e = -1i32; let mut m = mant;
+            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            (sign << 31) | (((e + 127 - 15) as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(out)
+}
+
 fn parse_dtype(s: &str) -> Result<DType> {
     Ok(match s {
         "F32" => DType::F32,
@@ -128,6 +147,20 @@ impl SafeTensors {
 
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         self.index.get(name)
+    }
+
+    /// Tensor decoded to `f32` (handles F32 / F16 / BF16 on disk) + its shape.
+    /// The convenience every host-orchestrated model test wants — checkpoints
+    /// ship in any of the three float widths.
+    pub fn tensor_f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        let (b, dt, shape) = self.tensor(name)?;
+        let v = match dt {
+            DType::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+            DType::F16 => b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+            DType::BF16 => b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+            other => return Err(Error::Msg(format!("tensor_f32 '{name}': dtype {other} unsupported"))),
+        };
+        Ok((v, shape.to_vec()))
     }
 
     /// Raw bytes + dtype + shape of a tensor, or an error if absent.

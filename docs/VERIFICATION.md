@@ -26,6 +26,19 @@ and HF. Same code path covers the rest of the family as weights are staged:
 dense Llama-style transformers differing only by config + the qk-norm/bias
 flags `load_hf` already detects.
 
+## Architecture-path coverage — distinct non-Llama mechanisms (host-orchestrated, vs HF argmax/top-k)
+
+Each model below was chosen to exercise a *mechanism* the dense `load_hf` path
+doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
+
+| model | mechanism exercised | CUDA | Metal | HF |
+|---|---|:---:|:---:|:---:|
+| GPT-2 124M | LayerNorm-LLM, learned-pos, Conv1D (transposed) weights, gelu_new, tied | ✅ 198 | ✅ 198 | 198 |
+| Pythia-160m | GPT-NeoX: parallel residual, interleaved per-head QKV, partial rotary | ✅ 285 | ✅ 285 | 285 |
+| Gemma-2-2b | √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA hd256, softcaps | ⏳ | ✅ top3 | [9707,235265,110] |
+
+(`load_hf` already covers qk-norm / QKV-bias / plain-Llama / GQA via Qwen3·Qwen2.5·SmolLM2.)
+
 ## Exotic families — dedicated builders / ops (in progress)
 
 | family | needs | status |
