@@ -1,6 +1,6 @@
 // swift-tools-version: 6.1
 //
-// FFAI — Fucking Fast Apple Inference
+// FFAI — F*cking Fast Apple Inference
 //
 // Apple Silicon LLM inference library built on pre-compiled Metal kernels
 // generated from the metaltile Rust DSL.
@@ -39,18 +39,16 @@ let package = Package(
     ],
     targets: [
         // Pre-compiled Metal kernels + Swift dispatch wrappers.
-        // Resources are produced at build time by metaltile-emit (Rust bin
-        // in the sibling metaltile workspace) and live under Resources/.
-        // Generated/ contains the typed Swift wrappers, also produced by
-        // metaltile-emit.
+        // Resources are produced at build time by `tile build --emit all`
+        // (the metaltile-cli binary in the sibling metaltile workspace)
+        // and live under Resources/. Generated/ contains the typed Swift
+        // wrappers, also produced by `tile build`.
         .target(
             name: "MetalTileSwift",
             path: "Sources/MetalTileSwift",
             resources: [
-                .copy("Resources"),
+                .copy("Resources")
             ]
-            // TODO: add MetalTileEmitPlugin once SPM build plugin lands
-            // (Phase 0 deliverable — see planning/plan.md).
         ),
 
         // Main inference library: Tensor, Module system, model families,
@@ -75,6 +73,19 @@ let package = Package(
             path: "Sources/FFAICLI"
         ),
 
+        // Shared test helpers (model-load lock, image / audio /
+        // checkpoint resolution, coherent-output + content-recognition
+        // assertions). Lives in its own target so both FFAITests and
+        // ModelIntegrationTests can depend on it without source duplication.
+        // Uses only FFAI's public API — no `@testable` import.
+        // Fixtures live at `Tests/Resources/` and are resolved by the
+        // helpers via `#filePath`-relative paths (not SwiftPM bundles).
+        .target(
+            name: "TestHelpers",
+            dependencies: ["FFAI"],
+            path: "Tests/Helpers"
+        ),
+
         // Tests
         .testTarget(
             name: "MetalTileSwiftTests",
@@ -83,19 +94,13 @@ let package = Package(
         ),
         .testTarget(
             name: "FFAITests",
-            dependencies: ["FFAI"],
+            dependencies: ["FFAI", "TestHelpers"],
             path: "Tests/FFAITests"
         ),
         .testTarget(
-            name: "ModelTests",
-            dependencies: ["FFAI"],
-            path: "Tests/ModelTests",
-            resources: [
-                // Golden fixtures captured from mlx-lm. See
-                // Tools/capture-fixtures.py and planning/plan.md Phase 0
-                // testing reference convention.
-                .copy("../Fixtures"),
-            ]
+            name: "ModelIntegrationTests",
+            dependencies: ["FFAI", "TestHelpers"],
+            path: "Tests/ModelIntegrationTests"
         ),
     ]
 )
