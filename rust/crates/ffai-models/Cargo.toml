@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 ffai-core.workspace = true
 ffai-ops.workspace = true
+ffai-loader.workspace = true

@@ -16,6 +16,7 @@ metaltile-runtime = { workspace = true, optional = true }
 ffai-core.workspace = true
 ffai-ops.workspace = true
 ffai-models.workspace = true
+ffai-loader.workspace = true
 metaltile-core.workspace = true
 
 [features]
@@ -29,4 +30,8 @@ required-features = ["cuda"]
 
 [[test]]
 name = "ffai_model"
+required-features = ["cuda"]
+
+[[test]]
+name = "qwen3_real"
 required-features = ["cuda"]

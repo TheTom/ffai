@@ -43,6 +43,7 @@ metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "fea
 metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
+serde_json = "1"
 
 # Local co-dev override: when the metaltile checkout sits beside this repo
 # (../metaltile-cuda), build against it directly — instant, no fetch, edits

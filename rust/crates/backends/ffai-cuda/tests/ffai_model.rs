@@ -54,6 +54,7 @@ fn qwen2_decode_layer_on_cuda_matches_cpu() {
         intermediate: 4864,
         rope_theta: 1_000_000.0,
         eps: 1e-6,
+        qk_norm: false,
     };
     let h = cfg.hidden;
     let qd = cfg.n_q_heads * cfg.head_dim; // 896
@@ -78,6 +79,8 @@ fn qwen2_decode_layer_on_cuda_matches_cpu() {
         wk: tens(dev.as_ref(), &wk, vec![kd, h]),
         wv: tens(dev.as_ref(), &wv, vec![kd, h]),
         wo: tens(dev.as_ref(), &wo, vec![h, qd]),
+        q_norm: None,
+        k_norm: None,
         mlp_norm: tens(dev.as_ref(), &mlp_norm, vec![h]),
         w_gate: tens(dev.as_ref(), &w_gate, vec![im, h]),
         w_up: tens(dev.as_ref(), &w_up, vec![im, h]),
@@ -169,6 +172,8 @@ fn gpu_layer(dev: &dyn Device, cfg: &LlamaConfig, lw: &LW) -> LayerWeights {
         wk: tens(dev, &lw.wk, vec![kd, h]),
         wv: tens(dev, &lw.wv, vec![kd, h]),
         wo: tens(dev, &lw.wo, vec![h, qd]),
+        q_norm: None,
+        k_norm: None,
         mlp_norm: tens(dev, &lw.mlp_norm, vec![h]),
         w_gate: tens(dev, &lw.w_gate, vec![im, h]),
         w_up: tens(dev, &lw.w_up, vec![im, h]),
@@ -216,6 +221,7 @@ fn qwen2_full_forward_logits_on_cuda_matches_cpu() {
         intermediate: 4864,
         rope_theta: 1_000_000.0,
         eps: 1e-6,
+        qk_norm: false,
     };
     const VOCAB: usize = 2048;
     const N_LAYERS: usize = 2;
