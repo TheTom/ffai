@@ -6,7 +6,7 @@
 
 use ffai_core::{DType, Device, Tensor};
 use ffai_cuda::CudaDevice;
-use ffai_ops::{dsv4_partial_rope, sdpa_decode_sink};
+use ffai_ops::{dsv4_partial_rope, sdpa_decode_sink, sqrtsoftplus_route, swiglu_limit};
 
 fn tb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -116,4 +116,45 @@ fn dsv4_sink_sdpa_on_cuda_matches_cpu() {
     eprintln!("dsv4 sink-SDPA on CUDA vs CPU: max|Δ|={err:.3e}");
     assert!(err <= 1e-4, "sink sdpa mismatch: {err:.3e}");
     eprintln!("✅ DSv4 d512 sink-SDPA runs on CUDA through the shared op layer, matches CPU.");
+}
+
+#[test]
+fn dsv4_moe_ops_on_cuda_match_cpu() {
+    let Some(dev) = CudaDevice::create().expect("metal init") else {
+        eprintln!("no CUDA device — skipping");
+        return;
+    };
+    let lim = 10.0f32;
+    let sig = |x: f32| x / (1.0 + (-x).exp());
+
+    // ── swiglu_limit ──
+    let g: Vec<f32> = (0..1024).map(|i| (i % 41) as f32 * 0.8 - 16.0).collect();
+    let u: Vec<f32> = (0..1024).map(|i| (i % 37) as f32 * 0.9 - 16.0).collect();
+    let tg = Tensor::new(dev.upload(&tb(&g)).unwrap(), vec![1024], DType::F32);
+    let tu = Tensor::new(dev.upload(&tb(&u)).unwrap(), vec![1024], DType::F32);
+    let out = swiglu_limit(dev.as_ref(), &tg, &tu, lim).unwrap();
+    dev.synchronize().unwrap();
+    let mut ob = vec![0u8; 1024 * 4];
+    dev.download(out.buffer.as_ref(), &mut ob).unwrap();
+    let got = fb(&ob);
+    let mut e = 0.0f32;
+    for i in 0..1024 {
+        let want = sig(g[i].min(lim)) * u[i].clamp(-lim, lim);
+        e = e.max((got[i] - want).abs());
+    }
+    assert!(e <= 1e-5, "swiglu_limit mismatch: {e:.3e}");
+    eprintln!("✅ DSv4 swiglu_limit on CUDA: max|Δ|={e:.1e}");
+
+    // ── sqrtsoftplus router (host-side) ──
+    let logits: Vec<f32> = (0..8).map(|i| (i as f32 - 4.0) * 1.3).collect();
+    let bias: Vec<f32> = (0..8).map(|i| (i as f32) * 0.05 - 0.2).collect();
+    let (unb, bia) = sqrtsoftplus_route(&logits, &bias);
+    let mut e2 = 0.0f32;
+    for i in 0..8 {
+        let sp = logits[i].max(0.0) + (1.0 + (-logits[i].abs()).exp()).ln();
+        let un = sp.sqrt();
+        e2 = e2.max((unb[i] - un).abs()).max((bia[i] - (un + bias[i])).abs());
+    }
+    assert!(e2 <= 1e-6, "router mismatch: {e2:.3e}");
+    eprintln!("✅ DSv4 sqrtsoftplus router (host) matches reference: max|Δ|={e2:.1e}");
 }

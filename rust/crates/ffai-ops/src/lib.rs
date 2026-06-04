@@ -149,6 +149,46 @@ pub fn mul(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     elementwise(dev, a, b, BinOpKind::Mul, "ffai_mul")
 }
 
+// ── DeepSeek-V4 MoE ops ─────────────────────────────────────────────────
+
+/// DSv4 clamped SwiGLU: `out = silu(min(gate, limit)) * clip(up, ±limit)`.
+/// Dispatches `ffai_dsv4_swiglu_limit` (limit = 10 for DSv4).
+pub fn swiglu_limit(dev: &dyn Device, gate: &Tensor, up: &Tensor, limit: f32) -> Result<Tensor> {
+    if gate.shape != up.shape {
+        return Err(Error::Msg("swiglu_limit: gate/up shape mismatch".into()));
+    }
+    let k = lookup("ffai_dsv4_swiglu_limit", gate.dtype)?;
+    let out = Tensor::empty(dev, gate.shape.clone(), gate.dtype)?;
+    let n = gate.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(gate.buffer.clone()),
+            Binding::Buffer(up.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Scalar(limit.to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// DSv4 MoE router scoring: `score_unbiased[e] = sqrt(softplus(logit[e]))`,
+/// `score_biased[e] = score_unbiased[e] + bias[e]`. Computed **host-side** —
+/// the router operates on the tiny `[n_experts]` logit vector that the MoE
+/// already downloads for top-k selection, so a GPU kernel buys nothing and
+/// avoids the multi-output dispatch path. `biased` selects the top-k experts;
+/// `unbiased` weights the combine.
+pub fn sqrtsoftplus_route(logits: &[f32], bias: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let unbiased: Vec<f32> = logits
+        .iter()
+        .map(|&x| (x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()).sqrt())
+        .collect();
+    let biased: Vec<f32> = unbiased.iter().zip(bias).map(|(u, b)| u + b).collect();
+    (unbiased, biased)
+}
+
 // ── Heavier ops — dispatch the registered metaltile kernels ─────────────
 
 /// Row-wise RMS norm: `out[r] = x[r] * rsqrt(mean(x[r]²) + eps) * weight`.
