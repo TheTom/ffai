@@ -5,7 +5,10 @@
 
 use ffai_core::{DType, Device, Tensor};
 use ffai_metal::MetalDevice;
-use ffai_ops::{dsv4_partial_rope, sdpa_decode_sink, sqrtsoftplus_route, swiglu_limit};
+use ffai_ops::{
+    dsv4_mhc_collapse, dsv4_mhc_expand, dsv4_partial_rope, sdpa_decode_sink, sqrtsoftplus_route,
+    swiglu_limit,
+};
 
 fn tb(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -156,4 +159,59 @@ fn dsv4_moe_ops_on_metal_match_cpu() {
     }
     assert!(e2 <= 1e-6, "router mismatch: {e2:.3e}");
     eprintln!("✅ DSv4 sqrtsoftplus router (host) matches reference: max|Δ|={e2:.1e}");
+}
+
+#[test]
+fn dsv4_mhc_on_metal_matches_cpu() {
+    let Some(dev) = MetalDevice::create().expect("metal init") else {
+        eprintln!("no Metal device — skipping");
+        return;
+    };
+    const H: usize = 512; // multiple of 256
+    const NHC: usize = 4;
+
+    // ── collapse ──
+    let state: Vec<f32> = (0..NHC * H).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+    let pre: Vec<f32> = vec![0.6, 0.9, 0.3, 1.1];
+    let ts = Tensor::new(dev.upload(&tb(&state)).unwrap(), vec![NHC, H], DType::F32);
+    let tp = Tensor::new(dev.upload(&tb(&pre)).unwrap(), vec![NHC], DType::F32);
+    let out = dsv4_mhc_collapse(dev.as_ref(), &ts, &tp, H as u32, NHC as u32).unwrap();
+    dev.synchronize().unwrap();
+    let mut ob = vec![0u8; H * 4];
+    dev.download(out.buffer.as_ref(), &mut ob).unwrap();
+    let got = fb(&ob);
+    let mut e = 0.0f32;
+    for d in 0..H {
+        let want: f32 = (0..NHC).map(|c| pre[c] * state[c * H + d]).sum();
+        e = e.max((got[d] - want).abs());
+    }
+    assert!(e <= 1e-4, "collapse mismatch: {e:.3e}");
+    eprintln!("✅ DSv4 mHC collapse on Metal: max|Δ|={e:.1e}");
+
+    // ── expand ──
+    let block_out: Vec<f32> = (0..H).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let post: Vec<f32> = vec![1.2, 0.8, 1.0, 0.5];
+    let comb: Vec<f32> = (0..NHC * NHC).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+    let resid: Vec<f32> = (0..NHC * H).map(|i| ((i % 11) as f32 - 5.0) * 0.07).collect();
+    let tbo = Tensor::new(dev.upload(&tb(&block_out)).unwrap(), vec![H], DType::F32);
+    let tpo = Tensor::new(dev.upload(&tb(&post)).unwrap(), vec![NHC], DType::F32);
+    let tco = Tensor::new(dev.upload(&tb(&comb)).unwrap(), vec![NHC * NHC], DType::F32);
+    let tr = Tensor::new(dev.upload(&tb(&resid)).unwrap(), vec![NHC, H], DType::F32);
+    let st = dsv4_mhc_expand(dev.as_ref(), &tbo, &tpo, &tco, &tr, H as u32, NHC as u32).unwrap();
+    dev.synchronize().unwrap();
+    let mut sb = vec![0u8; NHC * H * 4];
+    dev.download(st.buffer.as_ref(), &mut sb).unwrap();
+    let gs = fb(&sb);
+    let mut e3 = 0.0f32;
+    for dst in 0..NHC {
+        for d in 0..H {
+            let mut want = block_out[d] * post[dst];
+            for src in 0..NHC {
+                want += comb[dst * NHC + src] * resid[src * H + d];
+            }
+            e3 = e3.max((gs[dst * H + d] - want).abs());
+        }
+    }
+    assert!(e3 <= 1e-4, "expand mismatch: {e3:.3e}");
+    eprintln!("✅ DSv4 mHC expand on Metal: max|Δ|={e3:.1e}");
 }

@@ -189,6 +189,71 @@ pub fn sqrtsoftplus_route(logits: &[f32], bias: &[f32]) -> (Vec<f32>, Vec<f32>) 
     (unbiased, biased)
 }
 
+// ── DeepSeek-V4 mHC (hyper-connection 4-channel residual) ───────────────
+
+/// mHC collapse: `out[d] = Σ_c pre[c] · state[c, d]` — mix the 4-channel
+/// residual state `[n_hc, hidden]` down to `[hidden]` using the per-channel
+/// `pre` weights. Single token. Dispatches `ffai_dsv4_mhc_collapse`.
+pub fn dsv4_mhc_collapse(
+    dev: &dyn Device,
+    state: &Tensor,
+    pre: &Tensor,
+    hidden_dim: u32,
+    n_hc: u32,
+) -> Result<Tensor> {
+    let k = lookup("ffai_dsv4_mhc_collapse", state.dtype)?;
+    let out = Tensor::empty(dev, vec![hidden_dim as usize], state.dtype)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid::d1((hidden_dim).div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(state.buffer.clone()),
+            Binding::Buffer(pre.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(hidden_dim),
+            u(n_hc),
+            u(1),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// mHC expand: write the new 4-channel residual state
+/// `state[dst, d] = block_out[d]·post[dst] + Σ_src comb[dst, src]·residual[src, d]`.
+/// Single token. Returns `[n_hc, hidden]`. Dispatches `ffai_dsv4_mhc_expand`.
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_mhc_expand(
+    dev: &dyn Device,
+    block_out: &Tensor,
+    post: &Tensor,
+    comb: &Tensor,
+    residual_state: &Tensor,
+    hidden_dim: u32,
+    n_hc: u32,
+) -> Result<Tensor> {
+    let k = lookup("ffai_dsv4_mhc_expand", block_out.dtype)?;
+    let state = Tensor::empty(dev, vec![(n_hc * hidden_dim) as usize], block_out.dtype)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid::d1((hidden_dim).div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(block_out.buffer.clone()),
+            Binding::Buffer(post.buffer.clone()),
+            Binding::Buffer(comb.buffer.clone()),
+            Binding::Buffer(residual_state.buffer.clone()),
+            Binding::Buffer(state.buffer.clone()),
+            u(hidden_dim),
+            u(n_hc),
+            u(1),
+        ],
+        grid,
+    )?;
+    Ok(state)
+}
+
 // ── Heavier ops — dispatch the registered metaltile kernels ─────────────
 
 /// Row-wise RMS norm: `out[r] = x[r] * rsqrt(mean(x[r]²) + eps) * weight`.
