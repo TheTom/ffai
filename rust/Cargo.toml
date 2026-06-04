@@ -8,6 +8,7 @@ members = [
     "crates/ffai-models",
     "crates/ffai",
     "crates/ffai-cli",
+    "crates/ffai-ffi",
     "crates/backends/ffai-metal",
     "crates/backends/ffai-cuda",
     "crates/backends/ffai-vulkan",
