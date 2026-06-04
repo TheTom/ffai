@@ -20,5 +20,6 @@ pub trait Model: Send + Sync {
     fn forward(&self, dev: &dyn Device, tokens: &[u32]) -> Result<Tensor>;
 }
 
+pub mod dsv4;
 pub mod llama;
 pub mod moe;
