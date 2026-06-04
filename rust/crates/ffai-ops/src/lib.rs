@@ -189,6 +189,53 @@ pub fn sqrtsoftplus_route(logits: &[f32], bias: &[f32]) -> (Vec<f32>, Vec<f32>) 
     (unbiased, biased)
 }
 
+// ── SSM (Mamba2 SSD selective scan) ─────────────────────────────────────
+
+/// Mamba2 SSD selective-scan **decode step** (single token, batch=1):
+/// `da = exp(-exp(a_log)·dt)`; `state' = da·state + x·dt·B`;
+/// `out = Σ_s C·state' + x·D`. Dispatches `mt_ssm_step`. Returns
+/// `(state_out [n_heads·dh·ds], out [n_heads·dh])`. `ds` must be a multiple
+/// of 32. Shapes: x `[n_heads·dh]`, a_log/d_skip/dt `[n_heads]`,
+/// b_mat/c_mat `[n_groups·ds]`, state_in `[n_heads·dh·ds]`.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_step(
+    dev: &dyn Device,
+    x: &Tensor,
+    a_log: &Tensor,
+    b_mat: &Tensor,
+    c_mat: &Tensor,
+    d_skip: &Tensor,
+    dt: &Tensor,
+    state_in: &Tensor,
+    dh: u32,
+    ds: u32,
+    n_heads: u32,
+    heads_per_group: u32,
+) -> Result<(Tensor, Tensor)> {
+    let k = lookup("mt_ssm_step", x.dtype)?;
+    let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
+    let out = Tensor::empty(dev, vec![(n_heads * dh) as usize], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let bindings = vec![
+        Binding::Buffer(x.buffer.clone()),
+        Binding::Buffer(a_log.buffer.clone()),
+        Binding::Buffer(b_mat.buffer.clone()),
+        Binding::Buffer(c_mat.buffer.clone()),
+        Binding::Buffer(d_skip.buffer.clone()),
+        Binding::Buffer(dt.buffer.clone()),
+        Binding::Buffer(state_in.buffer.clone()),
+        Binding::Buffer(state_out.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()),
+        u(dh),
+        u(ds),
+        u(n_heads),
+        u(heads_per_group),
+    ];
+    let grid = Grid { grid: [dh, n_heads, 1], block: [32, 1, 1] };
+    dev.dispatch(&k, &bindings, grid)?;
+    Ok((state_out, out))
+}
+
 // ── DeepSeek-V4 mHC (hyper-connection 4-channel residual) ───────────────
 
 /// mHC sinkhorn split (single token, host-side): the 24-value `mixes`
