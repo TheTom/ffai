@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 ffai-core.workspace = true
 serde_json.workspace = true
+memmap2.workspace = true

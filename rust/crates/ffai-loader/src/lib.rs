@@ -100,3 +100,4 @@ impl SafeTensors {
         Ok((&self.bytes[s..e], info.dtype, &info.shape))
     }
 }
+pub mod gguf;
