@@ -191,6 +191,54 @@ pub fn sqrtsoftplus_route(logits: &[f32], bias: &[f32]) -> (Vec<f32>, Vec<f32>) 
 
 // ── DeepSeek-V4 mHC (hyper-connection 4-channel residual) ───────────────
 
+/// mHC sinkhorn split (single token, host-side): the 24-value `mixes`
+/// vector → `pre[4]`, `post[4]`, `comb[4×4]`. Faithful transcription of
+/// `ffai_dsv4_mhc_sinkhorn_split` (a 3-output kernel; trivial at one token,
+/// so it runs on the host). `scale` is `[pre, post, comb]`, `base` is `[24]`.
+/// - pre[c]  = sigmoid(mixes[c]·pre_scale + base[c]) + eps
+/// - post[c] = 2·sigmoid(mixes[4+c]·post_scale + base[4+c])
+/// - comb    = per-row softmax of (mixes·comb_scale + base), then
+///   `iters` Sinkhorn steps (column-normalize, then row-normalize).
+pub fn dsv4_mhc_sinkhorn_split(
+    mixes: &[f32],
+    scale: [f32; 3],
+    base: &[f32],
+    eps: f32,
+    iters: u32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let pre: Vec<f32> = (0..4).map(|c| sig(mixes[c] * scale[0] + base[c]) + eps).collect();
+    let post: Vec<f32> = (0..4).map(|c| 2.0 * sig(mixes[4 + c] * scale[1] + base[4 + c])).collect();
+
+    let mut c = [[0.0f32; 4]; 4];
+    for i in 0..4 {
+        let r: [f32; 4] = std::array::from_fn(|j| mixes[8 + i * 4 + j] * scale[2] + base[8 + i * 4 + j]);
+        let m = r.iter().cloned().fold(f32::MIN, f32::max);
+        let e: [f32; 4] = std::array::from_fn(|j| (r[j] - m).exp());
+        let s: f32 = e.iter().sum();
+        for j in 0..4 {
+            c[i][j] = e[j] / s + eps;
+        }
+    }
+    for _ in 0..iters {
+        for j in 0..4 {
+            let cs: f32 = (0..4).map(|i| c[i][j]).sum::<f32>() + eps;
+            for row in c.iter_mut() {
+                row[j] /= cs;
+            }
+        }
+        for row in c.iter_mut() {
+            let rs: f32 = row.iter().sum::<f32>() + eps;
+            for v in row.iter_mut() {
+                *v /= rs;
+            }
+        }
+    }
+    let comb: Vec<f32> = (0..4).flat_map(|i| (0..4).map(move |j| c[i][j])).collect();
+    (pre, post, comb)
+}
+
+
 /// mHC collapse: `out[d] = Σ_c pre[c] · state[c, d]` — mix the 4-channel
 /// residual state `[n_hc, hidden]` down to `[hidden]` using the per-channel
 /// `pre` weights. Single token. Dispatches `ffai_dsv4_mhc_collapse`.
@@ -586,4 +634,28 @@ pub fn rope_llama(
         grid,
     )?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dsv4_mhc_sinkhorn_split;
+
+    #[test]
+    fn sinkhorn_comb_is_doubly_stochastic() {
+        // mixes/base arbitrary; after enough Sinkhorn iters the 4×4 comb
+        // matrix must be (near) doubly-stochastic: every row and column ≈ 1.
+        let mixes: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) * 0.2).collect();
+        let base: Vec<f32> = (0..24).map(|i| (i as f32) * 0.01 - 0.1).collect();
+        let (pre, post, comb) = dsv4_mhc_sinkhorn_split(&mixes, [1.0, 1.0, 1.0], &base, 1e-6, 20);
+        assert_eq!((pre.len(), post.len(), comb.len()), (4, 4, 16));
+        for i in 0..4 {
+            let row: f32 = (0..4).map(|j| comb[i * 4 + j]).sum();
+            let col: f32 = (0..4).map(|j| comb[j * 4 + i]).sum();
+            assert!((row - 1.0).abs() < 1e-2, "row {i} sum {row}");
+            assert!((col - 1.0).abs() < 1e-2, "col {i} sum {col}");
+        }
+        // pre is sigmoid+eps ∈ (0,1+eps); post is 2·sigmoid ∈ (0,2).
+        assert!(pre.iter().all(|&x| x > 0.0 && x < 1.01));
+        assert!(post.iter().all(|&x| x > 0.0 && x < 2.0));
+    }
 }
