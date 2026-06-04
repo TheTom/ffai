@@ -15,6 +15,7 @@ metaltile-runtime = { workspace = true, optional = true }
 [dev-dependencies]
 ffai-core.workspace = true
 ffai-ops.workspace = true
+ffai-models.workspace = true
 metaltile-core.workspace = true
 
 [features]
@@ -24,4 +25,8 @@ cuda = ["dep:metaltile-runtime", "dep:metaltile-codegen", "metaltile-runtime/cud
 
 [[test]]
 name = "cuda_smoke"
+required-features = ["cuda"]
+
+[[test]]
+name = "ffai_model"
 required-features = ["cuda"]
