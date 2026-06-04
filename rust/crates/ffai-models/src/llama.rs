@@ -21,6 +21,8 @@ pub struct LlamaConfig {
     pub eps: f32,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
+    /// QKV projection bias (Qwen2/Qwen2.5).
+    pub attn_bias: bool,
 }
 
 impl LlamaConfig {
@@ -40,6 +42,10 @@ pub struct LayerWeights {
     pub wk: Tensor,        // [n_kv_heads*head_dim, hidden]
     pub wv: Tensor,        // [n_kv_heads*head_dim, hidden]
     pub wo: Tensor,        // [hidden, n_q_heads*head_dim]
+    /// QKV biases `[*_heads*head_dim]` (None unless attn_bias).
+    pub bias_q: Option<Tensor>,
+    pub bias_k: Option<Tensor>,
+    pub bias_v: Option<Tensor>,
     /// Qwen3 per-head Q/K RMSNorm weights `[head_dim]` (None unless qk_norm).
     pub q_norm: Option<Tensor>,
     pub k_norm: Option<Tensor>,
@@ -69,9 +75,14 @@ pub fn decode_layer_self(
 
     // ── attention ────────────────────────────────────────────────────
     let h = ops::rms_norm(dev, x, &w.attn_norm, cfg.eps)?;
-    let q = ops::gemv(dev, &w.wq, &h)?;
-    let k = ops::gemv(dev, &w.wk, &h)?;
-    let v = ops::gemv(dev, &w.wv, &h)?;
+    let mut q = ops::gemv(dev, &w.wq, &h)?;
+    let mut k = ops::gemv(dev, &w.wk, &h)?;
+    let mut v = ops::gemv(dev, &w.wv, &h)?;
+    if cfg.attn_bias {
+        q = ops::add(dev, &q, w.bias_q.as_ref().ok_or_else(|| Error::Msg("attn_bias set but bias_q missing".into()))?)?;
+        k = ops::add(dev, &k, w.bias_k.as_ref().ok_or_else(|| Error::Msg("attn_bias set but bias_k missing".into()))?)?;
+        v = ops::add(dev, &v, w.bias_v.as_ref().ok_or_else(|| Error::Msg("attn_bias set but bias_v missing".into()))?)?;
+    }
 
     // Reshape to heads; optional Qwen3 per-head Q/K RMSNorm before RoPE.
     let q = q.reshaped(vec![cfg.n_q_heads, hd]);
@@ -178,6 +189,9 @@ pub fn load_qwen3(
             wk: up(&format!("{p}.self_attn.k_proj.weight"))?,
             wv: up(&format!("{p}.self_attn.v_proj.weight"))?,
             wo: up(&format!("{p}.self_attn.o_proj.weight"))?,
+            bias_q: if cfg.attn_bias { Some(up(&format!("{p}.self_attn.q_proj.bias"))?) } else { None },
+            bias_k: if cfg.attn_bias { Some(up(&format!("{p}.self_attn.k_proj.bias"))?) } else { None },
+            bias_v: if cfg.attn_bias { Some(up(&format!("{p}.self_attn.v_proj.bias"))?) } else { None },
             q_norm: if cfg.qk_norm {
                 Some(up(&format!("{p}.self_attn.q_norm.weight"))?)
             } else {
@@ -196,4 +210,52 @@ pub fn load_qwen3(
     }
 
     Ok(ModelWeights { embed, layers, final_norm, lm_head })
+}
+
+/// A model loaded from an HF directory, with its derived config.
+pub struct LoadedModel {
+    pub cfg: LlamaConfig,
+    pub weights: ModelWeights,
+    pub n_layers: usize,
+    pub vocab: usize,
+}
+
+/// Load any dense transformer-LLM straight from an HF directory: parse
+/// `config.json` for the geometry, detect arch flags from the tensor names
+/// (qk-norm by `q_norm.weight`, QKV bias by `q_proj.bias`), and upload the
+/// weights. This is what makes the whole Llama/Qwen/Mistral/Yi/Phi/SmolLM
+/// family load with one code path — no per-model hardcoding.
+pub fn load_hf(dev: &dyn Device, dir: &str) -> Result<LoadedModel> {
+    let cfg_txt = std::fs::read_to_string(format!("{dir}/config.json"))
+        .map_err(|e| Error::Msg(format!("read config.json: {e}")))?;
+    let j: serde_json::Value =
+        serde_json::from_str(&cfg_txt).map_err(|e| Error::Msg(format!("config.json: {e}")))?;
+    let u = |k: &str| j[k].as_u64().map(|x| x as usize);
+    let hidden = u("hidden_size").ok_or_else(|| Error::Msg("config: hidden_size".into()))?;
+    let n_q_heads = u("num_attention_heads").ok_or_else(|| Error::Msg("config: n_heads".into()))?;
+    let n_kv_heads = u("num_key_value_heads").unwrap_or(n_q_heads);
+    let head_dim = u("head_dim").unwrap_or(hidden / n_q_heads);
+    let intermediate = u("intermediate_size").ok_or_else(|| Error::Msg("config: inter".into()))?;
+    let n_layers = u("num_hidden_layers").ok_or_else(|| Error::Msg("config: n_layers".into()))?;
+    let vocab = u("vocab_size").ok_or_else(|| Error::Msg("config: vocab".into()))?;
+    let rope_theta = j["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+    let eps = j["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32;
+
+    let st = ffai_loader::SafeTensors::open(&format!("{dir}/model.safetensors"))?;
+    let qk_norm = st.info("model.layers.0.self_attn.q_norm.weight").is_some();
+    let attn_bias = st.info("model.layers.0.self_attn.q_proj.bias").is_some();
+
+    let cfg = LlamaConfig {
+        hidden,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        intermediate,
+        rope_theta,
+        eps,
+        qk_norm,
+        attn_bias,
+    };
+    let weights = load_qwen3(dev, &st, &cfg, n_layers)?;
+    Ok(LoadedModel { cfg, weights, n_layers, vocab })
 }

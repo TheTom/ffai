@@ -37,6 +37,7 @@ fn qwen3_0_6b_real_forward_on_metal() {
         rope_theta: 1_000_000.0,
         eps: 1e-6,
         qk_norm: true,
+        attn_bias: false,
     };
     const N_LAYERS: usize = 28;
     const VOCAB: usize = 151936;

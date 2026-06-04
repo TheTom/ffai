@@ -53,6 +53,7 @@ fn qwen2_decode_layer_on_metal_matches_cpu() {
         rope_theta: 1_000_000.0,
         eps: 1e-6,
         qk_norm: false,
+        attn_bias: false,
     };
     let h = cfg.hidden;
     let qd = cfg.n_q_heads * cfg.head_dim;
@@ -76,6 +77,9 @@ fn qwen2_decode_layer_on_metal_matches_cpu() {
         wk: tens(dev.as_ref(), &wk, vec![kd, h]),
         wv: tens(dev.as_ref(), &wv, vec![kd, h]),
         wo: tens(dev.as_ref(), &wo, vec![h, qd]),
+        bias_q: None,
+        bias_k: None,
+        bias_v: None,
         q_norm: None,
         k_norm: None,
         mlp_norm: tens(dev.as_ref(), &mlp_norm, vec![h]),
