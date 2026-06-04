@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ffai-core",
+    "crates/ffai-ops",
+    "crates/ffai-loader",
+    "crates/ffai-runtime",
+    "crates/ffai-models",
+    "crates/ffai",
+    "crates/ffai-cli",
+    "crates/backends/ffai-metal",
+    "crates/backends/ffai-cuda",
+    "crates/backends/ffai-vulkan",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Eric Kryski (@ekryski)", "Tom Turney (@TheTom)"]
+repository = "https://github.com/TheTom/ffai"
+
+[workspace.dependencies]
+# ── engine crates ────────────────────────────────────────────────────
+ffai-core = { path = "crates/ffai-core" }
+ffai-ops = { path = "crates/ffai-ops" }
+ffai-loader = { path = "crates/ffai-loader" }
+ffai-runtime = { path = "crates/ffai-runtime" }
+ffai-models = { path = "crates/ffai-models" }
+ffai = { path = "crates/ffai" }
+# ── backend crates ───────────────────────────────────────────────────
+ffai-metal = { path = "crates/backends/ffai-metal" }
+ffai-cuda = { path = "crates/backends/ffai-cuda" }
+ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
+# ── shared kernel toolchain (external: the metaltile cuda/metal repo) ──
+# Canonical pointer is the git branch carrying both backends, so a fresh
+# clone (Eric included) is self-contained. Local co-development overrides
+# these to the live checkout via the [patch] section below.
+metaltile-core = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
+metaltile-codegen = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
+metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
+# ── third-party ──────────────────────────────────────────────────────
+thiserror = "2"
+
+# Local co-dev override: when the metaltile checkout sits beside this repo
+# (../metaltile-cuda), build against it directly — instant, no fetch, edits
+# to kernels/codegen pick up immediately. Eric / CI without that sibling
+# fall through to the git branch above. Comment out to force the git dep.
+[patch."https://github.com/TheTom/metaltile"]
+metaltile-core = { path = "../../metaltile-cuda/crates/metaltile-core" }
+metaltile-codegen = { path = "../../metaltile-cuda/crates/metaltile-codegen" }
+metaltile-runtime = { path = "../../metaltile-cuda/crates/metaltile-runtime" }
