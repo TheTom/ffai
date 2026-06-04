@@ -1,9 +1,9 @@
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
-//! GPT-2 vs HF — thin wrapper; the forward lives once in ffai-modeltests.
+//! The entire shared model suite on CUDA — ONE file (mirror of the Metal one).
 use ffai_cuda::CudaDevice;
 #[test]
-fn gpt2_124m_full_forward_vs_hf() {
+fn all_models_on_cuda() {
     let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA — skip"); return; };
-    ffai_modeltests::verify_gpt2(dev.as_ref(), "GB10 sm_121");
+    ffai_modeltests::run_all(dev.as_ref(), "GB10 sm_121");
 }

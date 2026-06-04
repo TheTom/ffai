@@ -74,14 +74,6 @@ name = "conv1d_test"
 required-features = ["cuda"]
 
 [[test]]
-name = "mamba2"
-required-features = ["cuda"]
-
-[[test]]
-name = "olmoe"
-required-features = ["cuda"]
-
-[[test]]
 name = "vit_ops"
 required-features = ["cuda"]
 
@@ -91,26 +83,6 @@ required-features = ["cuda"]
 
 [[test]]
 name = "whisper"
-required-features = ["cuda"]
-
-[[test]]
-name = "gpt2"
-required-features = ["cuda"]
-
-[[test]]
-name = "pythia"
-required-features = ["cuda"]
-
-[[test]]
-name = "gemma2"
-required-features = ["cuda"]
-
-[[test]]
-name = "phi"
-required-features = ["cuda"]
-
-[[test]]
-name = "falcon_h1"
 required-features = ["cuda"]
 
 [[test]]
@@ -138,13 +110,5 @@ name = "gpt2_kvcache"
 required-features = ["cuda"]
 
 [[test]]
-name = "olmo2"
-required-features = ["cuda"]
-
-[[test]]
-name = "stablelm2"
-required-features = ["cuda"]
-
-[[test]]
-name = "gptneo"
+name = "all_models"
 required-features = ["cuda"]
