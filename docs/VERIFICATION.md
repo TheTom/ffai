@@ -37,9 +37,9 @@ doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
 | Pythia-160m | GPT-NeoX: parallel residual, interleaved per-head QKV, partial rotary | ✅ 285 | ✅ 285 | 285 |
 | Gemma-2-2b | √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA hd256, softcaps | ✅ top3 | ✅ top3 | [9707,235265,110] |
 | Phi-1.5 | single shared norm → parallel attn+MLP, separate q/k/v+bias, partial rotary | ✅ top3 | ✅ top3 | [11,13,546] |
-| OLMo-2-1B | **post-norm** (norm on sublayer output) + qk-norm over full proj, SwiGLU | ⏳ | ✅ top3 | [198,8,13] |
-| StableLM-2-1.6B | LayerNorm(+bias), q/k/v bias, partial rotary, SwiGLU | ⏳ | ✅ top3 | [341,11,280] |
-| GPT-Neo-125M | learned-pos + LayerNorm, separate q/k/v (no bias), no attn scaling, tied | ⏳ | ✅ top3 | [28,59,91] |
+| OLMo-2-1B | **post-norm** (norm on sublayer output) + qk-norm over full proj, SwiGLU | ✅ top3 | ✅ top3 | [198,8,13] |
+| StableLM-2-1.6B | LayerNorm(+bias), q/k/v bias, partial rotary, SwiGLU | ✅ top3 | ✅ top3 | [341,11,280] |
+| GPT-Neo-125M | learned-pos + LayerNorm, separate q/k/v (no bias), no attn scaling, tied | ✅ top3 | ✅ top3 | [28,59,91] |
 
 (`load_hf` already covers qk-norm / QKV-bias / plain-Llama / GQA via Qwen3·Qwen2.5·SmolLM2.)
 
@@ -53,6 +53,16 @@ with `n_kv = i+1` against the per-head K/V cache (`kv_stride = seq_len`).
 |---|---|:---:|:---:|:---:|
 | GPT-2 prefill (8 tok) | causal masking + learned positions | ✅ | ✅ | top3 [11,21831,7586] |
 | Llama prefill (7 tok) | **RoPE-at-position** + GQA + SwiGLU (SmolVLM text model) | ⏳ | ✅ | top3 [12642,4052,216] |
+
+### Throughput (correctness-first, not yet optimized) — GPT-2-124M, incremental KV cache + device-resident weights
+| platform | prefill | decode | one-time (weight upload / kernel JIT) | output |
+|---|---|---|---|---|
+| CUDA (GB10) | 52.5 tok/s | **24.6 tok/s** (41 ms/tok) | 16.1s / 42.4s | exact HF match |
+| Metal (Apple GPU) | 11 tok/s | **9.4 tok/s** (107 ms/tok) | 10.7s / 31.5s | exact HF match |
+
+Resident weights gave a 26× decode speedup over re-uploading per step. Remaining
+overhead is per-layer host round-trips + KV re-upload (device-resident activations
++ device KV cache is the next win) and F32-only compute. Not production tok/s yet.
 
 With these, every primitive for end-to-end generation + multimodal prefill is
 verified. A full VLM forward = [SigLIP tower] → [SmolVLM connector] → splice
