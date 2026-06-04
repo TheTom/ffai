@@ -107,3 +107,69 @@ pub fn mla_attention(
     let t_olow = Tensor::new(dev.upload(&tb(&o_low))?, vec![o_low.len()], DType::F32);
     ops::gemv(dev, &w.output_b, &t_olow)
 }
+
+// ── DeepSeek-V4 MoE feed-forward ────────────────────────────────────────
+
+/// One expert's SwiGLU MLP (gate/up/down).
+pub struct Dsv4Expert {
+    pub gate: Tensor, // [intermediate, hidden]
+    pub up: Tensor,   // [intermediate, hidden]
+    pub down: Tensor, // [hidden, intermediate]
+}
+
+/// DSv4 routed MoE: sqrt(softplus) router (+bias) → top-k clamped-SwiGLU
+/// experts (weighted by normalized unbiased score × routed_scaling) + an
+/// always-on shared expert.
+pub struct Dsv4Moe {
+    pub router: Tensor,   // [n_experts, hidden] (f32 here)
+    pub bias: Vec<f32>,   // [n_experts]
+    pub experts: Vec<Dsv4Expert>,
+    pub shared: Dsv4Expert,
+    pub top_k: usize,
+    pub routed_scaling: f32, // 1.5 for DSv4
+    pub swiglu_limit: f32,   // 10.0 for DSv4
+}
+
+/// Run the DSv4 MoE feed-forward for a single token `x [hidden]`.
+pub fn dsv4_moe(dev: &dyn Device, w: &Dsv4Moe, x: &Tensor) -> Result<Tensor> {
+    let hidden = x.elem_count();
+
+    // Router logits → host → sqrt(softplus) scores → top-k by biased.
+    let logits_t = ops::gemv(dev, &w.router, x)?;
+    dev.synchronize()?;
+    let mut lb = vec![0u8; w.experts.len() * 4];
+    dev.download(logits_t.buffer.as_ref(), &mut lb)?;
+    let logits = fb(&lb);
+    let (unbiased, biased) = ops::sqrtsoftplus_route(&logits, &w.bias);
+
+    let mut order: Vec<usize> = (0..w.experts.len()).collect();
+    order.sort_by(|&a, &b| biased[b].total_cmp(&biased[a]));
+    let top: Vec<usize> = order.into_iter().take(w.top_k).collect();
+    let denom: f32 = top.iter().map(|&e| unbiased[e]).sum();
+    let weights: Vec<f32> =
+        top.iter().map(|&e| unbiased[e] / denom * w.routed_scaling).collect();
+
+    let mut acc = vec![0.0f32; hidden];
+    let run_expert = |dev: &dyn Device, ex: &Dsv4Expert| -> Result<Vec<f32>> {
+        let gate = ops::gemv(dev, &ex.gate, x)?;
+        let up = ops::gemv(dev, &ex.up, x)?;
+        let inner = ops::swiglu_limit(dev, &gate, &up, w.swiglu_limit)?;
+        let out = ops::gemv(dev, &ex.down, &inner)?;
+        dev.synchronize()?;
+        let mut ob = vec![0u8; hidden * 4];
+        dev.download(out.buffer.as_ref(), &mut ob)?;
+        Ok(fb(&ob))
+    };
+    for (&e, &gw) in top.iter().zip(&weights) {
+        let out = run_expert(dev, &w.experts[e])?;
+        for i in 0..hidden {
+            acc[i] += gw * out[i];
+        }
+    }
+    let shared = run_expert(dev, &w.shared)?;
+    for i in 0..hidden {
+        acc[i] += shared[i];
+    }
+
+    Ok(Tensor::new(dev.upload(&tb(&acc))?, vec![hidden], x.dtype))
+}
