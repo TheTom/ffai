@@ -340,6 +340,47 @@ pub fn gather(dev: &dyn Device, table: &Tensor, indices: &Tensor) -> Result<Tens
     Ok(out)
 }
 
+/// DeepSeek-V4 partial RoPE: rotate only the rope tail of each head
+/// (`[n_nope .. head_dim]`, adjacent-pair / GPT-J convention) in place; the
+/// nope dims pass through. `qk` is `[n_heads, head_dim]`. Full-attention
+/// layers: YaRN disabled (freq_scale=1, ext_factor=0). Dispatches
+/// `ffai_dsv4_partial_rope` (grid `[n_heads, half_rot, 1]`). Mutates and
+/// returns a view of `qk`'s buffer (matches the Swift in-place RoPE).
+#[allow(clippy::too_many_arguments)]
+pub fn dsv4_partial_rope(
+    dev: &dyn Device,
+    qk: &Tensor,
+    n_heads: u32,
+    head_dim: u32,
+    n_nope: u32,
+    half_rot: u32,
+    position: u32,
+    theta_base: f32,
+    inverse: bool,
+) -> Result<Tensor> {
+    let k = lookup("ffai_dsv4_partial_rope", qk.dtype)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+    // Bind qk as both input and output → in-place (nope dims preserved).
+    let bindings = vec![
+        Binding::Buffer(qk.buffer.clone()),
+        Binding::Buffer(qk.buffer.clone()),
+        u(head_dim),
+        u(n_nope),
+        u(half_rot),
+        u(position),
+        f(theta_base),
+        u(if inverse { 1 } else { 0 }),
+        f(1.0), // freq_scale (YaRN off)
+        f(0.0), // ext_factor
+        f(0.0), // corr_low
+        f(1.0), // corr_high
+    ];
+    let grid = Grid { grid: [n_heads, half_rot, 1], block: [1, 1, 1] };
+    dev.dispatch(&k, &bindings, grid)?;
+    Ok(Tensor::new(qk.buffer.clone(), qk.shape.clone(), qk.dtype))
+}
+
 /// Softmax over the last dim, row-wise. Dispatches `mt_softmax`. Row width
 /// `n` must be a multiple of 1024 (the kernel's 4-elems/thread loop).
 pub fn softmax(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {

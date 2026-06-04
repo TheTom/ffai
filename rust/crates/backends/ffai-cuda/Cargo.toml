@@ -43,3 +43,7 @@ required-features = ["cuda"]
 [[test]]
 name = "moe_test"
 required-features = ["cuda"]
+
+[[test]]
+name = "dsv4_test"
+required-features = ["cuda"]
