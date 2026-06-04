@@ -35,3 +35,7 @@ required-features = ["cuda"]
 [[test]]
 name = "qwen3_real"
 required-features = ["cuda"]
+
+[[test]]
+name = "hf_model"
+required-features = ["cuda"]
