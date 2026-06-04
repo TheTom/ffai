@@ -98,3 +98,35 @@ pub fn decode_layer_self(
 
     Ok(x2)
 }
+
+/// Full model weights for the transformer-LLM family.
+pub struct ModelWeights {
+    pub embed: Tensor,           // [vocab, hidden]
+    pub layers: Vec<LayerWeights>,
+    pub final_norm: Tensor,      // [hidden]
+    pub lm_head: Tensor,         // [vocab, hidden]  (untied; tie = embed)
+}
+
+/// Single-token forward: embed → every decode layer (self-attention) →
+/// final RMSNorm → lm_head → next-token logits `[vocab]`. The whole model
+/// graph on the shared op layer — embedding, all layers, and the head. (The
+/// multi-position KV cache for sequences ≥ 2 is the decode loop's job; this
+/// is the per-token compute that proves the full graph.)
+pub fn forward_single(
+    dev: &dyn Device,
+    cfg: &LlamaConfig,
+    w: &ModelWeights,
+    token_id: u32,
+) -> Result<Tensor> {
+    let ids = Tensor::new(
+        dev.upload(&token_id.to_le_bytes())?,
+        vec![1],
+        ffai_core::DType::U32,
+    );
+    let mut x = ops::gather(dev, &w.embed, &ids)?.reshaped(vec![cfg.hidden]);
+    for layer in &w.layers {
+        x = decode_layer_self(dev, cfg, layer, &x, 0)?;
+    }
+    let xn = ops::rms_norm(dev, &x, &w.final_norm, cfg.eps)?;
+    ops::gemv(dev, &w.lm_head, &xn)
+}
