@@ -13,6 +13,7 @@ metaltile-codegen = { workspace = true, optional = true }
 metaltile-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
+ffai-modeltests.workspace = true
 ffai-core.workspace = true
 ffai-ops.workspace = true
 ffai-models.workspace = true

@@ -81,6 +81,7 @@ dependencies = [
  "ffai-core",
  "ffai-loader",
  "ffai-models",
+ "ffai-modeltests",
  "ffai-ops",
  "metaltile-codegen",
  "metaltile-core",
@@ -110,6 +111,7 @@ dependencies = [
  "ffai-core",
  "ffai-loader",
  "ffai-models",
+ "ffai-modeltests",
  "ffai-ops",
  "metaltile-core",
  "metaltile-runtime",
@@ -124,6 +126,16 @@ dependencies = [
  "ffai-loader",
  "ffai-ops",
  "serde_json",
+]
+
+[[package]]
+name = "ffai-modeltests"
+version = "0.1.0"
+dependencies = [
+ "ffai-core",
+ "ffai-loader",
+ "ffai-models",
+ "ffai-ops",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ members = [
     "crates/ffai-loader",
     "crates/ffai-runtime",
     "crates/ffai-models",
+    "crates/ffai-modeltests",
     "crates/ffai",
     "crates/ffai-cli",
     "crates/ffai-ffi",
@@ -29,6 +30,7 @@ ffai-loader = { path = "crates/ffai-loader" }
 ffai-runtime = { path = "crates/ffai-runtime" }
 ffai-models = { path = "crates/ffai-models" }
 ffai = { path = "crates/ffai" }
+ffai-modeltests = { path = "crates/ffai-modeltests" }
 # ── backend crates ───────────────────────────────────────────────────
 ffai-metal = { path = "crates/backends/ffai-metal" }
 ffai-cuda = { path = "crates/backends/ffai-cuda" }

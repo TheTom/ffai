@@ -16,6 +16,7 @@ metaltile-runtime.workspace = true
 metaltile-core.workspace = true
 
 [dev-dependencies]
+ffai-modeltests.workspace = true
 ffai-ops.workspace = true
 ffai-models.workspace = true
 ffai-loader.workspace = true
