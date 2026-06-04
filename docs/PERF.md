@@ -1,17 +1,37 @@
 # FFAI performance — status, numbers, and the #1 bottleneck
 
-## Current throughput (GPT-2-124M, incremental KV cache, correctness-first)
+## Current throughput (GPT-2-124M, incremental KV cache)
 
 | platform | prefill | decode | one-time | output |
 |---|---|---|---|---|
 | CUDA (GB10 sm_121) | 52.5 tok/s | 24.6 tok/s (41 ms/tok) | 16s upload + 42s JIT | exact HF match |
-| Metal (Apple GPU) | 11 tok/s | 9.4 tok/s (107 ms/tok) | 11s upload + 32s JIT | exact HF match |
+| Metal — resident bufs | 24 tok/s | **17.6 tok/s (57 ms/tok)** | 11s upload + 32s JIT | exact HF match |
+| Metal — old shim | 11 tok/s | 9.4 tok/s (107 ms/tok) | (re-uploaded weights/dispatch) | exact HF match |
 
-These are **correctness-first** numbers, ~10–40× off production. They are NOT
-bandwidth-bound: GPT-2 reads ~500 MB of weights/token, a ~2.5 ms floor at Metal
-bandwidth, yet we measure 107 ms — **42× over**.
+## Per-dispatch micro-bench (the Rust-vs-Swift question)
 
-## Root cause: the Metal `Device` is a host-shadow copy-in/copy-out shim
+| op (Rust → Metal) | shim | resident | what it is |
+|---|---|---|---|
+| tiny add (4096) | 188 µs | 161 µs | per-dispatch floor = `commit()`+wait |
+| gemv (2048², 16MB wt) | 1868 µs | **178 µs** | shim re-uploaded the weight every call |
+
+The 10× gemv drop confirms the cost was the **host-shadow shim re-uploading
+weights per dispatch**, now fixed (see below). What remains (~161 µs/dispatch
+floor) is the Metal `commit()`+wait, a driver cost paid identically from Swift —
+the host language is not the variable. Going below it means batching ops into
+fewer command buffers (`dispatch_chain`), not changing host language.
+
+## Fixed: resident-buffer fast path (was a host-shadow copy-in/out shim)
+
+`ffai-metal` now caches a GPU-resident `ResidentBuffer` on each `MetalBuffer`
+(via the runtime's `upload_resident`), so pure inputs (weights) upload **once**
+and bind resident across every dispatch instead of being re-staged from a host
+shadow each call. Outputs still flow through host bytes (preserves in-place
+reads + readback). Verified correct across elementwise / reduction / multi-output
+/ in-place / MLA-composite kernels and all real-model forwards. Result: gemv 10×,
+decode 1.9× (107→57 ms/tok).
+
+### Original root cause (for the record)
 
 `crates/backends/ffai-metal/src/lib.rs::dispatch` (and `synchronize`, which is a
 no-op "dispatch is synchronous") does, **per op**:
