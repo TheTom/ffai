@@ -40,6 +40,22 @@ doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
 
 (`load_hf` already covers qk-norm / QKV-bias / plain-Llama / GQA via Qwen3·Qwen2.5·SmolLM2.)
 
+## Prefill primitive — multi-token causal forward (vs HF argmax/top-k)
+
+The model tests above are single-token (pos 0). These verify the **multi-token
+causal prefill** path — each position attends over [0, i] via `sdpa_decode`
+with `n_kv = i+1` against the per-head K/V cache (`kv_stride = seq_len`).
+
+| test | what it adds | CUDA | Metal | HF |
+|---|---|:---:|:---:|:---:|
+| GPT-2 prefill (8 tok) | causal masking + learned positions | ✅ | ✅ | top3 [11,21831,7586] |
+| Llama prefill (7 tok) | **RoPE-at-position** + GQA + SwiGLU (SmolVLM text model) | ⏳ | ✅ | top3 [12642,4052,216] |
+
+With these, every primitive for end-to-end generation + multimodal prefill is
+verified. A full VLM forward = [SigLIP tower] → [SmolVLM connector] → splice
+image embeds into the text sequence → [this Llama causal prefill] — each piece
+independently confirmed vs HF on the shared op layer.
+
 ## Exotic families — dedicated builders / ops (in progress)
 
 | family | needs | status |
