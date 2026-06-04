@@ -1,0 +1,14 @@
+[package]
+name = "ffai-vulkan"
+description = "FFAI Vulkan backend (SPIR-V via metaltile codegen, future). The portable GPU path for non-CUDA / non-Apple hardware."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ffai-core.workspace = true
+
+[features]
+# vulkan = ["dep:ash"]  # TODO
+vulkan = []

@@ -1,0 +1,11 @@
+[package]
+name = "ffai-ops"
+description = "FFAI semantic ops — the seam between model code and metaltile kernels. Builds/looks up a Kernel and dispatches it via the Device trait."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ffai-core.workspace = true
+metaltile-core.workspace = true
