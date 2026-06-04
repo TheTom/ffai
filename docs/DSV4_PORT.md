@@ -56,3 +56,45 @@ norms/sinks/scales/biases: **f32**. token_embd f16, output q8_0.
 4. **mHC** — sinkhorn-split / collapse / expand (the 4-channel residual).
 5. **Full-attention layers end-to-end** on CUDA, diff vs Swift full-attn output.
 6. **CSA/HCA + indexer** — research track; reference is WIP.
+
+## Real checkpoint — reverse-engineered layout (2026-06, IQ2XXS 86 GB, CUDA box)
+
+GGUF dequant verified vs gguf-py on the real checkpoint **on the GB10 box**
+(43 blocks, 1328 tensors): Q8_0 Δ4.0e-7, Q2_K Δ4.9e-7, IQ2_XXS Δ4.7e-7.
+Composites (MLA/MoE/mHC/swiglu_limit/router) all pass on CUDA vs CPU.
+
+**Config (`deepseek4.*` metadata):** hidden 4096 · 64 heads · head_dim
+(key/value_length) 512 · q_lora 1024 · output_lora 1024 · output_groups 8 ·
+rope_dim 64 (⇒ n_nope 448, half_rot 32) · eps 1e-6 · experts 256 (used 6,
+shared 1, ffn 2048, weights_scale 1.5, norm true) · swiglu_clamp 10 · mHC
+count 4, sinkhorn_iters 20.
+
+**blk.N tensor → struct map** (ggml `[in,out]` dims = row-major `[out,in]` =
+struct layout, no transpose):
+
+| GGUF tensor | dims | → struct field |
+|---|---|---|
+| `attn_norm.weight` | [4096] | `MlaWeights.attn_norm` |
+| `attn_q_a.weight` | [4096,1024] | `q_a` [1024,4096] |
+| `attn_q_a_norm.weight` | [1024] | `q_a_norm` |
+| `attn_q_b.weight` | [1024,32768] | `q_b` [32768,1024] |
+| `attn_kv.weight` | [4096,512] | `kv` [512,4096] |
+| `attn_kv_a_norm.weight` | [512] | `kv_a_norm` |
+| `attn_sinks.weight` | [64] | `sink` (per-head) |
+| `attn_output_a.weight` | [4096,8192] | `output_a` = 8 groups × [1024,4096] |
+| `attn_output_b.weight` | [8192,4096] | `output_b` [4096,8192] |
+| `hc_attn_fn.weight` | [16384,24] | `MhcWeights.hc_fn` [24,16384] |
+| `hc_attn_base.weight` | [24] | `hc_base` |
+| `hc_attn_scale.weight` | [3] | `hc_scale` (pre/post/comb — a tensor, not a const) |
+| `ffn_gate_inp.weight` | [4096,256] | MoE router |
+| `ffn_{gate,up}_exps.weight` | [4096,2048,256] | 256 experts (IQ2_XXS) |
+| `ffn_down_exps.weight` | [2048,4096,256] | 256 experts (Q2_K) |
+| `ffn_{gate,up,down}_shexp.weight` | … | shared expert |
+| `ffn_gate_tid2eid.weight` | [6,129280] | hash-routing table |
+
+**Full-forward blocker (now named precisely):** the `attention.indexer`
+(head_count 64, key_length 128, top_k 512) + `sliding_window 128` — the CSA
+sparse-attention indexer, WIP in the reference itself ⇒ no correct oracle for
+the full 43-layer forward. Everything *else* (dense MLA + mHC + MoE per layer)
+is op-verified; a real-weight single-layer forward (GPU-vs-CPU) is turnkey from
+the map above.
