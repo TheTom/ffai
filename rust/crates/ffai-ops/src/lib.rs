@@ -189,6 +189,39 @@ pub fn sqrtsoftplus_route(logits: &[f32], bias: &[f32]) -> (Vec<f32>, Vec<f32>) 
     (unbiased, biased)
 }
 
+// ── Causal conv1d step (Mamba2 short-conv / audio front-ends) ───────────
+
+/// Causal depthwise conv1d decode step (one thread per channel):
+/// `y[d] = b[d] + w[K-1,d]·x[d] + Σ_{k<K-1} w[k,d]·state[k,d]`, then shift the
+/// ring `state` and insert `x`. `w` is `[kernel_size·n_channels]`, `state` is
+/// `[(kernel_size-1)·n_channels]` (updated in place). Dispatches
+/// `conv1d_causal_step`. Returns `y [n_channels]`; `state` buffer is mutated.
+pub fn conv1d_causal_step(
+    dev: &dyn Device,
+    x: &Tensor,
+    w: &Tensor,
+    b: &Tensor,
+    state: &Tensor,
+    n_channels: u32,
+    kernel_size: u32,
+) -> Result<Tensor> {
+    let k = lookup("conv1d_causal_step", x.dtype)?;
+    let y = Tensor::empty(dev, vec![n_channels as usize], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let bindings = vec![
+        Binding::Buffer(x.buffer.clone()),
+        Binding::Buffer(w.buffer.clone()),
+        Binding::Buffer(b.buffer.clone()),
+        Binding::Buffer(state.buffer.clone()), // in-place ring state
+        Binding::Buffer(y.buffer.clone()),
+        u(n_channels),
+        u(kernel_size),
+    ];
+    let grid = Grid { grid: [n_channels, 1, 1], block: [1, 1, 1] };
+    dev.dispatch(&k, &bindings, grid)?;
+    Ok(y)
+}
+
 // ── SSM (Mamba2 SSD selective scan) ─────────────────────────────────────
 
 /// Mamba2 SSD selective-scan **decode step** (single token, batch=1):
