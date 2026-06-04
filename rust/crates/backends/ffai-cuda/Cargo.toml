@@ -135,3 +135,15 @@ required-features = ["cuda"]
 [[test]]
 name = "gpt2_kvcache"
 required-features = ["cuda"]
+
+[[test]]
+name = "olmo2"
+required-features = ["cuda"]
+
+[[test]]
+name = "stablelm2"
+required-features = ["cuda"]
+
+[[test]]
+name = "gptneo"
+required-features = ["cuda"]

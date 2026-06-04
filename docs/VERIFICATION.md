@@ -37,6 +37,9 @@ doesn't, on the shared op layer. All single-token forwards, argmax/top-k vs HF.
 | Pythia-160m | GPT-NeoX: parallel residual, interleaved per-head QKV, partial rotary | ✅ 285 | ✅ 285 | 285 |
 | Gemma-2-2b | √hidden embed-scale, RMSNorm(1+w), 4 norms/layer, geGLU, GQA hd256, softcaps | ✅ top3 | ✅ top3 | [9707,235265,110] |
 | Phi-1.5 | single shared norm → parallel attn+MLP, separate q/k/v+bias, partial rotary | ✅ top3 | ✅ top3 | [11,13,546] |
+| OLMo-2-1B | **post-norm** (norm on sublayer output) + qk-norm over full proj, SwiGLU | ⏳ | ✅ top3 | [198,8,13] |
+| StableLM-2-1.6B | LayerNorm(+bias), q/k/v bias, partial rotary, SwiGLU | ⏳ | ✅ top3 | [341,11,280] |
+| GPT-Neo-125M | learned-pos + LayerNorm, separate q/k/v (no bias), no attn scaling, tied | ⏳ | ✅ top3 | [28,59,91] |
 
 (`load_hf` already covers qk-norm / QKV-bias / plain-Llama / GQA via Qwen3·Qwen2.5·SmolLM2.)
 
