@@ -11,24 +11,26 @@
 //! this layer once is what lets the whole model surface above it run on
 //! every backend.
 //!
-//! The elementwise ops below are real and run on any backend that
-//! implements [`Device`] (proven on CUDA). The heavier ops (matmul /
-//! rms_norm / attention) are reductions and cooperative-matmul kernels that
-//! map to the registered metaltile kernel set; they land via a kernel
-//! lookup and are stubbed for now.
+//! Every op here is real and runs on any backend implementing [`Device`]
+//! (verified vs HF on CUDA + Metal). Elementwise ops hand-build their IR;
+//! the heavier ones (matmul / rms_norm / layer_norm / sdpa / rope / conv1d /
+//! ssm …) resolve a registered metaltile kernel via `lookup`, which carries
+//! the correct dispatch mode.
 
 use ffai_core::{Binding, DType, Device, Error, Grid, Kernel, Result, Tensor};
 use metaltile_core::ir::{ActKind, BinOpKind, IndexExpr, Op, Param, ParamKind, ValueId};
 use metaltile_core::shape::Shape;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+use std::sync::OnceLock;
 
 /// Cache of resolved kernel IR keyed by (name, dtype). Resolving walks the
 /// whole test registry building setups, which is expensive — a forward pass
 /// dispatches the same handful of kernels hundreds of times, so cache them.
-fn kernel_cache() -> &'static Mutex<HashMap<(String, DType), Kernel>> {
-    static C: OnceLock<Mutex<HashMap<(String, DType), Kernel>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+/// FxHashMap (single-cycle hash) + parking_lot Mutex (unpoisoned, inlinable).
+fn kernel_cache() -> &'static Mutex<FxHashMap<(String, DType), Kernel>> {
+    static C: OnceLock<Mutex<FxHashMap<(String, DType), Kernel>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 /// Look up a registered metaltile kernel by name and instantiate its IR for
@@ -40,7 +42,7 @@ fn kernel_cache() -> &'static Mutex<HashMap<(String, DType), Kernel>> {
 /// is the same path the CUDA corpus dispatches, so we inherit its correctness.
 fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
     let key = (name.to_string(), dtype);
-    if let Some(k) = kernel_cache().lock().unwrap().get(&key) {
+    if let Some(k) = kernel_cache().lock().get(&key) {
         return Ok(k.clone());
     }
     for entry in metaltile_std::all_tests() {
@@ -51,7 +53,7 @@ fn lookup(name: &str, dtype: DType) -> Result<Kernel> {
         let setup = t.setup(dtype);
         let k = setup.kernel();
         if k.name == name {
-            kernel_cache().lock().unwrap().insert(key, k.clone());
+            kernel_cache().lock().insert(key, k.clone());
             return Ok(k.clone());
         }
     }

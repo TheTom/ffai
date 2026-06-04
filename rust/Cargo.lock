@@ -113,6 +113,7 @@ dependencies = [
  "ffai-ops",
  "metaltile-core",
  "metaltile-runtime",
+ "parking_lot",
 ]
 
 [[package]]
@@ -133,6 +134,8 @@ dependencies = [
  "metaltile-codegen",
  "metaltile-core",
  "metaltile-std",
+ "parking_lot",
+ "rustc-hash",
 ]
 
 [[package]]

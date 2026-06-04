@@ -1,14 +1,13 @@
-#![cfg(feature = "cuda")]
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! Full real Mamba2 (mamba2-130m) single-token forward on the shared engine,
 //! verified vs HF transformers. Turns SSM from component-verified into a
 //! complete real-model-vs-HF family. Single token → zero initial state →
 //! conv1d step + SSD scan both start from zero (= HF's 1-token forward).
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{DType, Device as _, Tensor};
 use ffai_cuda::CudaDevice;
 use ffai_loader::SafeTensors;
-use ffai_ops::{conv1d_causal_step, gemv, mul, rms_norm, silu, ssm_step};
+use ffai_ops::{conv1d_causal_step, gemv, rms_norm, silu, ssm_step};
 
 fn tb(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() }
 fn fb(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() }
@@ -21,7 +20,7 @@ fn mamba2_130m_full_forward_vs_hf() {
     });
     let path = format!("{dir}/model.safetensors");
     let Ok(st) = SafeTensors::open(&path) else { eprintln!("no model at {path} — skipping"); return; };
-    let Some(dev) = CudaDevice::create().expect("metal") else { eprintln!("no CUDA — skip"); return; };
+    let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA — skip"); return; };
     let d = dev.as_ref();
 
     // config (mamba2-130m)
@@ -89,10 +88,9 @@ fn mamba2_130m_full_forward_vs_hf() {
     let lm = upm(&embed, vec![vocab, hid]);
     let logits = dl(&gemv(d, &lm, &xf).unwrap(), vocab);
     let argmax = (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
-    let _ = mul; // (kept in scope for parity with other tests)
     eprintln!("Mamba2-130m full forward on CUDA: argmax = {argmax} (HF = 310)");
     assert_eq!(argmax, 310, "Mamba2 argmax != HF 310");
-    eprintln!("✅ Full real Mamba2-130m forward matches HF on the shared engine (CUDA).");
+    eprintln!("✅ Full real Mamba2-130m forward matches HF on the shared engine (GB10 sm_121).");
 }
 
 fn glob_snap() -> Option<String> {

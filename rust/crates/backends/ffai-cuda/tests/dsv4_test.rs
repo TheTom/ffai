@@ -1,10 +1,9 @@
-#![cfg(feature = "cuda")]
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
-//! DeepSeek-V4 MLA primitive: partial RoPE on the rope tail, on CUDA vs a
+//! DeepSeek-V4 MLA primitive: partial RoPE on the rope tail, on Metal vs a
 //! CPU reference. First validated DSv4-specific op on the shared layer.
 
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{DType, Tensor};
 use ffai_cuda::CudaDevice;
 use ffai_ops::{
     dsv4_mhc_collapse, dsv4_mhc_expand, dsv4_partial_rope, sdpa_decode_sink, sqrtsoftplus_route,
@@ -19,9 +18,9 @@ fn fb(b: &[u8]) -> Vec<f32> {
 }
 
 #[test]
-fn dsv4_partial_rope_on_cuda_matches_cpu() {
+fn dsv4_partial_rope_on_metal_matches_cpu() {
     let Some(dev) = CudaDevice::create().expect("metal init") else {
-        eprintln!("no CUDA device — skipping");
+        eprintln!("no Metal device — skipping");
         return;
     };
     const NH: usize = 4;
@@ -61,15 +60,15 @@ fn dsv4_partial_rope_on_cuda_matches_cpu() {
     for i in 0..NH * HD {
         err = err.max((got[i] - want[i]).abs());
     }
-    eprintln!("dsv4_partial_rope on CUDA vs CPU: max|Δ|={err:.3e}");
+    eprintln!("dsv4_partial_rope on Metal vs CPU: max|Δ|={err:.3e}");
     assert!(err <= 1e-4, "partial_rope mismatch: {err:.3e}");
-    eprintln!("✅ DSv4 partial RoPE runs on CUDA through the shared op layer, matches CPU.");
+    eprintln!("✅ DSv4 partial RoPE runs on GB10 sm_121 through the shared op layer, matches CPU.");
 }
 
 #[test]
-fn dsv4_sink_sdpa_on_cuda_matches_cpu() {
+fn dsv4_sink_sdpa_on_metal_matches_cpu() {
     let Some(dev) = CudaDevice::create().expect("metal init") else {
-        eprintln!("no CUDA device — skipping");
+        eprintln!("no Metal device — skipping");
         return;
     };
     const NQ: usize = 2;
@@ -116,15 +115,15 @@ fn dsv4_sink_sdpa_on_cuda_matches_cpu() {
     for i in 0..NQ * HD {
         err = err.max((got[i] - want[i]).abs());
     }
-    eprintln!("dsv4 sink-SDPA on CUDA vs CPU: max|Δ|={err:.3e}");
+    eprintln!("dsv4 sink-SDPA on Metal vs CPU: max|Δ|={err:.3e}");
     assert!(err <= 1e-4, "sink sdpa mismatch: {err:.3e}");
-    eprintln!("✅ DSv4 d512 sink-SDPA runs on CUDA through the shared op layer, matches CPU.");
+    eprintln!("✅ DSv4 d512 sink-SDPA runs on GB10 sm_121 through the shared op layer, matches CPU.");
 }
 
 #[test]
-fn dsv4_moe_ops_on_cuda_match_cpu() {
+fn dsv4_moe_ops_on_metal_match_cpu() {
     let Some(dev) = CudaDevice::create().expect("metal init") else {
-        eprintln!("no CUDA device — skipping");
+        eprintln!("no Metal device — skipping");
         return;
     };
     let lim = 10.0f32;
@@ -163,9 +162,9 @@ fn dsv4_moe_ops_on_cuda_match_cpu() {
 }
 
 #[test]
-fn dsv4_mhc_on_cuda_matches_cpu() {
+fn dsv4_mhc_on_metal_matches_cpu() {
     let Some(dev) = CudaDevice::create().expect("metal init") else {
-        eprintln!("no CUDA device — skipping");
+        eprintln!("no Metal device — skipping");
         return;
     };
     const H: usize = 512; // multiple of 256

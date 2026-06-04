@@ -3,7 +3,7 @@
 //! DeepSeek-V4 MLA primitive: partial RoPE on the rope tail, on Metal vs a
 //! CPU reference. First validated DSv4-specific op on the shared layer.
 
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{DType, Tensor};
 use ffai_metal::MetalDevice;
 use ffai_ops::{
     dsv4_mhc_collapse, dsv4_mhc_expand, dsv4_partial_rope, sdpa_decode_sink, sqrtsoftplus_route,

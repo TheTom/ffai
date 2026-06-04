@@ -5,7 +5,7 @@
 //! shared expert) on the shared op layer, comparing to HF transformers'
 //! Qwen2MoeSparseMoeBlock output for the same input. Turns MoE from
 //! "compute-verified-vs-CPU" into "real-weights-verified-vs-HF".
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{DType, Tensor};
 use ffai_metal::MetalDevice;
 use ffai_loader::SafeTensors;
 use ffai_ops::{gemv, swiglu};

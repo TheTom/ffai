@@ -45,6 +45,8 @@ metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature
 thiserror = "2"
 serde_json = "1"
 memmap2 = "0.9"
+parking_lot = "0.12"   # faster, unpoisoned locks on the dispatch hot path
+rustc-hash = "2"       # FxHash for already-hashed / densely-numeric keys
 
 # Local co-dev override: when the metaltile checkout sits beside this repo
 # (../metaltile-cuda), build against it directly — instant, no fetch, edits
@@ -55,3 +57,13 @@ metaltile-core = { path = "../../metaltile-cuda/crates/metaltile-core" }
 metaltile-codegen = { path = "../../metaltile-cuda/crates/metaltile-codegen" }
 metaltile-runtime = { path = "../../metaltile-cuda/crates/metaltile-runtime" }
 metaltile-std = { path = "../../metaltile-cuda/crates/metaltile-std" }
+
+# Perf build for benchmarks (fat-LTO inlines parking_lot locks, Arc/Rc clones,
+# FNV/Fx hash closures into the hot path). Kept OUT of [profile.release] on
+# purpose: fat-LTO + codegen-units=1 balloons build time with the metaltile
+# patch, and `panic="abort"` would break `cargo test`. (Rust-playbook split.)
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = true

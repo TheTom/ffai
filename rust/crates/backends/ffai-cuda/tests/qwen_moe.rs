@@ -1,4 +1,3 @@
-#![cfg(feature = "cuda")]
 // Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
 // SPDX-License-Identifier: Apache-2.0
 //! Real MoE feed-forward vs HF: load a real Qwen2-MoE block's weights and
@@ -6,7 +5,7 @@
 //! shared expert) on the shared op layer, comparing to HF transformers'
 //! Qwen2MoeSparseMoeBlock output for the same input. Turns MoE from
 //! "compute-verified-vs-CPU" into "real-weights-verified-vs-HF".
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{DType, Tensor};
 use ffai_cuda::CudaDevice;
 use ffai_loader::SafeTensors;
 use ffai_ops::{gemv, swiglu};
@@ -15,12 +14,12 @@ fn fb(b:&[u8])->Vec<f32>{b.chunks_exact(4).map(|c|f32::from_le_bytes(c.try_into(
 fn tb(v:&[f32])->Vec<u8>{v.iter().flat_map(|x|x.to_le_bytes()).collect()}
 
 #[test]
-fn qwen2_moe_block_on_cuda_matches_hf() {
+fn qwen2_moe_block_on_metal_matches_hf() {
     let path = std::env::var("QWENMOE_DIR").ok()
         .map(|d| format!("{d}/model.safetensors"))
         .unwrap_or_else(|| std::fs::read_to_string("/tmp/qwenmoe_path.txt").map(|s| format!("{}/model.safetensors", s.trim())).unwrap_or_default());
     let Ok(st) = SafeTensors::open(&path) else { eprintln!("no model at {path} — skipping"); return; };
-    let Some(dev) = CudaDevice::create().expect("metal") else { eprintln!("no CUDA — skip"); return; };
+    let Some(dev) = CudaDevice::create().expect("cuda") else { eprintln!("no CUDA — skip"); return; };
 
     let (h, _moe_i, ne, tk) = (32usize, 44usize, 8usize, 4usize);
     let t = |name: &str| -> Tensor {
@@ -70,8 +69,8 @@ fn qwen2_moe_block_on_cuda_matches_hf() {
 
     let hf = [-2.6e-05f32,-2.5e-05,4e-06,-7.1e-05,1.3e-05,3.5e-05,2.5e-05,1e-06,-2.7e-05,-2e-05,3.2e-05,-2.2e-05,3.2e-05,2.8e-05,-2.5e-05,9e-06,-2.5e-05,0.0,6e-05,2e-06,-1.9e-05,1e-05,-1.6e-05,3.2e-05,3.1e-05,2.2e-05,-3.2e-05,2.2e-05,9e-06,2.5e-05,1e-05,-2.2e-05];
     let mut e = 0.0f32; for i in 0..h { e = e.max((acc[i]-hf[i]).abs()); }
-    eprintln!("Qwen2-MoE block on CUDA vs HF: max|Δ|={e:.2e}  (top experts {top:?})");
+    eprintln!("Qwen2-MoE block on Metal vs HF: max|Δ|={e:.2e}  (top experts {top:?})");
     eprintln!("rust[..6]={:?}", &acc[..6]);
     assert!(e <= 3e-6, "qwen moe vs HF mismatch: {e:.2e}");
-    eprintln!("✅ Real Qwen2-MoE feed-forward matches HF on the shared op layer (CUDA).");
+    eprintln!("✅ Real Qwen2-MoE feed-forward matches HF on the shared op layer (GB10 sm_121).");
 }

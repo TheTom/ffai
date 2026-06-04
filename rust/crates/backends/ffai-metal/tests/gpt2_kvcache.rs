@@ -55,7 +55,7 @@ fn gpt2_kvcache_decode_throughput() {
     let argmax = |logits: &[f32]| (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
 
     // forward ONE token at `pos`, extending the cache; resident weights, returns next argmax
-    let mut step = |tok: usize, pos: usize, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> usize {
+    let step = |tok: usize, pos: usize, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> usize {
         let x0: Vec<f32> = (0..hid).map(|e| wte[tok*hid+e] + wpe[pos*hid+e]).collect();
         let mut xt = up(&x0, vec![hid]); // residual stream stays device-resident
         for (l, w) in lwt.iter().enumerate() {

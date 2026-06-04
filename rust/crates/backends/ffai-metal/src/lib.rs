@@ -9,16 +9,18 @@
 //! (and iOS)** as on CUDA. This is the half that makes "models shared across
 //! CUDA *and* Metal" real.
 //!
-//! Buffers are host-shadowed (`Vec<u8>`): the Metal `Context` dispatch model
-//! is host-bytes-in / host-bytes-out, so a tensor carries its bytes and each
-//! dispatch round-trips through the GPU. Correctness-first; a resident-buffer
-//! fast path is a later optimization.
+//! Each [`MetalBuffer`] keeps a host shadow (`Vec<u8>`, the `download` source of
+//! truth) plus a lazily-cached GPU-resident `ResidentBuffer`, so pure inputs
+//! (weights) upload **once** and bind resident across every dispatch instead of
+//! being re-staged from host bytes each call. Outputs flow through host bytes
+//! (preserves in-place reads + readback) and invalidate the stale resident copy.
 
 use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
 use metaltile_runtime::{Context, DispatchSpec, MetalTileError, ResidentBuffer};
+use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 fn err(e: MetalTileError) -> Error {
     Error::Dispatch(e.to_string())
@@ -40,7 +42,7 @@ unsafe impl Send for MetalBuffer {}
 unsafe impl Sync for MetalBuffer {}
 impl DeviceBuffer for MetalBuffer {
     fn len(&self) -> usize {
-        self.data.read().unwrap().len()
+        self.data.read().len()
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -97,14 +99,14 @@ impl Device for MetalDevice {
             .as_any()
             .downcast_ref::<MetalBuffer>()
             .ok_or_else(|| Error::Msg("metal: download buffer is not a MetalBuffer".into()))?;
-        let src = mb.data.read().unwrap();
+        let src = mb.data.read();
         let n = out.len().min(src.len());
         out[..n].copy_from_slice(&src[..n]);
         Ok(())
     }
 
     fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()> {
-        let ctx = self.ctx.lock().unwrap();
+        let ctx = self.ctx.lock();
         let n_params = kernel.params.len();
         // Bind every buffer as GPU-resident (uploaded once, cached on the
         // MetalBuffer) and scalars as host bytes. Weights — pure inputs that
@@ -131,11 +133,11 @@ impl Device for MetalDevice {
                     // current value). Pure inputs bind resident + cache, so
                     // weights upload once across all dispatches.
                     if i < n_params && kernel.params[i].is_output {
-                        host_buffers.insert(name, mb.data.read().unwrap().clone());
+                        host_buffers.insert(name, mb.data.read().clone());
                     } else {
-                        let mut slot = mb.resident.lock().unwrap();
+                        let mut slot = mb.resident.lock();
                         if slot.is_none() {
-                            let bytes = mb.data.read().unwrap();
+                            let bytes = mb.data.read();
                             *slot = Some(ctx.upload_resident(&bytes).map_err(err)?);
                         }
                         resident.insert(name, slot.as_ref().unwrap().clone());
@@ -165,11 +167,11 @@ impl Device for MetalDevice {
                     if let Binding::Buffer(buf) = &bindings[i] {
                         let mb = Self::shadow(buf)?;
                         {
-                            let mut w = mb.data.write().unwrap();
+                            let mut w = mb.data.write();
                             let n = w.len().min(out_bytes.len());
                             w[..n].copy_from_slice(&out_bytes[..n]);
                         }
-                        *mb.resident.lock().unwrap() = None;
+                        *mb.resident.lock() = None;
                     }
                 }
             }

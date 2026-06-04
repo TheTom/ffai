@@ -55,25 +55,27 @@ fn gpt2_kvcache_decode_throughput() {
     let argmax = |logits: &[f32]| (0..vocab).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
 
     // forward ONE token at `pos`, extending the cache; resident weights, returns next argmax
-    let mut step = |tok: usize, pos: usize, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> usize {
-        let mut x: Vec<f32> = (0..hid).map(|e| wte[tok*hid+e] + wpe[pos*hid+e]).collect();
+    let step = |tok: usize, pos: usize, kc: &mut Vec<Vec<f32>>, vc: &mut Vec<Vec<f32>>| -> usize {
+        let x0: Vec<f32> = (0..hid).map(|e| wte[tok*hid+e] + wpe[pos*hid+e]).collect();
+        let mut xt = up(&x0, vec![hid]); // residual stream stays device-resident
         for (l, w) in lwt.iter().enumerate() {
-            let h = layer_norm(d, &up(&x, vec![hid]), &w.ln1w, &w.ln1b, eps).unwrap();
-            let qkv = dl(&add(d, &gemv(d, &w.cattn, &h).unwrap(), &w.cattn_b).unwrap(), 3*hid);
+            let h = layer_norm(d, &xt, &w.ln1w, &w.ln1b, eps).unwrap();
+            let qkv_t = add(d, &gemv(d, &w.cattn, &h).unwrap(), &w.cattn_b).unwrap();
+            let qkv = dl(&qkv_t, 3*hid); // the one unavoidable download — feeds the host KV cache
             kc[l].extend_from_slice(&qkv[hid..2*hid]); vc[l].extend_from_slice(&qkv[2*hid..3*hid]);
             let len = kc[l].len() / hid;
             let kt = up(&reorg(&kc[l], len), vec![nh, len, hd]);
             let vt = up(&reorg(&vc[l], len), vec![nh, len, hd]);
             let a = sdpa_decode(d, &up(&qkv[0..hid], vec![nh, hd]), &kt, &vt, hd, len as u32, len as u32, 1, scale).unwrap();
-            let o = dl(&add(d, &gemv(d, &w.cproj, &a.reshaped(vec![hid])).unwrap(), &w.cproj_b).unwrap(), hid);
-            for i in 0..hid { x[i] += o[i]; }
-            let h2 = layer_norm(d, &up(&x, vec![hid]), &w.ln2w, &w.ln2b, eps).unwrap();
+            let o = add(d, &gemv(d, &w.cproj, &a.reshaped(vec![hid])).unwrap(), &w.cproj_b).unwrap();
+            xt = add(d, &xt, &o).unwrap(); // residual on-device (no round-trip)
+            let h2 = layer_norm(d, &xt, &w.ln2w, &w.ln2b, eps).unwrap();
             let f = add(d, &gemv(d, &w.fc, &h2).unwrap(), &w.fc_b).unwrap();
             let act = gelu(d, &f).unwrap();
-            let m = dl(&add(d, &gemv(d, &w.proj, &act).unwrap(), &w.proj_b).unwrap(), hid);
-            for i in 0..hid { x[i] += m[i]; }
+            let m = add(d, &gemv(d, &w.proj, &act).unwrap(), &w.proj_b).unwrap();
+            xt = add(d, &xt, &m).unwrap(); // residual on-device
         }
-        let xf = layer_norm(d, &up(&x, vec![hid]), &lnf_w, &lnf_b, eps).unwrap();
+        let xf = layer_norm(d, &xt, &lnf_w, &lnf_b, eps).unwrap();
         let logits = dl(&matmul(d, &wte_t, &xf.reshaped(vec![1, hid])).unwrap(), vocab);
         argmax(&logits)
     };
