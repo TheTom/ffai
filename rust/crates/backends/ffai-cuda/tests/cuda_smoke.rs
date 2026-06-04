@@ -10,10 +10,9 @@
 //! no device is present.
 #![cfg(feature = "cuda")]
 
-use ffai_core::{Binding, Grid};
+use ffai_core::{Binding, DType, Grid, Tensor};
 use ffai_cuda::CudaDevice;
 use metaltile_core::{
-    dtype::DType,
     ir::{BinOpKind, IndexExpr, Kernel, Op, Param, ParamKind, ValueId},
     shape::Shape,
 };
@@ -106,4 +105,40 @@ fn vector_add_through_shared_device_trait() {
     }
     assert!(max_err <= 1e-6, "vector_add via ffai Device mismatch: max|Δ|={max_err:.3e}");
     eprintln!("vector_add through ffai_core::Device on CUDA: OK (max|Δ|={max_err:.1e})");
+}
+
+/// Drive the real op layer (`ffai_ops::add` / `mul`) on CUDA — the same
+/// calls model code makes, executed through the shared Device trait.
+#[test]
+fn ffai_ops_elementwise_on_cuda() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else {
+        eprintln!("no CUDA device — skipping");
+        return;
+    };
+
+    const N: usize = 2048;
+    let a: Vec<f32> = (0..N).map(|i| (i % 17) as f32 - 8.0).collect();
+    let b: Vec<f32> = (0..N).map(|i| (i % 5) as f32 + 1.0).collect();
+
+    let ta = Tensor::new(dev.upload(&to_bytes(&a)).unwrap(), vec![N], DType::F32);
+    let tb = Tensor::new(dev.upload(&to_bytes(&b)).unwrap(), vec![N], DType::F32);
+
+    let sum = ffai_ops::add(dev.as_ref(), &ta, &tb).unwrap();
+    let prod = ffai_ops::mul(dev.as_ref(), &ta, &tb).unwrap();
+    dev.synchronize().unwrap();
+
+    let mut sbytes = vec![0u8; N * 4];
+    let mut pbytes = vec![0u8; N * 4];
+    dev.download(sum.buffer.as_ref(), &mut sbytes).unwrap();
+    dev.download(prod.buffer.as_ref(), &mut pbytes).unwrap();
+    let s = from_bytes(&sbytes);
+    let p = from_bytes(&pbytes);
+
+    let mut err = 0.0f32;
+    for i in 0..N {
+        err = err.max((s[i] - (a[i] + b[i])).abs());
+        err = err.max((p[i] - (a[i] * b[i])).abs());
+    }
+    assert!(err <= 1e-6, "ffai_ops add/mul on CUDA mismatch: max|Δ|={err:.3e}");
+    eprintln!("ffai_ops::add + ffai_ops::mul on CUDA: OK (max|Δ|={err:.1e})");
 }
