@@ -40,6 +40,7 @@ ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
 metaltile-core = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
 metaltile-codegen = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
 metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
+metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
 
@@ -51,3 +52,4 @@ thiserror = "2"
 metaltile-core = { path = "../../metaltile-cuda/crates/metaltile-core" }
 metaltile-codegen = { path = "../../metaltile-cuda/crates/metaltile-codegen" }
 metaltile-runtime = { path = "../../metaltile-cuda/crates/metaltile-runtime" }
+metaltile-std = { path = "../../metaltile-cuda/crates/metaltile-std" }

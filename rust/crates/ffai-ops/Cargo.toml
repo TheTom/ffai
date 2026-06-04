@@ -9,3 +9,7 @@ repository.workspace = true
 [dependencies]
 ffai-core.workspace = true
 metaltile-core.workspace = true
+# the kernel registry (all_kernels) + the crate that registers the model
+# kernels (must be linked so `inventory` collects mt_rms_norm/mt_gemv/…).
+metaltile-codegen.workspace = true
+metaltile-std.workspace = true

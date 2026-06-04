@@ -142,3 +142,65 @@ fn ffai_ops_elementwise_on_cuda() {
     assert!(err <= 1e-6, "ffai_ops add/mul on CUDA mismatch: max|Δ|={err:.3e}");
     eprintln!("ffai_ops::add + ffai_ops::mul on CUDA: OK (max|Δ|={err:.1e})");
 }
+
+/// Heavier ops via the registered-kernel lookup: rms_norm (mt_rms_norm) and
+/// gemv (mt_gemv), driven through the shared Device trait on CUDA and
+/// checked against a CPU reference. This is the mechanism every transformer
+/// op rides on.
+#[test]
+fn ffai_ops_rms_norm_and_gemv_on_cuda() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else {
+        eprintln!("no CUDA device — skipping");
+        return;
+    };
+
+    // ── rms_norm: [rows, n] ──────────────────────────────────────────
+    const ROWS: usize = 4;
+    const N: usize = 512;
+    let x: Vec<f32> = (0..ROWS * N).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    let w: Vec<f32> = (0..N).map(|j| 1.0 + (j % 7) as f32 * 0.05).collect();
+    let eps = 1e-5f32;
+
+    let tx = Tensor::new(dev.upload(&to_bytes(&x)).unwrap(), vec![ROWS, N], DType::F32);
+    let tw = Tensor::new(dev.upload(&to_bytes(&w)).unwrap(), vec![N], DType::F32);
+    let ty = ffai_ops::rms_norm(dev.as_ref(), &tx, &tw, eps).unwrap();
+    dev.synchronize().unwrap();
+    let mut yb = vec![0u8; ROWS * N * 4];
+    dev.download(ty.buffer.as_ref(), &mut yb).unwrap();
+    let y = from_bytes(&yb);
+
+    let mut rms_err = 0.0f32;
+    for r in 0..ROWS {
+        let row = &x[r * N..(r + 1) * N];
+        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / N as f32;
+        let scale = 1.0 / (ms + eps).sqrt();
+        for j in 0..N {
+            let want = row[j] * scale * w[j];
+            rms_err = rms_err.max((y[r * N + j] - want).abs());
+        }
+    }
+    assert!(rms_err <= 1e-4, "rms_norm on CUDA mismatch: max|Δ|={rms_err:.3e}");
+    eprintln!("ffai_ops::rms_norm (mt_rms_norm) on CUDA: OK (max|Δ|={rms_err:.1e})");
+
+    // ── gemv: [M,K] @ [K] ────────────────────────────────────────────
+    const M: usize = 64;
+    const K: usize = 512;
+    let mat: Vec<f32> = (0..M * K).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
+    let vecd: Vec<f32> = (0..K).map(|j| ((j % 9) as f32 - 4.0) * 0.05).collect();
+
+    let tmat = Tensor::new(dev.upload(&to_bytes(&mat)).unwrap(), vec![M, K], DType::F32);
+    let tvec = Tensor::new(dev.upload(&to_bytes(&vecd)).unwrap(), vec![K], DType::F32);
+    let tout = ffai_ops::gemv(dev.as_ref(), &tmat, &tvec).unwrap();
+    dev.synchronize().unwrap();
+    let mut ob = vec![0u8; M * 4];
+    dev.download(tout.buffer.as_ref(), &mut ob).unwrap();
+    let got = from_bytes(&ob);
+
+    let mut gemv_err = 0.0f32;
+    for r in 0..M {
+        let want: f32 = (0..K).map(|j| mat[r * K + j] * vecd[j]).sum();
+        gemv_err = gemv_err.max((got[r] - want).abs());
+    }
+    assert!(gemv_err <= 1e-3, "gemv on CUDA mismatch: max|Δ|={gemv_err:.3e}");
+    eprintln!("ffai_ops::gemv (mt_gemv) on CUDA: OK (max|Δ|={gemv_err:.1e})");
+}
