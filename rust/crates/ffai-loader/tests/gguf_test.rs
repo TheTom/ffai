@@ -25,4 +25,15 @@ fn gguf_parse_and_q8_0_dequant_match_ggufpy() {
     }
     assert!(e <= 1e-4, "Q8_0 dequant mismatch vs gguf-py: max|Δ|={e:.3e}");
     eprintln!("✅ GGUF v3 parse + Q8_0 dequant match gguf-py (max|Δ|={e:.1e})");
+
+    // Q2_K dequant vs gguf-py.
+    let q2 = g.dequant_f32("blk.0.ffn_down_exps.weight").expect("dequant down_exps");
+    let want2 = [-0.017595f32, 0.015516, 0.032072, -0.017595, 0.015516, -0.017595, 0.015516, -0.00104];
+    eprintln!("rust Q2_K first8 = {:?}", &q2[..8]);
+    let mut e2 = 0.0f32;
+    for i in 0..8 {
+        e2 = e2.max((q2[i] - want2[i]).abs());
+    }
+    assert!(e2 <= 1e-4, "Q2_K dequant mismatch vs gguf-py: max|Δ|={e2:.3e}");
+    eprintln!("✅ GGUF Q2_K dequant matches gguf-py (max|Δ|={e2:.1e})");
 }

@@ -207,8 +207,42 @@ impl Gguf {
                 }
                 Ok(out)
             }
+            GgmlType::Q2K => {
+                // block_q2_K (QK_K=256, 84 bytes): scales[16] + qs[64] + d(f16) + dmin(f16).
+                const QK: usize = 256;
+                let nblocks = n / QK;
+                let b = self.raw(t, nblocks * 84);
+                let mut out = Vec::with_capacity(n);
+                for blk in 0..nblocks {
+                    let base = blk * 84;
+                    let scales = &b[base..base + 16];
+                    let qs = &b[base + 16..base + 80];
+                    let d = f16_to_f32(u16::from_le_bytes([b[base + 80], b[base + 81]]));
+                    let dmin = f16_to_f32(u16::from_le_bytes([b[base + 82], b[base + 83]]));
+                    let mut is = 0usize;
+                    let mut q_off = 0usize;
+                    for _n in (0..QK).step_by(128) {
+                        let mut shift = 0u8;
+                        for _j in 0..4 {
+                            for half in 0..2 {
+                                let sc = scales[is];
+                                is += 1;
+                                let dl = d * (sc & 0xF) as f32;
+                                let ml = dmin * (sc >> 4) as f32;
+                                for l in 0..16 {
+                                    let q = (qs[q_off + half * 16 + l] >> shift) & 3;
+                                    out.push(dl * q as f32 - ml);
+                                }
+                            }
+                            shift += 2;
+                        }
+                        q_off += 32;
+                    }
+                }
+                Ok(out)
+            }
             other => Err(Error::Msg(format!(
-                "dequant '{name}': {other:?} not yet supported (Q2_K / IQ2_XXS pending)"
+                "dequant '{name}': {other:?} not yet supported (IQ2_XXS pending)"
             ))),
         }
     }
