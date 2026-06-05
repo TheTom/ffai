@@ -12,6 +12,10 @@ FFAI is a Rust + Swift inference engine spanning 35 model families, with residen
 
 ![FFAI architecture](docs/architecture.png)
 
+## Scope & naming
+
+FFAI began as an Apple/Metal-focused inference engine. It now runs across NVIDIA (GB10), AMD, and Vulkan-class GPUs via metaltile, so the Apple-specific name no longer reflects the multi-backend scope. A rename is under discussion to match the broadened reach — the candidate name is still TBD and nothing is decided. The current name (FFAI) continues to apply until any rename is settled.
+
 ## Status
 
 Early bootstrap — the dense-text, hybrid, vision-language, and audio model waves have all landed; end-to-end inference runs real HuggingFace checkpoints across every shipped family.
