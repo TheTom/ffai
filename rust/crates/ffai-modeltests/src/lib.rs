@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_step, conv_roll, gated_group_rmsnorm, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, kv_append, moe_gather_down, moe_gather_up_relu2, moe_router_device, moe_weighted_sum, mul, quantize_q4, rms_norm, rope_llama, silu, slice, sdpa_decode, sdpa_decode_2pass, softplus_add, ssm_step};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_step, conv_roll, gated_group_rmsnorm, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, kv_append, moe_gather_down, moe_gather_up_relu2, moe_router_device, moe_weighted_sum, mul, quantize_q4, rms_norm, rope_llama, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, ssm_step};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -721,7 +721,60 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
     let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
     let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
-    // ── SETUP: quantize + upload all big matrices to Q8 resident (once) ──
+
+    // ── Q4 weight cache ─────────────────────────────────────────────────────────
+    // Gated by NEMOTRON_Q4CACHE env (default ON). On first run, writes Q4+scales to
+    // ~/.cache/nemo_q4/<sanitized_name>.q4b. Subsequent runs skip BF16→F32+quantize
+    // and read the cached bytes directly → load time ~15-25s vs ~120s.
+    // Cache file format (little-endian):
+    //   [8B: m as u64][8B: k as u64][1B: f16 flag (0=f32, 1=f16)]
+    //   [N*4 bytes: qs as u32 LE][M*2 or M*4 bytes: scales as f16 or f32 LE]
+    let use_q4cache = std::env::var("NEMOTRON_Q4CACHE").map(|v| v != "0" && v != "false").unwrap_or(true);
+    let cache_dir = std::env::var("NEMOTRON_Q4CACHE_DIR")
+        .unwrap_or_else(|_| format!("{}/.cache/nemo_q4", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())));
+    if use_q4cache { let _ = std::fs::create_dir_all(&cache_dir); }
+
+    let cache_path = |name: &str| -> std::path::PathBuf {
+        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        std::path::PathBuf::from(&cache_dir).join(format!("{safe}.q4b"))
+    };
+
+    // Read from cache: returns (qs_bytes, sc_bytes, m, k, f16) or None if miss/disabled.
+    let cache_read = |name: &str| -> Option<(Vec<u8>, Vec<u8>, usize, usize, bool)> {
+        if !use_q4cache { return None; }
+        let bytes = std::fs::read(cache_path(name)).ok()?;
+        if bytes.len() < 17 { return None; }
+        let m = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+        let k = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let f16 = bytes[16] != 0;
+        let bpr = k / 32;
+        let qs_len_u32 = m * bpr * 4;
+        let sc_len = m * bpr;
+        let sc_bytes = if f16 { sc_len * 2 } else { sc_len * 4 };
+        let expected = 17 + qs_len_u32 * 4 + sc_bytes;
+        if bytes.len() != expected { return None; } // stale/corrupt
+        let qs_bytes = bytes[17..17 + qs_len_u32 * 4].to_vec();
+        let sc_bytes = bytes[17 + qs_len_u32 * 4..].to_vec();
+        Some((qs_bytes, sc_bytes, m, k, f16))
+    };
+
+    // Write to cache.
+    let cache_write = |name: &str, qs: &[u32], sc: &[f32], m: usize, k: usize, f16: bool| {
+        if !use_q4cache { return; }
+        let mut out = Vec::with_capacity(17 + qs.len() * 4 + sc.len() * if f16 { 2 } else { 4 });
+        out.extend_from_slice(&(m as u64).to_le_bytes());
+        out.extend_from_slice(&(k as u64).to_le_bytes());
+        out.push(f16 as u8);
+        for &q in qs { out.extend_from_slice(&q.to_le_bytes()); }
+        if f16 {
+            for &s in sc { out.extend_from_slice(&f32_to_f16(s).to_le_bytes()); }
+        } else {
+            for &s in sc { out.extend_from_slice(&s.to_le_bytes()); }
+        }
+        let _ = std::fs::write(cache_path(name), &out);
+    };
+
+    // ── SETUP: quantize + upload all big matrices to Q4 resident (once) ──
     let t_load = Instant::now();
     let mut qw: HashMap<String, (Tensor, Tensor, usize, usize)> = HashMap::new(); // name → (qs, scales, m, k)
     let mut fw: HashMap<String, Vec<f32>> = HashMap::new(); // f32 weights used HOST-side
@@ -732,8 +785,19 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // f16: true for weights read by the PLAIN gemv kernel (qmv) — its scale param
     // is f16. false for shared-expert weights (relu2/accum kernels, f32 scale).
     let qload = |qw: &mut HashMap<String, (Tensor, Tensor, usize, usize)>, name: &str, m: usize, k: usize, f16: bool| {
+        // Try cache hit first: skip BF16→F32 + quantize if available.
+        if let Some((qs_bytes, sc_bytes, cm, ck, cf16)) = cache_read(name) {
+            if cm == m && ck == k && cf16 == f16 {
+                let qt = Tensor::new(d.upload(&qs_bytes).unwrap(), vec![qs_bytes.len() / 4], DType::U32);
+                let sct = Tensor::new(d.upload(&sc_bytes).unwrap(), vec![sc_bytes.len() / if f16 { 2 } else { 4 }], if f16 { DType::F16 } else { DType::F32 });
+                qw.insert(name.to_string(), (qt, sct, m, k));
+                return;
+            }
+        }
+        // Cache miss: full BF16→F32 + Q4 quantize path.
         let w = g(name);
         let (qs, sc) = quantize_q4(&w, m, k);
+        cache_write(name, &qs, &sc, m, k, f16);
         let qt = Tensor::new(d.upload(&tbu(&qs)).unwrap(), vec![qs.len()], DType::U32);
         let sct = if f16 {
             Tensor::new(d.upload(&tb_f16(&sc)).unwrap(), vec![sc.len()], DType::F16)
@@ -768,15 +832,46 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 fw.insert(format!("{p}.mixer.gate.e_score_correction_bias"), g(&format!("{p}.mixer.gate.e_score_correction_bias")));
                 // Experts stored CONTIGUOUS ([n_exp*inter, hid] up, [n_exp*hid, inter] down)
                 // so the batched gather kernel runs them as one big efficient GEMV.
-                let (mut uqs, mut usc, mut dqs, mut dsc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-                for e in 0..n_exp {
-                    let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.up_proj.weight")), inter, hid);
-                    uqs.extend(q); usc.extend(s);
-                    let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.down_proj.weight")), hid, inter);
-                    dqs.extend(q); dsc.extend(s);
+                // Cache the combined expert packs under "{p}.moe_up_all" / ".moe_down_all".
+                let moe_up_name = format!("{p}.moe_up_all");
+                let moe_down_name = format!("{p}.moe_down_all");
+                let (mup_hit, mdown_hit) = (cache_read(&moe_up_name), cache_read(&moe_down_name));
+                if let (Some((uqb, usb, cm, ck, _)), Some((dqb, dsb, dm, dk, _))) = (mup_hit, mdown_hit) {
+                    if cm == n_exp * inter && ck == hid && dm == n_exp * hid && dk == inter {
+                        let ut = Tensor::new(d.upload(&uqb).unwrap(), vec![uqb.len() / 4], DType::U32);
+                        let ust = Tensor::new(d.upload(&usb).unwrap(), vec![usb.len() / 2], DType::F16);
+                        let dt2 = Tensor::new(d.upload(&dqb).unwrap(), vec![dqb.len() / 4], DType::U32);
+                        let dst2 = Tensor::new(d.upload(&dsb).unwrap(), vec![dsb.len() / 2], DType::F16);
+                        qw.insert(moe_up_name, (ut, ust, n_exp * inter, hid));
+                        qw.insert(moe_down_name, (dt2, dst2, n_exp * hid, inter));
+                    } else {
+                        // Dimension mismatch — fall through to rebuild.
+                        let (mut uqs, mut usc, mut dqs, mut dsc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                        for e in 0..n_exp {
+                            let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.up_proj.weight")), inter, hid);
+                            uqs.extend(q); usc.extend(s);
+                            let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.down_proj.weight")), hid, inter);
+                            dqs.extend(q); dsc.extend(s);
+                        }
+                        cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
+                        cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
+                        qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                        qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                    }
+                } else {
+                    // Cache miss: build + cache.
+                    let (mut uqs, mut usc, mut dqs, mut dsc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    for e in 0..n_exp {
+                        let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.up_proj.weight")), inter, hid);
+                        uqs.extend(q); usc.extend(s);
+                        let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.down_proj.weight")), hid, inter);
+                        dqs.extend(q); dsc.extend(s);
+                    }
+                    cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
+                    cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
+                    qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                    qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                 }
-                qw.insert(format!("{p}.moe_up_all"), (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
-                qw.insert(format!("{p}.moe_down_all"), (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                 qload(&mut qw, &format!("{p}.mixer.shared_experts.up_proj.weight"), shared_inter, hid, true);
                 qload(&mut qw, &format!("{p}.mixer.shared_experts.down_proj.weight"), hid, shared_inter, true);
             }
@@ -821,6 +916,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // top-k bubble underutilizes the GPU worse than host top-k + a cheap sync drain
     // (same lesson as device-Mamba). Host router is DEFAULT; device is opt-in only.
     let no_devrouter = !std::env::var("NEMOTRON_DEVROUTER").is_ok();
+    // CUDA-graph capture/replay: collapse ~390 per-token kernel launches into ONE
+    // cuGraphLaunch to remove host-launch-gap overhead. Requires NEMOTRON_DEVROUTER=1
+    // (device MoE router, no host sync) and gates the final argmax download so the
+    // captured region is fully sync-free. Set NEMOTRON_GRAPH=1 to enable.
+    let use_graph = std::env::var("NEMOTRON_GRAPH").is_ok();
+    // skip_dl: Cell<bool> threaded into the step closure. Set true during capture and
+    // replay so the dl(logits) host-sync is skipped (forbidden during capture; not
+    // needed for the graph throughput measurement).
+    let skip_dl = std::cell::Cell::new(false);
     // F16 KV cache: the clock-locked "+11-27%" was a thermal/order artifact (the
     // internal A/B shows it neutral-to-negative — casts cost ≥ halved-read saves).
     // DEFAULT OFF (f32, no casts); opt in with NEMOTRON_F16KV.
@@ -964,8 +1068,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     let attn = if std::env::var("NEMOTRON_SKIPSDPA").is_ok() {
                         q.clone()
                     } else if !no_2pass && len > 1024 {
-                        let blocks: u32 = if len <= 1024 { 32 } else if len <= 8192 { 128 } else { 256 };
-                        let a = sdpa_decode_2pass(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap();
+                        // NEMOTRON_BLOCKS overrides the split-K block count.
+                        // GB10 sweep: 128 ≈ optimal at all ctx (256 within noise, both
+                        // beat 512/1024). Default 128; blocks MUST be a multiple of 32.
+                        let blocks: u32 = env("NEMOTRON_BLOCKS", 128usize) as u32;
+                        // NEMOTRON_BC4=1: BC=4 pass-1 (batched 4 positions/iter).
+                        // NEMOTRON_TILED=1: tiled pass-1 (contiguous chunks, L2-friendly).
+                        let use_bc4 = std::env::var("NEMOTRON_BC4").is_ok();
+                        let use_tiled = std::env::var("NEMOTRON_TILED").is_ok();
+                        let a = if use_bc4 {
+                            sdpa_decode_2pass_bc4(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                        } else if use_tiled {
+                            sdpa_decode_2pass_tiled(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                        } else {
+                            sdpa_decode_2pass(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                        };
                         if f16kv { cast_f16_f32(d, &a).unwrap() } else { a }
                     } else {
                         let a = sdpa_decode(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale).unwrap();
@@ -980,6 +1097,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         }
         let ht = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
         let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap();
+        // Gate the final argmax download: forbidden during CUDA-graph capture (host-sync).
+        // During capture and graph replay we return a dummy 0 — the bench only measures
+        // throughput, not token correctness.
+        if skip_dl.get() {
+            let _ = qmv(&xf, "language_model.lm_head.weight"); // keep the lm_head kernel in graph
+            if let Some(ht) = ht { d.synchronize().ok(); th.set(th.get() + ht.elapsed().as_secs_f64()); }
+            return 0;
+        }
         let logits = dl(&qmv(&xf, "language_model.lm_head.weight"), vocab);
         if let Some(ht) = ht { d.synchronize().ok(); th.set(th.get() + ht.elapsed().as_secs_f64()); }
         ffai_runtime::argmax(&logits)
@@ -1000,6 +1125,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // between alternating decode batches IN-PROCESS — same thermal/clock state,
     // order-alternated to cancel drift. Resets pos each batch so the KV cap holds.
     if let Ok(ab) = std::env::var("NEMOTRON_AB") {
+        // "on" sets the flag to NEMOTRON_AB_VAL (default "1"); "off" unsets it.
+        // For value-flags like MT_MOE_RPT/MT_GEMV_RPT use NEMOTRON_AB_VAL=2 so
+        // ON=rpt2 vs OFF=rpt1 (unset default), not the no-op "1" vs unset(=1).
+        let ab_val = std::env::var("NEMOTRON_AB_VAL").unwrap_or_else(|_| "1".to_string());
         let rounds = 6usize;
         let base_pos = pos;
         let (mut t_off, mut t_on) = (0f64, 0f64);
@@ -1007,7 +1136,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // alternate which config runs first each round to cancel position bias
             let first_on = r % 2 == 1;
             for &on in &[first_on, !first_on] {
-                unsafe { if on { std::env::set_var(&ab, "1"); } else { std::env::remove_var(&ab); } }
+                unsafe { if on { std::env::set_var(&ab, &ab_val); } else { std::env::remove_var(&ab); } }
                 pos = base_pos;
                 let s = Instant::now();
                 for _ in 0..n_decode { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
@@ -1025,9 +1154,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     let t0 = Instant::now();
     for _ in 0..n_decode { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
     let dt = t0.elapsed().as_secs_f64();
+    let eager_tps = n_decode as f64 / dt;
     eprintln!("──────── NemotronH-Nano RESIDENT-Q8 DECODE on {plat} ────────");
     eprintln!("  context  start {} + {n_decode} timed (pos→{pos})", fakectx.max(prefill));
-    eprintln!("  decode   {n_decode} tok in {dt:.2}s = {:.2} tok/s ({:.1} ms/tok)", n_decode as f64 / dt, dt * 1000.0 / n_decode as f64);
+    eprintln!("  decode   {n_decode} tok in {dt:.2}s = {eager_tps:.2} tok/s ({:.1} ms/tok)", dt * 1000.0 / n_decode as f64);
     if prof {
         let n = (n_decode + 1) as f64; // includes the warm step
         eprintln!("  profile/tok: M(mamba×23) {:.1}ms · E(moe×23) {:.1}ms · *(attn×6) {:.1}ms · head {:.1}ms",
@@ -1035,4 +1165,72 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     }
     eprintln!("  (vs naive-reload baseline 0.003 tok/s; resident weights uploaded once in {load_s:.0}s setup)");
     eprintln!("──────────────────────────────────────────────────────────────");
+
+    // ── CUDA GRAPH CAPTURE/REPLAY measurement ──────────────────────────────────
+    // Activated by NEMOTRON_GRAPH=1. Requires NEMOTRON_DEVROUTER=1 (device router,
+    // no host sync in the step). Collapses ~390 per-token launches into one
+    // cuGraphLaunch to remove host-launch-gap overhead; measures vs eager at the
+    // SAME thermal/clock state in one process.
+    //
+    // Protocol:
+    //   a. Run 5 more warm eager steps (pool stays fully populated, clocks steady).
+    //   b. Time M eager steps (skip_dl=false so argmax fires for comparison baseline).
+    //   c. One more eager step (pool free-list in exact capture-step state).
+    //   d. begin_capture → step (skip_dl=true, no devrouter host-sync) → end_capture.
+    //   e. synchronize; time M graph_launches.
+    //   f. Print eager_tps_graph_run, graph_tps, ratio.
+    if use_graph {
+        if no_devrouter {
+            eprintln!("NEMOTRON_GRAPH: WARNING — NEMOTRON_DEVROUTER not set. Host router mid-token sync will break capture. Re-run with NEMOTRON_DEVROUTER=1.");
+        }
+        let gm = n_decode; // use same step count for apples-to-apples
+        // Use `fakectx` as the fixed position for all graph-section measurements.
+        // This keeps `pos` within bounds (KV cap = fakectx + n_decode + 8) AND gives
+        // the correct 32K SDPA length. We don't advance pos in the graph section.
+        let gpos = fakectx.max(prefill); // fixed position for graph-section steps
+        // (a) 5 warm steps at gpos (untimed) — populates pool, reaches steady clocks.
+        for _ in 0..5 { step(tok, gpos, &mut conv_state, &mut ssm_state, &mut kvcache); }
+        // (b) Eager baseline at fixed gpos (skip_dl=false — argmax fires for comparison).
+        let t_eager = Instant::now();
+        for _ in 0..gm { step(tok, gpos, &mut conv_state, &mut ssm_state, &mut kvcache); }
+        d.synchronize().ok();
+        let eager_dt = t_eager.elapsed().as_secs_f64();
+        let eager_tps_hot = gm as f64 / eager_dt;
+        // (c) One pool-alignment step (pool free-list in exact same state the capture step sees).
+        step(tok, gpos, &mut conv_state, &mut ssm_state, &mut kvcache);
+        // (d) Capture: skip_dl = true so no host-sync in step.
+        skip_dl.set(true);
+        d.begin_capture().expect("NEMOTRON_GRAPH: begin_capture failed — check DEVROUTER and that no cuMemAlloc slipped into the step");
+        step(tok, gpos, &mut conv_state, &mut ssm_state, &mut kvcache);
+        let graph_handle = d.end_capture().expect("NEMOTRON_GRAPH: end_capture failed — check for stray sync/alloc in the captured region");
+        // (e) Synchronize then time M graph launches — two modes:
+        //   serial:  graph_launch (sync-per-token) measures single-token latency
+        //   batched: graph_launch_batch (N enqueues, one sync) eliminates per-token
+        //            host-GPU handoff, giving maximum pipeline throughput
+        d.synchronize().ok();
+        // Serial: measures true per-token wall time (GPU + host round-trip).
+        let t_graph_serial = Instant::now();
+        for _ in 0..gm { d.graph_launch(graph_handle).expect("graph_launch failed"); }
+        let graph_serial_dt = t_graph_serial.elapsed().as_secs_f64();
+        let graph_serial_tps = gm as f64 / graph_serial_dt;
+        // Batched: N cuGraphLaunch enqueues, one cuStreamSynchronize — removes
+        // per-token host-GPU handoff to reveal the true GPU throughput ceiling.
+        d.synchronize().ok();
+        let t_graph_batch = Instant::now();
+        d.graph_launch_batch(graph_handle, gm).expect("graph_launch_batch failed");
+        let graph_batch_dt = t_graph_batch.elapsed().as_secs_f64();
+        let graph_batch_tps = gm as f64 / graph_batch_dt;
+        let ratio_serial = graph_serial_tps / eager_tps_hot;
+        let ratio_batch  = graph_batch_tps  / eager_tps_hot;
+        eprintln!("──────── CUDA GRAPH CAPTURE/REPLAY (ctx {}, {} tok each) ────────", fakectx.max(prefill), gm);
+        eprintln!("  eager (hot)       {eager_tps_hot:.2} tok/s  ({:.2} ms/tok)", eager_dt * 1000.0 / gm as f64);
+        eprintln!("  graph serial      {graph_serial_tps:.2} tok/s  ({:.2} ms/tok)  ratio {ratio_serial:.3}x", graph_serial_dt * 1000.0 / gm as f64);
+        eprintln!("  graph batched     {graph_batch_tps:.2} tok/s  ({:.2} ms/tok)  ratio {ratio_batch:.3}x", graph_batch_dt * 1000.0 / gm as f64);
+        if graph_batch_tps >= 75.0 {
+            eprintln!("  ✓ TARGET MET: graph_batch_tps {graph_batch_tps:.1} >= 75 tok/s");
+        } else {
+            eprintln!("  ✗ target 75 tok/s not yet met (gap {:.1} tok/s)", 75.0 - graph_batch_tps);
+        }
+        eprintln!("──────────────────────────────────────────────────────────────────────");
+    }
 }

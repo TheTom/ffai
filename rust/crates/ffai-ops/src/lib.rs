@@ -641,7 +641,9 @@ pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &T
     let k = cached_ir("ffai_moe_gather_q4_relu2", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
-    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+    // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
+    // global-load latency (clean internal-A/B: +1.8% @ctx4096, MoE cost is ctx-independent).
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
     Ok(out)
 }
@@ -660,7 +662,9 @@ pub fn moe_gather_down(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tenso
     let k = cached_ir("ffai_moe_gather_q4_down", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
     let out = Tensor::empty(dev, vec![top_k * hid], x.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
-    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+    // Default rpt=2: MoE-gather kernels are big + latency-bound; 2 warps/row hides
+    // global-load latency (clean internal-A/B: +1.8% @ctx4096, MoE cost is ctx-independent).
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(2);
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(inter as u32), u(hid as u32), u(rpt)], Grid { grid: [(hid as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
     Ok(out)
 }
@@ -981,6 +985,109 @@ pub fn sdpa_decode_2pass(
         u(head_dim as u32), u(n_kv), u(kv_stride), u(gqa_factor), u(blocks), f(scale),
     ], Grid { grid: [n_kv_heads as u32, blocks, 1], block: [32 * gqa_factor, 1, 1] })?;
 
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+    let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k2, &[
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()), u(head_dim as u32), u(blocks),
+    ], Grid { grid: [n_q_heads as u32, 1, 1], block: [1024, 1, 1] })?;
+    Ok(out)
+}
+
+/// Like `sdpa_decode_2pass` but uses the TILED pass-1 variant: assigns each
+/// block a contiguous chunk of KV positions for L2-cache-friendly sequential
+/// access (vs the strided pattern which thrashes L2). Activated by NEMOTRON_TILED=1.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_2pass_tiled(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv: u32,
+    kv_stride: u32,
+    gqa_factor: u32,
+    scale: f32,
+    blocks: u32,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    let n_q_heads = q.elem_count() / head_dim;
+    let n_kv_heads = n_q_heads / gqa_factor as usize;
+    let nb = blocks as usize;
+    let partial_o = Tensor::empty(dev, vec![n_q_heads * nb * head_dim], q.dtype)?;
+    let partial_m = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let partial_l = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+
+    let k1 = cached_ir("sdpa_decode_2pass_pass1_tiled", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass1_tiled::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k1, &[
+        Binding::Buffer(q.buffer.clone()), Binding::Buffer(k.buffer.clone()), Binding::Buffer(v.buffer.clone()),
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        u(head_dim as u32), u(n_kv), u(kv_stride), u(gqa_factor), u(blocks), f(scale),
+    ], Grid { grid: [n_kv_heads as u32, blocks, 1], block: [32 * gqa_factor, 1, 1] })?;
+
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+    let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k2, &[
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()), u(head_dim as u32), u(blocks),
+    ], Grid { grid: [n_q_heads as u32, 1, 1], block: [1024, 1, 1] })?;
+    Ok(out)
+}
+
+/// Like `sdpa_decode_2pass` but uses the BC=4 pass-1 variant: processes 4 KV
+/// positions per loop iteration to expose memory-level parallelism and hide
+/// load latency. Same pass-2 reduction. Same correctness guarantees.
+/// Activated by NEMOTRON_BC4=1 in the bench harness.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_2pass_bc4(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv: u32,
+    kv_stride: u32,
+    gqa_factor: u32,
+    scale: f32,
+    blocks: u32,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    let n_q_heads = q.elem_count() / head_dim;
+    let n_kv_heads = n_q_heads / gqa_factor as usize;
+    let nb = blocks as usize;
+    let partial_o = Tensor::empty(dev, vec![n_q_heads * nb * head_dim], q.dtype)?;
+    let partial_m = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let partial_l = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+
+    // BC=4 pass 1: 4 positions per loop iter for MLP / load-latency hiding.
+    let k1 = cached_ir("sdpa_decode_2pass_pass1_bc4", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass1_bc4::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k1, &[
+        Binding::Buffer(q.buffer.clone()), Binding::Buffer(k.buffer.clone()), Binding::Buffer(v.buffer.clone()),
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        u(head_dim as u32), u(n_kv), u(kv_stride), u(gqa_factor), u(blocks), f(scale),
+    ], Grid { grid: [n_kv_heads as u32, blocks, 1], block: [32 * gqa_factor, 1, 1] })?;
+
+    // Pass 2 unchanged: same partial buffer layout, same reduction.
     let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
     let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
         let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);

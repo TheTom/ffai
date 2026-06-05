@@ -67,6 +67,11 @@ impl CudaDevice {
         let src = cg
             .generate(kernel)
             .map_err(|e| Error::Codegen(format!("{e:?}")))?;
+        // MT_DUMP_CUDA_SRC=<dir>: dump generated CUDA C++ for kernel inspection.
+        if let Ok(dir) = std::env::var("MT_DUMP_CUDA_SRC") {
+            let path = format!("{}/{}.cu", dir, kernel.name);
+            let _ = std::fs::write(&path, &src);
+        }
         let module = self
             .dev
             .compile(&src, &format!("{}.cu", kernel.name))
@@ -220,5 +225,8 @@ impl Device for CudaDevice {
     }
     fn graph_launch(&self, exec: u64) -> Result<()> {
         self.dev.graph_launch(exec as usize as *mut std::ffi::c_void).map_err(dispatch_err)
+    }
+    fn graph_launch_batch(&self, exec: u64, n: usize) -> Result<()> {
+        self.dev.graph_launch_batch(exec as usize as *mut std::ffi::c_void, n).map_err(dispatch_err)
     }
 }

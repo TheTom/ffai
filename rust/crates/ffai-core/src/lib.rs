@@ -126,6 +126,14 @@ pub trait Device: Send + Sync {
     fn graph_launch(&self, _exec: u64) -> Result<()> {
         Err(Error::Msg("graph capture unsupported on this backend".into()))
     }
+    /// Issue `n` sequential graph launches on the GPU stream without syncing
+    /// between them; sync once at the end. Eliminates per-token host-GPU
+    /// handoff for the throughput benchmark. Default impl falls back to
+    /// n individual `graph_launch` calls (correct but not pipelined).
+    fn graph_launch_batch(&self, exec: u64, n: usize) -> Result<()> {
+        for _ in 0..n { self.graph_launch(exec)?; }
+        Ok(())
+    }
 }
 
 /// A handle to a region of device memory + shape + dtype. Backend-neutral:
