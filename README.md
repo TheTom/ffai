@@ -6,6 +6,12 @@ A minimal, dependency-light LLM inference library for Apple Silicon, built on pr
 
 **Just really f*cking fast AI on your Mac!** 🚀
 
+## Architecture
+
+FFAI is a Rust + Swift inference engine spanning 35 model families, with resident decode across four GPU backends (Apple Metal, NVIDIA CUDA, AMD HIP, and Vulkan) via [metaltile](https://github.com/thewafflehaus/metaltile)'s `#[kernel]` DSL. The diagram below traces the engine stack from model loading through the per-token dispatch loop down to the shared kernel layer.
+
+![FFAI architecture](docs/architecture.png)
+
 ## Status
 
 Early bootstrap — the dense-text, hybrid, vision-language, and audio model waves have all landed; end-to-end inference runs real HuggingFace checkpoints across every shipped family.
