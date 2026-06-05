@@ -177,3 +177,83 @@ impl SafeTensors {
 }
 mod iq2xxs_tables;
 pub mod gguf;
+
+// ── Capability probe ────────────────────────────────────────────────────
+//
+// Derive what a checkpoint can ACTUALLY do from the tensors present, not from
+// the model card / config (which lie — quants silently strip vision/audio
+// towers, repos reuse llama/qwen backbones + bolt on towers, names are a mess).
+// Cross-checks the config's *claims* against the tensors and flags the gap.
+
+/// What a checkpoint can do (each flag = the relevant tensors are present).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Caps {
+    pub text: bool,
+    pub vision: bool,
+    pub audio: bool,
+}
+
+/// Grounded inspection of a model directory.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    /// `model_type` from config.json (the card's claim).
+    pub config_model_type: Option<String>,
+    pub config_architectures: Vec<String>,
+    /// Capabilities **detected from the tensors** — the truth.
+    pub detected: Caps,
+    /// Capabilities the config **claims** (vision_config / audio_config keys).
+    pub declared: Caps,
+    pub n_tensors: usize,
+    pub n_params: u64,
+    /// Mismatches between claim and reality — e.g. a quant that stripped vision.
+    pub warnings: Vec<String>,
+}
+
+fn any_name(names: &[String], pats: &[&str]) -> bool {
+    names.iter().any(|n| pats.iter().any(|p| n.contains(p)))
+}
+
+/// Probe a model dir: read config.json (if any) + scan the SafeTensors tensor
+/// names, and report what it can really do — independent of the card.
+pub fn probe(dir: &str) -> Result<Probe> {
+    let st = SafeTensors::open_dir(dir)?;
+    let names: Vec<String> = st.names().cloned().collect();
+    let n_params: u64 = names.iter().filter_map(|n| st.info(n)).map(|i| i.shape.iter().product::<usize>() as u64).sum();
+
+    // detected from tensors (the truth)
+    let detected = Caps {
+        text: any_name(&names, &["embed_tokens", "wte", "embed_in", "token_embedding"]),
+        vision: any_name(&names, &["vision_model", "vision_tower", "visual.", "patch_embedding", "patch_embed", "vision_encoder"]),
+        audio: any_name(&names, &["audio_tower", "audio_encoder", "encoder.conv1", "feature_extractor", "audio_model"]),
+    };
+
+    // config.json claims (the card)
+    let mut config_model_type = None;
+    let mut config_architectures = Vec::new();
+    let mut declared = Caps::default();
+    if let Ok(txt) = std::fs::read_to_string(format!("{dir}/config.json")) {
+        if let Ok(j) = serde_json::from_str::<serde_json::Value>(&txt) {
+            config_model_type = j["model_type"].as_str().map(String::from);
+            if let Some(a) = j["architectures"].as_array() {
+                config_architectures = a.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            }
+            declared.vision = !j["vision_config"].is_null();
+            declared.audio = !j["audio_config"].is_null() || !j["audio_encoder_config"].is_null();
+            declared.text = !j["text_config"].is_null() || config_model_type.is_some();
+        }
+    }
+
+    // claim-vs-reality gaps (Eric's "the quant stripped vision but the card didn't say so")
+    let mut warnings = Vec::new();
+    if declared.vision && !detected.vision {
+        warnings.push("config declares a vision tower but NO vision tensors are present — this checkpoint/quant stripped it (text-only despite the card)".into());
+    }
+    if declared.audio && !detected.audio {
+        warnings.push("config declares audio but NO audio tensors are present — stripped from this checkpoint".into());
+    }
+    if detected.vision && !declared.vision {
+        warnings.push("vision tensors present but config has no vision_config — a tower was bolted on / the card under-reports".into());
+    }
+
+    Ok(Probe { config_model_type, config_architectures, detected, declared, n_tensors: names.len(), n_params, warnings })
+}
