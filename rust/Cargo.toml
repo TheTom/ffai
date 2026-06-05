@@ -39,10 +39,10 @@ ffai-vulkan = { path = "crates/backends/ffai-vulkan" }
 # Canonical pointer is the git branch carrying both backends, so a fresh
 # clone (Eric included) is self-contained. Local co-development overrides
 # these to the live checkout via the [patch] section below.
-metaltile-core = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
-metaltile-codegen = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
-metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
-metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-backend" }
+metaltile-core = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
+metaltile-codegen = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
+metaltile-runtime = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
+metaltile-std = { git = "https://github.com/TheTom/metaltile", branch = "feature/cuda-hip-vulkan" }
 # ── third-party ──────────────────────────────────────────────────────
 thiserror = "2"
 serde_json = "1"

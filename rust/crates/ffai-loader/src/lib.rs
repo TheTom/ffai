@@ -88,8 +88,13 @@ impl SafeTensors {
             if name == "__metadata__" {
                 continue;
             }
-            let dtype =
-                parse_dtype(v["dtype"].as_str().ok_or_else(|| Error::Msg("missing dtype".into()))?)?;
+            // Omni/multimodal checkpoints mix in dtypes we don't decode (I64
+            // position buffers, F8 vision scales, …). Skip those tensors rather
+            // than failing the whole load — callers only ask for the ones they need.
+            let dtype = match parse_dtype(v["dtype"].as_str().ok_or_else(|| Error::Msg("missing dtype".into()))?) {
+                Ok(dt) => dt,
+                Err(_) => continue,
+            };
             let shape: Vec<usize> = v["shape"]
                 .as_array()
                 .ok_or_else(|| Error::Msg("missing shape".into()))?

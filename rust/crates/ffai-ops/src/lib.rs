@@ -33,6 +33,19 @@ fn kernel_cache() -> &'static Mutex<FxHashMap<(String, DType), Kernel>> {
     C.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+/// Cache an inline-built kernel IR by (name, dtype). `kernel_ir_for` rebuilds the
+/// full IR (~30+ ops) on every call — on the decode hot path that's ~250
+/// rebuilds/token. Build once, clone thereafter.
+fn cached_ir(name: &str, dtype: DType, build: impl FnOnce() -> Kernel) -> Kernel {
+    let key = (name.to_string(), dtype);
+    if let Some(k) = kernel_cache().lock().get(&key) {
+        return k.clone();
+    }
+    let k = build();
+    kernel_cache().lock().insert(key, k.clone());
+    k
+}
+
 /// Look up a registered metaltile kernel by name and instantiate its IR for
 /// `dtype`, **with the correct dispatch mode already set**. We pull it from
 /// the test registry (`metaltile_std::all_tests`) rather than the raw kernel
@@ -452,6 +465,346 @@ pub fn gemv(dev: &dyn Device, mat: &Tensor, vec: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+/// Q8_0 grouped matvec — weights stay QUANTIZED resident (int8, block 32, one
+/// f32 scale/block): `out[r] = Σ_k dequant(qs[r,k], scales[r, k/32]) ·
+/// x[(r/rows_per_group)·k_in + k]`. `qs` is u32-packed (4 int8/u32, 8 u32/block),
+/// `scales` is `[m_out · k_in/32]` f32. Dense gemv ⇒ `rows_per_group = m_out`
+/// (n_groups=1, `x = [k_in]`); MoE ⇒ per-expert grouping. Dispatches the
+/// Reduction kernel `ffai_grouped_gemv_q8_rows` (8-bit ⇒ ~4× less weight DRAM
+/// than F32, the resident-decode bandwidth win). `k_in` must be a multiple of 32.
+pub fn gemv_q8(
+    dev: &dyn Device,
+    qs: &Tensor,
+    scales: &Tensor,
+    x: &Tensor,
+    m_out: usize,
+    k_in: usize,
+    rows_per_group: usize,
+) -> Result<Tensor> {
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemv_q8: k_in {k_in} must be a multiple of 32")));
+    }
+    // Not in the test registry, so build the kernel IR directly (constexpr dims
+    // are JIT-specialized by the runtime from the scalar bindings below).
+    // Coalesced variant: consecutive lanes read consecutive qs words (~2× the
+    // strided original's DRAM bandwidth on GB10).
+    let k = cached_ir("ffai_gemv_q8_coalesced", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_gemv_q8_coalesced::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(k_in as u32),
+            u(m_out as u32),
+            u(rows_per_group as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Q8 gemv with fused ReLU²: `out[r] = max(0, (Wq·x)[r])²` — a MoE expert's
+/// `up` projection + activation in one dispatch. Dispatches `ffai_gemv_q8_coalesced_relu2`.
+pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_gemv_q8_coalesced_relu2", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_gemv_q8_coalesced_relu2::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![m_out], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(k_in as u32), u(m_out as u32), u(rows_per_group as u32)], grid)?;
+    Ok(out)
+}
+
+/// Q8 gemv that scales + accumulates in place: `acc[r] += scale · (Wq · x)[r]`.
+/// Fuses an MoE expert's `down` projection with its router-weighted sum into the
+/// layer accumulator — no per-expert scalar-broadcast upload or separate add.
+/// `scale_buf` is a 1-element device buffer. Dispatches `ffai_gemv_q8_coalesced_accum`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q8_accum(
+    dev: &dyn Device,
+    qs: &Tensor,
+    scales: &Tensor,
+    x: &Tensor,
+    acc: &Tensor,
+    scale_buf: &Tensor,
+    m_out: usize,
+    k_in: usize,
+    rows_per_group: usize,
+) -> Result<()> {
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemv_q8_accum: k_in {k_in} must be a multiple of 32")));
+    }
+    let k = cached_ir("ffai_gemv_q8_coalesced_accum", acc.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_gemv_q8_coalesced_accum::kernel_ir_for(acc.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(acc.buffer.clone()),
+            Binding::Buffer(scale_buf.buffer.clone()),
+            u(k_in as u32),
+            u(m_out as u32),
+            u(rows_per_group as u32),
+        ],
+        grid,
+    )?;
+    Ok(())
+}
+
+/// Append one decode step's K (or V) into an in-place device KV cache:
+/// `dst[h, pos, :] = src[h, :]`, where `dst` is `[nkv, cap, hd]`, `src` is
+/// `[nkv*hd]`, and `posbuf` is a 1-element u32 device buffer. Keeps the growing
+/// context entirely on-device — no host reorg/reupload per step (the 32K-context
+/// fix). Dispatches `ffai_kv_append` (runtime `pos` ⇒ compiled once, not per step).
+pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, hd: usize, cap: usize, n: usize) -> Result<()> {
+    let k = cached_ir("ffai_kv_append", src.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_kv_append::kernel_ir_for(src.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid { grid: [(n as u32).div_ceil(64), 1, 1], block: [64, 1, 1] };
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(dst.buffer.clone()), Binding::Buffer(posbuf.buffer.clone()), u(hd as u32), u(cap as u32)], grid)?;
+    Ok(())
+}
+
+/// Device slice `out[i] = src[off + i]` for `len` elements (no host round-trip).
+pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_slice", src.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_slice::kernel_ir_for(src.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let out = Tensor::empty(dev, vec![len], src.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(off as u32), u(len as u32)], Grid { grid: [(len as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// Cast f32 → f16 (KV-cache compaction: store attention K/V at half precision
+/// to halve the 32K-context sdpa read). Returns a fresh F16 tensor.
+pub fn cast_f32_f16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
+    let k = cached_ir("ffai_cast_f32_f16", DType::F16, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_cast_f32_f16::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let n = src.elem_count();
+    let out = Tensor::empty(dev, src.shape.clone(), DType::F16)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// Cast f16 → f32 (reverse: widen the sdpa f16 output back to f32 for the
+/// downstream o_proj Q4 GEMV, which consumes f32 activations). Fresh F32 tensor.
+pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
+    let k = cached_ir("ffai_cast_f16_f32", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_cast_f16_f32::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let n = src.elem_count();
+    let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// Device Mamba dt: `softplus(dt_raw + dt_bias)` — no host round-trip.
+pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let k = cached_ir("ffai_softplus_add", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_softplus_add::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let n = a.elem_count();
+    let out = Tensor::empty(dev, a.shape.clone(), DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(a.buffer.clone()), Binding::Buffer(b.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// NemotronH/Zamba2 gated grouped RMSNorm ON-DEVICE: out = (y·silu(z)) normalized
+/// per `gs`-group, ×w. Removes the per-Mamba-layer dl→host-norm→up sync. `y` is f32.
+pub fn gated_group_rmsnorm(dev: &dyn Device, y: &Tensor, z: &Tensor, w: &Tensor, eps: f32, di: usize, gs: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_gated_group_rmsnorm", z.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_gated_group_rmsnorm::kernel_ir_for(z.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![di], z.dtype)?;
+    let eps_buf = Tensor::new(dev.upload(&eps.to_le_bytes()).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::F32);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let ng = (di / gs) as u32;
+    dev.dispatch(&k, &[Binding::Buffer(y.buffer.clone()), Binding::Buffer(z.buffer.clone()), Binding::Buffer(w.buffer.clone()), Binding::Buffer(out.buffer.clone()), Binding::Buffer(eps_buf.buffer.clone()), u(gs as u32)], Grid { grid: [ng, 1, 1], block: [(gs / 4) as u32, 1, 1] })?;
+    Ok(out)
+}
+
+/// Roll a causal-conv state on-device: `new = [old[conv_dim..], xbc]`.
+pub fn conv_roll(dev: &dyn Device, old: &Tensor, xbc: &Tensor, conv_dim: usize, kc: usize) -> Result<Tensor> {
+    let n = (kc - 1) * conv_dim;
+    let keep = (kc - 2) * conv_dim;
+    let k = cached_ir("ffai_conv_roll", old.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_conv_roll::kernel_ir_for(old.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let out = Tensor::empty(dev, vec![n], old.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(old.buffer.clone()), Binding::Buffer(xbc.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(conv_dim as u32), u(keep as u32), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// Batched MoE up+ReLU²: gather `top_k` experts (indices `idx`) from the
+/// contiguous `[n_exp*inter, hid]` Q4 weight into one `[top_k*inter]` GEMV.
+pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_moe_gather_q4_relu2", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_relu2::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * inter], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(hid as u32), u(inter as u32), u(rpt)], Grid { grid: [(inter as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
+}
+/// Batched MoE down + router-weighted accumulate into `acc[hid]`. `qs` is the
+/// contiguous `[n_exp*hid, inter]` Q4 weight; `x` is the `[top_k*inter]` up output.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gather_down_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, wts: &Tensor, acc: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<()> {
+    let k = cached_ir("ffai_moe_gather_q4_down_accum", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_down_accum::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(inter as u32), u(hid as u32), u(top_k as u32)], Grid { grid: [hid as u32, 1, 1], block: [32, 1, 1] })?;
+    Ok(())
+}
+
+/// Batched MoE down gather → `[top_k*hid]` (one big GEMV, no accumulate).
+pub fn moe_gather_down(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
+    let k = cached_ir("ffai_moe_gather_q4_down", x.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_gather_q4_down::kernel_ir_for(x.dtype); k.mode = metaltile_core::ir::KernelMode::Reduction; k });
+    let out = Tensor::empty(dev, vec![top_k * hid], x.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let rpt: u32 = std::env::var("MT_MOE_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+    dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(inter as u32), u(hid as u32), u(rpt)], Grid { grid: [(hid as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
+    Ok(out)
+}
+/// Router-weighted sum of per-expert down outputs into `acc`: `acc[h] += Σ wts·downs[·,h]`.
+/// Fully ON-DEVICE MoE router (NemotronH sigmoid + e_score_correction_bias, top-k by
+/// biased score, weights from unbiased renormalized to sum-1, ×routed_scaling_factor).
+/// Returns (idx[top_k] U32, wts[top_k] F32) WITHOUT a host round-trip — replaces the
+/// per-layer dl(gate)+host-topk+up(idx) sync that drains the async pipeline 23×/token.
+pub fn moe_router_device(dev: &dyn Device, gate_logits: &Tensor, bias: &Tensor, n_exp: usize, top_k: usize, scale: f32) -> Result<(Tensor, Tensor)> {
+    use metaltile_core::ir::KernelMode;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let unbiased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
+    let biased = Tensor::empty(dev, vec![n_exp], DType::F32)?;
+    let ks = cached_ir("ffai_moe_sigmoid_bias", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_sigmoid_bias::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    dev.dispatch(&ks, &[Binding::Buffer(gate_logits.buffer.clone()), Binding::Buffer(bias.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(biased.buffer.clone()), u(n_exp as u32)], Grid { grid: [(n_exp as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    let idx = Tensor::empty(dev, vec![top_k], DType::U32)?;
+    let wts = Tensor::empty(dev, vec![top_k], DType::F32)?;
+    let kr = cached_ir("mt_dsv4_router_topk", DType::F32, || { let mut k = metaltile_std::ffai::dsv4_router_topk::mt_dsv4_router_topk::kernel_ir_for(DType::F32); k.mode = KernelMode::Reduction; k });
+    dev.dispatch(&kr, &[Binding::Buffer(biased.buffer.clone()), Binding::Buffer(unbiased.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(wts.buffer.clone()), u(n_exp as u32), u(top_k as u32)], Grid { grid: [1, 1, 1], block: [32, 1, 1] })?;
+    let kv = cached_ir("ffai_vscale", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_vscale::kernel_ir(); k.mode = KernelMode::Grid3D; k });
+    dev.dispatch(&kv, &[Binding::Buffer(wts.buffer.clone()), f(scale), u(top_k as u32)], Grid { grid: [(top_k as u32).div_ceil(64), 1, 1], block: [64, 1, 1] })?;
+    Ok((idx, wts))
+}
+
+pub fn moe_weighted_sum(dev: &dyn Device, downs: &Tensor, wts: &Tensor, acc: &Tensor, hid: usize, top_k: usize) -> Result<()> {
+    let k = cached_ir("ffai_moe_weighted_sum", acc.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_moe_weighted_sum::kernel_ir_for(acc.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(downs.buffer.clone()), Binding::Buffer(wts.buffer.clone()), Binding::Buffer(acc.buffer.clone()), u(hid as u32), u(top_k as u32)], Grid { grid: [(hid as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(())
+}
+
+// ── Q4 (4-bit) family — half the weight DRAM of Q8 (the decode lever). ──
+fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: Option<&Tensor>, scale_buf: Option<&Tensor>, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {
+    // 2-row tiling: 2 output rows per warp, shared activation read, 2 weight
+    // streams in flight (more memory-level-parallelism on the latency-bound Q4 read).
+    let vec = kernel == "plain" && std::env::var("MT_GEMV_VEC").is_ok();
+    let two_row = !vec && kernel == "plain" && std::env::var("MT_GEMV_2ROW").is_ok();
+    let name = if vec { "ffai_gemv_q4_vec" } else if two_row { "ffai_gemv_q4_coalesced_2row" } else { match kernel { "plain" => "ffai_gemv_q4_coalesced", "relu2" => "ffai_gemv_q4_coalesced_relu2", _ => "ffai_gemv_q4_coalesced_accum" } };
+    let k = cached_ir(name, x.dtype, || {
+        let mut k = if vec {
+            metaltile_std::ffai::gemv_q8::ffai_gemv_q4_vec::kernel_ir_for(x.dtype)
+        } else if two_row {
+            metaltile_std::ffai::gemv_q8::ffai_gemv_q4_coalesced_2row::kernel_ir_for(x.dtype)
+        } else { match kernel {
+            "plain" => metaltile_std::ffai::gemv_q8::ffai_gemv_q4_coalesced::kernel_ir_for(x.dtype),
+            "relu2" => metaltile_std::ffai::gemv_q8::ffai_gemv_q4_coalesced_relu2::kernel_ir_for(x.dtype),
+            _ => metaltile_std::ffai::gemv_q8::ffai_gemv_q4_coalesced_accum::kernel_ir_for(x.dtype),
+        }};
+        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        k
+    });
+    let out = acc.cloned().unwrap_or(Tensor::empty(dev, vec![m_out], x.dtype)?);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let mut b = vec![Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(out.buffer.clone())];
+    if let Some(sb) = scale_buf { b.push(Binding::Buffer(sb.buffer.clone())); }
+    b.extend([u(k_in as u32), u(m_out as u32), u(rows_per_group as u32)]);
+    // Plain gemv is multi-warp capable (rows_per_tg warps/TG to hide the
+    // ncu-measured global-load latency). MT_GEMV_RPT=1 → original single-warp.
+    let grid = if vec {
+        // single-warp/row, vectorized loads (no rpt binding)
+        Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] }
+    } else if kernel == "plain" {
+        let rpt: u32 = std::env::var("MT_GEMV_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+        b.push(u(rpt));
+        let rows_per_block = if two_row { 2 * rpt } else { rpt };
+        Grid { grid: [(m_out as u32).div_ceil(rows_per_block), 1, 1], block: [32 * rpt, 1, 1] }
+    } else {
+        Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] }
+    };
+    dev.dispatch(&k, &b, grid)?;
+    Ok(out)
+}
+/// Q4 matvec `out = Wq4·x`. (block 32, int4 [-7,7], f32 scale/block.)
+pub fn gemv_q4(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
+    gemv_q4_dispatch(dev, "plain", qs, scales, x, None, None, m_out, k_in, rpg)
+}
+/// Q4 matvec with fused ReLU² (MoE expert up).
+pub fn gemv_q4_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<Tensor> {
+    gemv_q4_dispatch(dev, "relu2", qs, scales, x, None, None, m_out, k_in, rpg)
+}
+/// Q4 matvec, scale + accumulate into `acc` in place (MoE expert down).
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_accum(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, acc: &Tensor, scale_buf: &Tensor, m_out: usize, k_in: usize, rpg: usize) -> Result<()> {
+    gemv_q4_dispatch(dev, "accum", qs, scales, x, Some(acc), Some(scale_buf), m_out, k_in, rpg)?;
+    Ok(())
+}
+/// Quantize a row-major `[m,k]` F32 weight to Q4 blocks (block 32, symmetric int4
+/// in [-7,7], f32 scale `amax/7`). Returns `(qs_u32, scales)`: qs `[m·k/32·4]`
+/// (8 nibbles/u32, 4 u32/block), scales `[m·k/32]`. `k` must be a multiple of 32.
+pub fn quantize_q4(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
+    assert_eq!(k % 32, 0, "quantize_q4: k must be a multiple of 32");
+    let bpr = k / 32;
+    let mut qs = vec![0u32; m * bpr * 4];
+    let mut scales = vec![0f32; m * bpr];
+    for r in 0..m {
+        for b in 0..bpr {
+            let base = r * k + b * 32;
+            let amax = (0..32).fold(0f32, |a, i| a.max(w[base + i].abs()));
+            let d = amax / 7.0;
+            scales[r * bpr + b] = d;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for word in 0..4 {
+                let mut packed = 0u32;
+                for i in 0..8 {
+                    let q = (w[base + word * 8 + i] * inv).round().clamp(-7.0, 7.0) as i32;
+                    packed |= ((q as u32) & 0xf) << (i * 4);
+                }
+                qs[r * bpr * 4 + b * 4 + word] = packed;
+            }
+        }
+    }
+    (qs, scales)
+}
+
+/// Quantize a row-major `[m, k]` F32 weight to Q8_0 blocks (block 32, symmetric
+/// int8, per-block f32 scale `amax/127`). Returns `(qs_u32_packed, scales_f32)`
+/// laid out exactly as [`gemv_q8`] expects: qs `[m · k/32 · 8]` u32, scales
+/// `[m · k/32]` f32. CPU, one-time at load. `k` must be a multiple of 32.
+pub fn quantize_q8(w: &[f32], m: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
+    assert_eq!(k % 32, 0, "quantize_q8: k must be a multiple of 32");
+    let bpr = k / 32;
+    let mut qs = vec![0u32; m * bpr * 8];
+    let mut scales = vec![0f32; m * bpr];
+    for r in 0..m {
+        for b in 0..bpr {
+            let base = r * k + b * 32;
+            let amax = (0..32).fold(0f32, |a, i| a.max(w[base + i].abs()));
+            let d = amax / 127.0;
+            scales[r * bpr + b] = d;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for w_i in 0..8 {
+                let mut packed = 0u32;
+                for i in 0..4 {
+                    let q = (w[base + w_i * 4 + i] * inv).round().clamp(-127.0, 127.0) as i32;
+                    packed |= ((q as u8) as u32) << (i * 8);
+                }
+                qs[r * bpr * 8 + b * 8 + w_i] = packed;
+            }
+        }
+    }
+    (qs, scales)
+}
+
 /// Prefill linear: `out[r, :] = weight · input[r, :]` for a block of rows in
 /// one dispatch — `weight` is `[out_dim, in_dim]`, `input` is `[n_rows, in_dim]`,
 /// result `[n_rows, out_dim]`. Dispatches the 32×32-tiled Reduction kernel
@@ -585,6 +938,62 @@ pub fn sdpa_decode(
     Ok(out)
 }
 
+/// GQA-aware split-K flash-decode SDPA (MLX `sdpa_vector_2pass` port, head_dim
+/// 128). Pass 1: grid `(n_kv_heads, blocks)`, block `(32, gqa_factor)` — one
+/// simdgroup per Q-head of the group, so the `gqa_factor` heads SHARE each K/V
+/// load (the single-pass kernel re-reads the shared KV head `gqa_factor`× — at
+/// 32K that's the dominant cost). Each block-row strides a `1/blocks` slice of
+/// the KV positions, emitting per-block (max, sum, partial_o). Pass 2: grid
+/// `(n_q_heads)`, block 1024 — online-softmax merge of the `blocks` partials.
+/// `blocks` MUST be a multiple of 32 (pass-2 reducer constraint). Kernel math
+/// is registry-validated (`test_ffai_sdpa_decode_2pass_combined`, f32/f16/bf16).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_2pass(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_kv: u32,
+    kv_stride: u32,
+    gqa_factor: u32,
+    scale: f32,
+    blocks: u32,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    let n_q_heads = q.elem_count() / head_dim;
+    let n_kv_heads = n_q_heads / gqa_factor as usize;
+    let nb = blocks as usize;
+    let partial_o = Tensor::empty(dev, vec![n_q_heads * nb * head_dim], q.dtype)?;
+    let partial_m = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let partial_l = Tensor::empty(dev, vec![n_q_heads * nb], DType::F32)?;
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+
+    let k1 = cached_ir("sdpa_decode_2pass_pass1", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass1::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k1, &[
+        Binding::Buffer(q.buffer.clone()), Binding::Buffer(k.buffer.clone()), Binding::Buffer(v.buffer.clone()),
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        u(head_dim as u32), u(n_kv), u(kv_stride), u(gqa_factor), u(blocks), f(scale),
+    ], Grid { grid: [n_kv_heads as u32, blocks, 1], block: [32 * gqa_factor, 1, 1] })?;
+
+    let out = Tensor::empty(dev, vec![n_q_heads, head_dim], q.dtype)?;
+    let k2 = cached_ir("sdpa_decode_2pass_pass2", q.dtype, || {
+        let mut k = metaltile_std::ffai::sdpa_decode_2pass::sdpa_decode_2pass_pass2::kernel_ir_for(q.dtype);
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    dev.dispatch(&k2, &[
+        Binding::Buffer(partial_o.buffer.clone()), Binding::Buffer(partial_m.buffer.clone()), Binding::Buffer(partial_l.buffer.clone()),
+        Binding::Buffer(out.buffer.clone()), u(head_dim as u32), u(blocks),
+    ], Grid { grid: [n_q_heads as u32, 1, 1], block: [1024, 1, 1] })?;
+    Ok(out)
+}
+
 /// Run a registered elementwise kernel (Grid3D, one thread per element) with
 /// the given ordered bindings, producing a fresh `out`-shaped output.
 fn elementwise_kernel(
@@ -608,6 +1017,27 @@ fn elementwise_kernel(
 /// SiLU activation `out = x * sigmoid(x)`, elementwise. Dispatches `mt_silu`.
 pub fn silu(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     elementwise_kernel(dev, "mt_silu", x.dtype, x.shape.clone(), vec![Binding::Buffer(x.buffer.clone())])
+}
+
+/// ReLU² activation `out = max(x,0)²`, elementwise — NemotronH MoE expert act.
+/// Built inline (Relu → square) so the expert `up → relu² → down` chain stays
+/// ON-DEVICE (no host round-trip between the two Q8 GEMVs). Dispatches `mt_relu2`.
+pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+    let mut k = Kernel::new("mt_relu2");
+    for (pname, is_out) in [("a", false), ("c", true)] {
+        k.params.push(Param { name: pname.into(), dtype: x.dtype, shape: Shape::scalar(), is_output: is_out, kind: ParamKind::Tensor });
+    }
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(Op::Load { src: "a".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], mask: None, other: None }, ValueId::new(1));
+    k.body.push_op(Op::Activation { kind: ActKind::Relu, value: ValueId::new(1) }, ValueId::new(2));
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(2) }, ValueId::new(3));
+    k.body.push_op_no_result(Op::Store { dst: "c".into(), indices: vec![IndexExpr::Value(ValueId::new(0))], value: ValueId::new(3), mask: None });
+    k.mode = metaltile_core::ir::KernelMode::Elementwise;
+    let out = Tensor::empty(dev, x.shape.clone(), x.dtype)?;
+    let n = out.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(&k, &[Binding::Buffer(x.buffer.clone()), Binding::Buffer(out.buffer.clone())], grid)?;
+    Ok(out)
 }
 
 /// Build an Elementwise `out[i] = act(a[i])` kernel for `dtype`. (`mt_gelu`
@@ -637,6 +1067,31 @@ fn unary_act_kernel(name: &str, dtype: DType, kind: ActKind) -> Kernel {
         mask: None,
     });
     k
+}
+
+/// Fused multiply-add into an accumulator, elementwise IN-PLACE:
+/// `acc[i] += x[i] · s[i]`. Lets the MoE expert sum stay ON-DEVICE — each
+/// expert's `down` output is folded into `acc` on the GPU (one final download
+/// per layer instead of one per expert). `s` is the per-expert weight broadcast
+/// to `[len]`. Dispatches `mt_fma_inplace`.
+pub fn fma_inplace(dev: &dyn Device, acc: &Tensor, x: &Tensor, s: &Tensor) -> Result<()> {
+    let mut k = Kernel::new("mt_fma_inplace");
+    for (pname, is_out) in [("acc", true), ("x", false), ("s", false)] {
+        k.params.push(Param { name: pname.into(), dtype: acc.dtype, shape: Shape::scalar(), is_output: is_out, kind: ParamKind::Tensor });
+    }
+    let idx = || vec![IndexExpr::Value(ValueId::new(0))];
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(Op::Load { src: "acc".into(), indices: idx(), mask: None, other: None }, ValueId::new(1));
+    k.body.push_op(Op::Load { src: "x".into(), indices: idx(), mask: None, other: None }, ValueId::new(2));
+    k.body.push_op(Op::Load { src: "s".into(), indices: idx(), mask: None, other: None }, ValueId::new(3));
+    k.body.push_op(Op::BinOp { op: BinOpKind::Mul, lhs: ValueId::new(2), rhs: ValueId::new(3) }, ValueId::new(4));
+    k.body.push_op(Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(1), rhs: ValueId::new(4) }, ValueId::new(5));
+    k.body.push_op_no_result(Op::Store { dst: "acc".into(), indices: idx(), value: ValueId::new(5), mask: None });
+    k.mode = metaltile_core::ir::KernelMode::Elementwise;
+    let n = acc.elem_count() as u32;
+    let grid = Grid::d1(n.div_ceil(256), 256);
+    dev.dispatch(&k, &[Binding::Buffer(acc.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(s.buffer.clone())], grid)?;
+    Ok(())
 }
 
 /// GELU activation (PyTorch tanh approximation, = `gelu_pytorch_tanh`),

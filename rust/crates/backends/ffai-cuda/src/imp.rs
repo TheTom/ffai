@@ -36,6 +36,9 @@ pub struct CudaDevice {
     name: String,
     /// Compile-once cache: kernel name → loaded module.
     modules: RwLock<HashMap<String, Arc<CachedModule>>>,
+    /// Memoized shared-mem bytes per (kernel, block_x) — avoids re-walking the
+    /// kernel IR on every dispatch (hot in decode: ~hundreds of dispatches/token).
+    shared: RwLock<HashMap<(String, u32), u32>>,
 }
 
 impl CudaDevice {
@@ -48,6 +51,7 @@ impl CudaDevice {
                     dev: Arc::new(d),
                     name: format!("CUDA device (sm_{maj}{min})"),
                     modules: RwLock::new(HashMap::new()),
+                    shared: RwLock::new(HashMap::new()),
                 };
                 Ok(Some(Arc::new(dev)))
             }
@@ -99,7 +103,9 @@ impl DeviceBuffer for CudaBuffer {
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
-        self.dev.free_raw(self.ptr);
+        // Return to the device's size-bucketed pool instead of a synchronous
+        // cuMemFree — the hot decode path reuses these every token.
+        self.dev.free_raw_pooled(self.ptr, self.len);
     }
 }
 
@@ -146,7 +152,14 @@ impl Device for CudaDevice {
     fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()> {
         let module = self.module_for(kernel)?;
         let func = module.0.function(&kernel.name).map_err(dispatch_err)?;
-        let shared = CudaGenerator::new().shared_bytes(kernel, grid.block[0]) as u32;
+        let skey = (kernel.name.clone(), grid.block[0]);
+        let shared = if let Some(&s) = self.shared.read().unwrap().get(&skey) {
+            s
+        } else {
+            let s = CudaGenerator::new().shared_bytes(kernel, grid.block[0]) as u32;
+            self.shared.write().unwrap().insert(skey, s);
+            s
+        };
 
         // Marshal kernel args: device ptrs / scalar bytes in binding order,
         // then the synthetic _n_elems for Elementwise kernels. `ptr_store`
@@ -188,12 +201,24 @@ impl Device for CudaDevice {
             }
         }
 
+        // Async launch (no per-dispatch cuCtxSynchronize) — kernels pipeline on the
+        // ordered default stream; `download`/`synchronize` sync when results are read.
         self.dev
-            .launch(func, grid.grid, grid.block, shared, &mut args)
+            .launch_async(func, grid.grid, grid.block, shared, &mut args)
             .map_err(dispatch_err)
     }
 
     fn synchronize(&self) -> Result<()> {
         self.dev.synchronize().map_err(dispatch_err)
+    }
+
+    fn begin_capture(&self) -> Result<()> {
+        self.dev.begin_capture().map_err(dispatch_err)
+    }
+    fn end_capture(&self) -> Result<u64> {
+        self.dev.end_capture().map(|exec| exec as usize as u64).map_err(dispatch_err)
+    }
+    fn graph_launch(&self, exec: u64) -> Result<()> {
+        self.dev.graph_launch(exec as usize as *mut std::ffi::c_void).map_err(dispatch_err)
     }
 }

@@ -112,6 +112,20 @@ pub trait Device: Send + Sync {
 
     /// Block until all submitted work has completed.
     fn synchronize(&self) -> Result<()>;
+
+    /// CUDA-graph capture (megakernel). `begin_capture` starts recording stream
+    /// work; run an all-device (no host-sync) sequence; `end_capture` returns an
+    /// opaque executable-graph handle; `graph_launch` replays it as ONE launch.
+    /// Default impls error (backend without graph support). Returns handle as u64.
+    fn begin_capture(&self) -> Result<()> {
+        Err(Error::Msg("graph capture unsupported on this backend".into()))
+    }
+    fn end_capture(&self) -> Result<u64> {
+        Err(Error::Msg("graph capture unsupported on this backend".into()))
+    }
+    fn graph_launch(&self, _exec: u64) -> Result<()> {
+        Err(Error::Msg("graph capture unsupported on this backend".into()))
+    }
 }
 
 /// A handle to a region of device memory + shape + dtype. Backend-neutral:

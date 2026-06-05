@@ -524,3 +524,515 @@ pub fn verify_falcon_h1(d: &dyn Device, plat: &str) {
     assert_eq!(&idx[..3], &[593usize, 531, 587], "Falcon-H1 top-3 != HF");
     eprintln!("✅ Falcon-H1-0.5B (hybrid Mamba2+attn) matches HF ({plat}).");
 }
+
+/// NemotronH-Nano-Omni-30B-A3B (text backbone): 52-layer M/E/* hybrid.
+/// pattern MEMEM*EMEMEM*… (M=Mamba2 mixer, E=128-expert MoE relu², *=GQA attn).
+/// Single mixer per layer, pre-norm residual. BF16 weights → F32 on-device.
+/// Verified against an HF-transformers CPU oracle (set NEMOTRON_ARGMAX).
+pub fn verify_nemotron(d: &dyn Device, plat: &str) {
+    use ffai_ops::{conv1d_causal_step, rms_norm, rope_llama, silu, ssm_step};
+    const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
+    let dir = std::env::var("NEMOTRON_DIR")
+        .unwrap_or_else(|_| "/home/pidtom/models/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16".into());
+    let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
+    let (hid, vocab, eps) = (2688usize, 131072usize, 1e-5f32);
+    // Mamba2: d_inner 4096 (64h×64), n_groups 8, d_state 128, conv_kernel 4.
+    let (di, m_nh, m_dh, ds, ng, kc) = (4096usize, 64usize, 64usize, 128usize, 8usize, 4usize);
+    let conv_dim = di + 2 * ng * ds;            // 6144
+    let in_proj_out = 2 * di + 2 * ng * ds + m_nh; // 10304
+    // MoE: 128 experts top-6, relu² ungated, shared 3712, sigmoid+bias router, ×2.5.
+    let (n_exp, top_k, inter, shared_inter, scale_f) = (128usize, 6usize, 1856usize, 3712usize, 2.5f32);
+    // Attn: GQA 32q/2kv hd128, rope θ1e4.
+    let (nq, nkv, hd, rope_theta) = (32usize, 2usize, 128usize, 10000f32);
+    let (qdim, kvdim) = (nq * hd, nkv * hd); // 4096, 256
+    let ascale = 1.0 / (hd as f32).sqrt();
+
+    // Coarse perf accounting: how much of a token is weight dequant (CPU BF16→F32)
+    // vs host↔device transfer vs everything else (GPU op dispatch). This baseline
+    // quantifies the resident-weights + quant headroom.
+    use std::cell::Cell;
+    use std::time::Instant;
+    let t_deq = Cell::new(0f64); // BF16→F32 dequant + mmap read
+    let t_xfer = Cell::new(0f64); // upload + download bytes
+    let g = |name: &str| -> Vec<f32> { let t = Instant::now(); let r = st.tensor_f32(name).unwrap().0; t_deq.set(t_deq.get() + t.elapsed().as_secs_f64()); r };
+    let up = |v: &[f32]| -> Tensor { let t = Instant::now(); let b = d.upload(&tb(v)).unwrap(); t_xfer.set(t_xfer.get() + t.elapsed().as_secs_f64()); Tensor::new(b, vec![v.len()], DType::F32) };
+    let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { let t = Instant::now(); let b = d.upload(&tb(v)).unwrap(); t_xfer.set(t_xfer.get() + t.elapsed().as_secs_f64()); Tensor::new(b, sh, DType::F32) };
+    let dl = |t: &Tensor, n: usize| -> Vec<f32> { let s = Instant::now(); let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); let r = fb(&b); t_xfer.set(t_xfer.get() + s.elapsed().as_secs_f64()); r };
+    let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+    let relu2 = |v: &mut [f32]| for x in v.iter_mut() { let r = x.max(0.0); *x = r * r; };
+    let t_total = Instant::now();
+
+    let token: usize = std::env::var("NEMOTRON_TOKEN").ok().and_then(|s| s.parse().ok()).unwrap_or(1234);
+    let embed = g("language_model.backbone.embeddings.weight");
+    let mut x: Vec<f32> = embed[token * hid..(token + 1) * hid].to_vec();
+    let enorm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+    eprintln!("Nemotron: token {token} embed‖·‖={enorm:.3}");
+    let dump = std::env::var("NEMOTRON_DUMP").is_ok();
+    let fp = |tag: &str, v: &[f32]| {
+        let n = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+        eprintln!("{tag} norm={n:.4} head={:?}", v[..4].iter().map(|a| (a * 10000.0).round() / 10000.0).collect::<Vec<_>>());
+    };
+    if dump { fp("L00", &x); }
+
+    for (l, mix) in PATTERN.chars().enumerate() {
+        let p = format!("language_model.backbone.layers.{l}");
+        let xn = rms_norm(d, &up(&x), &up(&g(&format!("{p}.norm.weight"))), eps).unwrap();
+        match mix {
+            'M' => {
+                let in_proj = upm(&g(&format!("{p}.mixer.in_proj.weight")), vec![in_proj_out, hid]);
+                let proj = dl(&gemv(d, &in_proj, &xn).unwrap(), in_proj_out);
+                let z = &proj[0..di];
+                let xbc = &proj[di..di + conv_dim];
+                let dt_raw = &proj[di + conv_dim..di + conv_dim + m_nh];
+                let cw_hf = g(&format!("{p}.mixer.conv1d.weight"));
+                let mut cw = vec![0.0f32; kc * conv_dim];
+                for ch in 0..conv_dim { for k in 0..kc { cw[k * conv_dim + ch] = cw_hf[ch * kc + k]; } }
+                let cb = g(&format!("{p}.mixer.conv1d.bias"));
+                let state0 = vec![0.0f32; (kc - 1) * conv_dim];
+                let yc = conv1d_causal_step(d, &up(xbc), &up(&cw), &up(&cb), &up(&state0), conv_dim as u32, kc as u32).unwrap();
+                let xbc_act = dl(&silu(d, &yc).unwrap(), conv_dim);
+                let x_ssm = &xbc_act[0..di];
+                let bmat = &xbc_act[di..di + ng * ds];
+                let cmat = &xbc_act[di + ng * ds..di + 2 * ng * ds];
+                let dt_bias = g(&format!("{p}.mixer.dt_bias"));
+                let dt: Vec<f32> = (0..m_nh).map(|i| softplus(dt_raw[i] + dt_bias[i])).collect();
+                let a_log = g(&format!("{p}.mixer.A_log"));
+                let dsk = g(&format!("{p}.mixer.D"));
+                let state_in = vec![0.0f32; m_nh * m_dh * ds];
+                let (_so, y_t) = ssm_step(d, &up(x_ssm), &up(&a_log), &up(bmat), &up(cmat), &up(&dsk), &up(&dt), &up(&state_in), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap();
+                let y = dl(&y_t, di);
+                let sz = dl(&silu(d, &up(z)).unwrap(), di);
+                let y_gated: Vec<f32> = (0..di).map(|i| y[i] * sz[i]).collect();
+                // Zamba2RMSNormGated: group-wise RMSNorm (group_size = d_inner/n_groups),
+                // gate applied before, weight after. NOT a full-vector RMSNorm.
+                let nw = g(&format!("{p}.mixer.norm.weight"));
+                let gs = di / ng; // 512
+                let mut yn = vec![0.0f32; di];
+                for grp in 0..ng {
+                    let s = grp * gs;
+                    let seg = dl(&rms_norm(d, &up(&y_gated[s..s + gs]), &up(&nw[s..s + gs]), eps).unwrap(), gs);
+                    yn[s..s + gs].copy_from_slice(&seg);
+                }
+                let out = dl(&gemv(d, &upm(&g(&format!("{p}.mixer.out_proj.weight")), vec![hid, di]), &up(&yn)).unwrap(), hid);
+                for i in 0..hid { x[i] += out[i]; }
+            }
+            'E' => {
+                let rl = dl(&gemv(d, &upm(&g(&format!("{p}.mixer.gate.weight")), vec![n_exp, hid]), &xn).unwrap(), n_exp);
+                let sig: Vec<f32> = rl.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
+                let bias = g(&format!("{p}.mixer.gate.e_score_correction_bias"));
+                let choice: Vec<f32> = (0..n_exp).map(|i| sig[i] + bias[i]).collect();
+                let eidx = ffai_runtime::topk(&choice, top_k);
+                let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
+                let wsum: f32 = w.iter().sum::<f32>() + 1e-20;
+                for v in w.iter_mut() { *v = *v / wsum * scale_f; }
+                let mut acc = vec![0.0f32; hid];
+                for (j, &e) in eidx.iter().enumerate() {
+                    let ep = format!("{p}.mixer.experts.{e}");
+                    let mut a = dl(&gemv(d, &upm(&g(&format!("{ep}.up_proj.weight")), vec![inter, hid]), &xn).unwrap(), inter);
+                    relu2(&mut a);
+                    let de = dl(&gemv(d, &upm(&g(&format!("{ep}.down_proj.weight")), vec![hid, inter]), &up(&a)).unwrap(), hid);
+                    for i in 0..hid { acc[i] += w[j] * de[i]; }
+                }
+                // shared expert (relu², inter 3712)
+                let mut sa = dl(&gemv(d, &upm(&g(&format!("{p}.mixer.shared_experts.up_proj.weight")), vec![shared_inter, hid]), &xn).unwrap(), shared_inter);
+                relu2(&mut sa);
+                let sde = dl(&gemv(d, &upm(&g(&format!("{p}.mixer.shared_experts.down_proj.weight")), vec![hid, shared_inter]), &up(&sa)).unwrap(), hid);
+                for i in 0..hid { x[i] += acc[i] + sde[i]; }
+            }
+            '*' => {
+                let q = gemv(d, &upm(&g(&format!("{p}.mixer.q_proj.weight")), vec![qdim, hid]), &xn).unwrap();
+                let k = gemv(d, &upm(&g(&format!("{p}.mixer.k_proj.weight")), vec![kvdim, hid]), &xn).unwrap();
+                let v = gemv(d, &upm(&g(&format!("{p}.mixer.v_proj.weight")), vec![kvdim, hid]), &xn).unwrap();
+                let q = rope_llama(d, &q.reshaped(vec![nq, hd]), 0, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
+                let k = rope_llama(d, &k.reshaped(vec![nkv, hd]), 0, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
+                let attn = sdpa_decode(d, &q, &k, &v.reshaped(vec![nkv, hd]), hd, 1, 1, (nq / nkv) as u32, ascale).unwrap();
+                let o = dl(&gemv(d, &upm(&g(&format!("{p}.mixer.o_proj.weight")), vec![hid, qdim]), &attn.reshaped(vec![qdim])).unwrap(), hid);
+                for i in 0..hid { x[i] += o[i]; }
+            }
+            _ => unreachable!("bad pattern char"),
+        }
+        if dump { fp(&format!("L{:02}[{mix}]", l + 1), &x); }
+    }
+    let xf = rms_norm(d, &up(&x), &up(&g("language_model.backbone.norm_f.weight")), eps).unwrap();
+    let logits = dl(&gemv(d, &upm(&g("language_model.lm_head.weight"), vec![vocab, hid]), &xf).unwrap(), vocab);
+    let argmax = ffai_runtime::argmax(&logits);
+    let idx = ffai_runtime::topk(&logits, 5);
+    let total = t_total.elapsed().as_secs_f64();
+    let (deq, xfer) = (t_deq.get(), t_xfer.get());
+    let compute = (total - deq - xfer).max(0.0);
+    eprintln!("──────── NemotronH-Nano BASELINE (1 token, F32, naive re-load) ────────");
+    eprintln!("  total      {total:7.1}s   ({:.3} tok/s)", 1.0 / total);
+    eprintln!("  dequant    {deq:7.1}s   {:.0}%  (CPU BF16→F32; gone once weights are quantized+resident)", 100.0 * deq / total);
+    eprintln!("  transfer   {xfer:7.1}s   {:.0}%  (host↔device; gone once weights resident)", 100.0 * xfer / total);
+    eprintln!("  compute    {compute:7.1}s   {:.0}%  (GPU op dispatch — the resident-decode floor in F32)", 100.0 * compute / total);
+    eprintln!("  ⇒ resident-weights ceiling ≈ {:.2} tok/s (F32 compute only); quant+fusion cuts further", 1.0 / compute.max(1e-3));
+    eprintln!("───────────────────────────────────────────────────────────────────────");
+    eprintln!("NemotronH-Nano text forward on {plat}: argmax={argmax} top5={:?}", &idx[..5]);
+    if let Ok(exp) = std::env::var("NEMOTRON_ARGMAX") {
+        assert_eq!(argmax, exp.parse::<usize>().unwrap(), "Nemotron argmax != HF");
+    } else if token == 1234 {
+        // HF-transformers CPU oracle (NemotronHForCausalLM, bf16, naive Mamba2 path).
+        assert_eq!(&idx[..5], &[1234usize, 99493, 99391, 67501, 49418], "Nemotron top5 != HF oracle");
+        eprintln!("✅ NemotronH-Nano-30B-A3B text backbone matches HF ({plat}).");
+    }
+}
+
+/// NemotronH-Nano-30B-A3B **resident Q8 decode benchmark**: quantize every big
+/// matrix to Q8_0 and upload it ONCE (resident), then run a real decode loop —
+/// per-token forward reuses the resident weights via [`gemv_q8`], carries an
+/// attention KV cache (6 layers) + Mamba2 conv/SSM state (23 layers), and times
+/// steady-state tok/s. This is the path off the 0.003 tok/s naive-reload floor.
+/// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
+/// this context length before timing, default 0).
+pub fn bench_nemotron(d: &dyn Device, plat: &str) {
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_step, conv_roll, gated_group_rmsnorm, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, kv_append, moe_gather_down, moe_gather_up_relu2, moe_router_device, moe_weighted_sum, mul, quantize_q4, rms_norm, rope_llama, silu, slice, sdpa_decode, sdpa_decode_2pass, softplus_add, ssm_step};
+    use std::collections::HashMap;
+    use std::time::Instant;
+    const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
+    let dir = std::env::var("NEMOTRON_DIR")
+        .unwrap_or_else(|_| "/home/pidtom/models/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16".into());
+    let Ok(st) = SafeTensors::open_dir(&dir) else { eprintln!("no model at {dir} — skipping"); return; };
+    let (hid, vocab, eps) = (2688usize, 131072usize, 1e-5f32);
+    let (di, m_nh, m_dh, ds, ng, kc) = (4096usize, 64usize, 64usize, 128usize, 8usize, 4usize);
+    let conv_dim = di + 2 * ng * ds;
+    let in_proj_out = 2 * di + 2 * ng * ds + m_nh;
+    let (n_exp, top_k, inter, shared_inter, scale_f) = (128usize, 6usize, 1856usize, 3712usize, 2.5f32);
+    let (nq, nkv, hd, rope_theta) = (32usize, 2usize, 128usize, 10000f32);
+    let (qdim, kvdim) = (nq * hd, nkv * hd);
+    let ascale = 1.0 / (hd as f32).sqrt();
+    let gs = di / ng;
+
+    let tbu = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    // f32 → f16 (round-to-nearest-even, positive normals; Q4 scales = amax/7 are in range).
+    fn f32_to_f16(f: f32) -> u16 {
+        let x = f.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let e = ((x >> 23) & 0xff) as i32 - 112; // 127 - 15
+        if e <= 0 { return sign; }
+        if e >= 0x1f { return sign | 0x7c00; }
+        let m = (x >> 13) & 0x3ff;
+        let round = (x >> 12) & 1;
+        let v = ((e as u32) << 10) | m;
+        sign | ((v + round) as u16)
+    }
+    let tb_f16 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&f| f32_to_f16(f).to_le_bytes()).collect() };
+    let g = |name: &str| -> Vec<f32> { st.tensor_f32(name).unwrap().0 };
+    let up = |v: &[f32]| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), vec![v.len()], DType::F32) };
+    let upm = |v: &[f32], sh: Vec<usize>| -> Tensor { Tensor::new(d.upload(&tb(v)).unwrap(), sh, DType::F32) };
+    let dl = |t: &Tensor, n: usize| -> Vec<f32> { let mut b = vec![0u8; n * 4]; d.download(t.buffer.as_ref(), &mut b).unwrap(); fb(&b) };
+    let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+    // ── SETUP: quantize + upload all big matrices to Q8 resident (once) ──
+    let t_load = Instant::now();
+    let mut qw: HashMap<String, (Tensor, Tensor, usize, usize)> = HashMap::new(); // name → (qs, scales, m, k)
+    let mut fw: HashMap<String, Vec<f32>> = HashMap::new(); // f32 weights used HOST-side
+    let mut fwd: HashMap<String, Tensor> = HashMap::new(); // f32 weights RESIDENT on device
+    let fd = |fwd: &mut HashMap<String, Tensor>, name: &str, v: &[f32], shape: Vec<usize>| {
+        fwd.insert(name.to_string(), Tensor::new(d.upload(&tb(v)).unwrap(), shape, DType::F32));
+    };
+    // f16: true for weights read by the PLAIN gemv kernel (qmv) — its scale param
+    // is f16. false for shared-expert weights (relu2/accum kernels, f32 scale).
+    let qload = |qw: &mut HashMap<String, (Tensor, Tensor, usize, usize)>, name: &str, m: usize, k: usize, f16: bool| {
+        let w = g(name);
+        let (qs, sc) = quantize_q4(&w, m, k);
+        let qt = Tensor::new(d.upload(&tbu(&qs)).unwrap(), vec![qs.len()], DType::U32);
+        let sct = if f16 {
+            Tensor::new(d.upload(&tb_f16(&sc)).unwrap(), vec![sc.len()], DType::F16)
+        } else {
+            Tensor::new(d.upload(&tb(&sc)).unwrap(), vec![sc.len()], DType::F32)
+        };
+        qw.insert(name.to_string(), (qt, sct, m, k));
+    };
+    let embed = g("language_model.backbone.embeddings.weight"); // host lookup table
+    fd(&mut fwd, "norm_f", &g("language_model.backbone.norm_f.weight"), vec![hid]);
+    qload(&mut qw, "language_model.lm_head.weight", vocab, hid, true);
+    for (l, mix) in PATTERN.chars().enumerate() {
+        let p = format!("language_model.backbone.layers.{l}");
+        fd(&mut fwd, &format!("{p}.norm.weight"), &g(&format!("{p}.norm.weight")), vec![hid]);
+        match mix {
+            'M' => {
+                qload(&mut qw, &format!("{p}.mixer.in_proj.weight"), in_proj_out, hid, true);
+                qload(&mut qw, &format!("{p}.mixer.out_proj.weight"), hid, di, true);
+                // conv weight pre-reorganized [kc, conv_dim] ONCE (was redone per step).
+                let cw_hf = g(&format!("{p}.mixer.conv1d.weight"));
+                let mut cw = vec![0.0f32; kc * conv_dim];
+                for ch in 0..conv_dim { for kk in 0..kc { cw[kk * conv_dim + ch] = cw_hf[ch * kc + kk]; } }
+                fd(&mut fwd, &format!("{p}.mixer.conv1d.weight"), &cw, vec![kc * conv_dim]);
+                fd(&mut fwd, &format!("{p}.mixer.conv1d.bias"), &g(&format!("{p}.mixer.conv1d.bias")), vec![conv_dim]);
+                fd(&mut fwd, &format!("{p}.mixer.A_log"), &g(&format!("{p}.mixer.A_log")), vec![m_nh]);
+                fd(&mut fwd, &format!("{p}.mixer.D"), &g(&format!("{p}.mixer.D")), vec![m_nh]);
+                fw.insert(format!("{p}.mixer.dt_bias"), g(&format!("{p}.mixer.dt_bias")));     // host (softplus, tiny)
+                fw.insert(format!("{p}.mixer.norm.weight"), g(&format!("{p}.mixer.norm.weight")));
+            }
+            'E' => {
+                fd(&mut fwd, &format!("{p}.mixer.gate.weight"), &g(&format!("{p}.mixer.gate.weight")), vec![n_exp, hid]);
+                fw.insert(format!("{p}.mixer.gate.e_score_correction_bias"), g(&format!("{p}.mixer.gate.e_score_correction_bias")));
+                // Experts stored CONTIGUOUS ([n_exp*inter, hid] up, [n_exp*hid, inter] down)
+                // so the batched gather kernel runs them as one big efficient GEMV.
+                let (mut uqs, mut usc, mut dqs, mut dsc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for e in 0..n_exp {
+                    let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.up_proj.weight")), inter, hid);
+                    uqs.extend(q); usc.extend(s);
+                    let (q, s) = quantize_q4(&g(&format!("{p}.mixer.experts.{e}.down_proj.weight")), hid, inter);
+                    dqs.extend(q); dsc.extend(s);
+                }
+                qw.insert(format!("{p}.moe_up_all"), (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                qw.insert(format!("{p}.moe_down_all"), (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                qload(&mut qw, &format!("{p}.mixer.shared_experts.up_proj.weight"), shared_inter, hid, true);
+                qload(&mut qw, &format!("{p}.mixer.shared_experts.down_proj.weight"), hid, shared_inter, true);
+            }
+            '*' => {
+                qload(&mut qw, &format!("{p}.mixer.q_proj.weight"), qdim, hid, true);
+                qload(&mut qw, &format!("{p}.mixer.k_proj.weight"), kvdim, hid, true);
+                qload(&mut qw, &format!("{p}.mixer.v_proj.weight"), kvdim, hid, true);
+                qload(&mut qw, &format!("{p}.mixer.o_proj.weight"), hid, qdim, true);
+            }
+            _ => unreachable!(),
+        }
+    }
+    let load_s = t_load.elapsed().as_secs_f64();
+    eprintln!("Nemotron resident-Q8 setup: {:.1}s ({} Q8 matrices, ~{:.1}GB)", load_s, qw.len(), qw.values().map(|(q, s, _, _)| (q.elem_count() * 4 + s.elem_count() * 4) as f64).sum::<f64>() / 1e9);
+
+    // resident-weight quantized matvec
+    let qmv = |x: &Tensor, name: &str| -> Tensor {
+        let (qs, sc, m, k) = &qw[name];
+        gemv_q4(d, qs, sc, x, *m, *k, *m).unwrap()
+    };
+    // resident-weight matvec that scales + accumulates into `acc` in one kernel.
+    let qacc = |x: &Tensor, name: &str, acc: &Tensor, sb: &Tensor| {
+        let (qs, sc, m, k) = &qw[name];
+        gemv_q4_accum(d, qs, sc, x, acc, sb, *m, *k, *m).unwrap();
+    };
+    // resident-weight matvec with fused ReLU² (MoE expert up-projection).
+    let qrelu2 = |x: &Tensor, name: &str| -> Tensor {
+        let (qs, sc, m, k) = &qw[name];
+        gemv_q4_relu2(d, qs, sc, x, *m, *k, *m).unwrap()
+    };
+
+    // ── DECODE: per-token forward reusing resident weights, KV + Mamba state ──
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let prefill = env("NEMOTRON_PREFILL", 0);
+    let n_decode = env("NEMOTRON_DECODE", 32);
+    let fakectx = env("NEMOTRON_FAKECTX", 0);
+    // GQA split-K flash-decode sdpa: default ON for long context (≈+15-25% @ 32K
+    // where the single-pass re-reads each shared KV head gqa_factor×); single-pass
+    // is marginally better at tiny ctx (2-pass partial overhead). Opt out w/ NEMOTRON_NO_2PASS.
+    let no_2pass = std::env::var("NEMOTRON_NO_2PASS").is_ok();
+    // Device MoE router REGRESSED (-17-24%, clock-locked): the 1-simdgroup serial
+    // top-k bubble underutilizes the GPU worse than host top-k + a cheap sync drain
+    // (same lesson as device-Mamba). Host router is DEFAULT; device is opt-in only.
+    let no_devrouter = !std::env::var("NEMOTRON_DEVROUTER").is_ok();
+    // F16 KV cache: the clock-locked "+11-27%" was a thermal/order artifact (the
+    // internal A/B shows it neutral-to-negative — casts cost ≥ halved-read saves).
+    // DEFAULT OFF (f32, no casts); opt in with NEMOTRON_F16KV.
+    let f16kv = std::env::var("NEMOTRON_F16KV").is_ok();
+    let cap = fakectx.max(prefill) + n_decode + 8; // KV-cache capacity (positions)
+    // per-layer state, indexed by absolute layer id. KV cache is now ON-DEVICE
+    // ([nkv,cap,hd] per attn layer), so the growing context never round-trips
+    // through the host — the 32K decode fix.
+    let mut conv_state: Vec<Vec<f32>> = vec![Vec::new(); 52];
+    let conv_dev: std::cell::RefCell<Vec<Option<Tensor>>> = std::cell::RefCell::new((0..52).map(|_| None).collect()); // device conv state (NEMOTRON_DEVMAMBA)
+    let mut ssm_state: Vec<Option<Tensor>> = (0..52).map(|_| None).collect(); // recurrent SSM state ON-DEVICE
+    let mut kvcache: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
+    let u32buf = |v: u32| Tensor::new(d.upload(&v.to_le_bytes()).unwrap(), vec![1], DType::U32);
+    let ones_gs = up(&vec![1.0f32; gs]); // grouped-norm: normalize each 512-group weightless, then scale by the real weight
+    // Optional per-section profiling (NEMOTRON_PROFILE=1): synchronize around each
+    // mixer type to attribute the per-token time. Adds sync overhead — proportions only.
+    let prof = std::env::var("NEMOTRON_PROFILE").is_ok();
+    let (tm, te, ta, th) = (std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64));
+
+    // one decode step at absolute position `pos`; returns next-token logits' argmax
+    let step = |token: usize, pos: usize,
+                    conv_state: &mut Vec<Vec<f32>>, ssm_state: &mut Vec<Option<Tensor>>,
+                    kvcache: &mut Vec<Option<(Tensor, Tensor)>>| -> usize {
+        // residual stream stays ON-DEVICE the whole forward — no per-layer up(x)/dl(out).
+        let mut xt = up(&embed[token * hid..(token + 1) * hid]);
+        for (l, mix) in PATTERN.chars().enumerate() {
+            let p = format!("language_model.backbone.layers.{l}");
+            let pt = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
+            let xn = rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap();
+            match mix {
+                'M' => {
+                    if std::env::var("NEMOTRON_SKIPMAMBA").is_ok() { continue; }
+                    if !std::env::var("NEMOTRON_HOSTMAMBA").is_ok() {
+                        // ALL-DEVICE Mamba (DEFAULT): no dl/host round-trips. +3.7% clean
+                        // internal A/B; argmax 1234. Opt out: NEMOTRON_HOSTMAMBA.
+                        let proj = qmv(&xn, &format!("{p}.mixer.in_proj.weight"));
+                        let zt = slice(d, &proj, 0, di).unwrap();
+                        let xbc_t = slice(d, &proj, di, conv_dim).unwrap();
+                        let dt_raw_t = slice(d, &proj, di + conv_dim, m_nh).unwrap();
+                        { let mut cd = conv_dev.borrow_mut(); if cd[l].is_none() { cd[l] = Some(up(&vec![0.0f32; (kc - 1) * conv_dim])); } }
+                        let yc = { let cd = conv_dev.borrow(); conv1d_causal_step(d, &xbc_t, &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], cd[l].as_ref().unwrap(), conv_dim as u32, kc as u32).unwrap() };
+                        let xbc_act = silu(d, &yc).unwrap();
+                        { let mut cd = conv_dev.borrow_mut(); let rolled = conv_roll(d, cd[l].as_ref().unwrap(), &xbc_t, conv_dim, kc).unwrap(); cd[l] = Some(rolled); }
+                        let x_ssm = slice(d, &xbc_act, 0, di).unwrap();
+                        let bmat = slice(d, &xbc_act, di, ng * ds).unwrap();
+                        let cmat = slice(d, &xbc_act, di + ng * ds, ng * ds).unwrap();
+                        let dt = softplus_add(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")])).unwrap();
+                        if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                        let (so, y_t) = ssm_step(d, &x_ssm, &fwd[&format!("{p}.mixer.A_log")], &bmat, &cmat, &fwd[&format!("{p}.mixer.D")], &dt, ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap();
+                        ssm_state[l] = Some(so);
+                        let yn = gated_group_rmsnorm(d, &y_t, &zt, &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, di, gs).unwrap();
+                        let out = qmv(&yn, &format!("{p}.mixer.out_proj.weight"));
+                        xt = add(d, &xt, &out).unwrap();
+                        continue;
+                    }
+                    let proj = dl(&qmv(&xn, &format!("{p}.mixer.in_proj.weight")), in_proj_out);
+                    let z = &proj[0..di];
+                    let xbc = &proj[di..di + conv_dim];
+                    let dt_raw = &proj[di + conv_dim..di + conv_dim + m_nh];
+                    if conv_state[l].is_empty() { conv_state[l] = vec![0.0f32; (kc - 1) * conv_dim]; }
+                    let yc = conv1d_causal_step(d, &up(xbc), &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], &up(&conv_state[l]), conv_dim as u32, kc as u32).unwrap();
+                    let xbc_act = dl(&silu(d, &yc).unwrap(), conv_dim);
+                    { let s = &mut conv_state[l]; s.drain(0..conv_dim); s.extend_from_slice(xbc); }
+                    let x_ssm = &xbc_act[0..di];
+                    let bmat = &xbc_act[di..di + ng * ds];
+                    let cmat = &xbc_act[di + ng * ds..di + 2 * ng * ds];
+                    let dt_bias = &fw[&format!("{p}.mixer.dt_bias")];
+                    let dt: Vec<f32> = (0..m_nh).map(|i| softplus(dt_raw[i] + dt_bias[i])).collect();
+                    if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                    let (so, y_t) = ssm_step(d, &up(x_ssm), &fwd[&format!("{p}.mixer.A_log")], &up(bmat), &up(cmat), &fwd[&format!("{p}.mixer.D")], &up(&dt), ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap();
+                    ssm_state[l] = Some(so);
+                    let y = dl(&y_t, di);
+                    let nw = &fw[&format!("{p}.mixer.norm.weight")];
+                    let mut yn = vec![0.0f32; di];
+                    for grp in 0..ng {
+                        let s = grp * gs;
+                        let mut ss = 0.0f32;
+                        for i in 0..gs { let g = y[s + i] * (z[s + i] / (1.0 + (-z[s + i]).exp())); yn[s + i] = g; ss += g * g; }
+                        let r = 1.0 / ((ss / gs as f32) + eps).sqrt();
+                        for i in 0..gs { yn[s + i] = yn[s + i] * r * nw[s + i]; }
+                    }
+                    let out = qmv(&up(&yn), &format!("{p}.mixer.out_proj.weight"));
+                    xt = add(d, &xt, &out).unwrap();
+                }
+                'E' => {
+                    if std::env::var("NEMOTRON_SKIPMOE").is_ok() { continue; }
+                    // Router: ON-DEVICE (sigmoid+bias+top-k+norm+scale, no host sync) by
+                    // default; host path kept for A/B via NEMOTRON_HOSTROUTER.
+                    let (idx_buf, wts_buf) = if !std::env::var("NEMOTRON_DEVROUTER").is_ok() {
+                        let rl = dl(&gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap(), n_exp);
+                        let sig: Vec<f32> = rl.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
+                        let bias = &fw[&format!("{p}.mixer.gate.e_score_correction_bias")];
+                        let choice: Vec<f32> = (0..n_exp).map(|i| sig[i] + bias[i]).collect();
+                        let eidx = ffai_runtime::topk(&choice, top_k);
+                        let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
+                        let wsum: f32 = w.iter().sum::<f32>() + 1e-20;
+                        for v in w.iter_mut() { *v = *v / wsum * scale_f; }
+                        (Tensor::new(d.upload(&tbu(&eidx.iter().map(|&e| e as u32).collect::<Vec<_>>())).unwrap(), vec![top_k], DType::U32), up(&w))
+                    } else {
+                        let logits = gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap();
+                        let bias_dev = up(&fw[&format!("{p}.mixer.gate.e_score_correction_bias")]);
+                        moe_router_device(d, &logits, &bias_dev, n_exp, top_k, scale_f).unwrap()
+                    };
+                    let acc_dev = up(&vec![0.0f32; hid]);
+                    let (uqs, usc, _, _) = &qw[&format!("{p}.moe_up_all")];
+                    let a = moe_gather_up_relu2(d, uqs, usc, &xn, &idx_buf, top_k, inter, hid).unwrap();
+                    let (dqs, dsc, _, _) = &qw[&format!("{p}.moe_down_all")];
+                    let downs = moe_gather_down(d, dqs, dsc, &a, &idx_buf, top_k, inter, hid).unwrap();
+                    moe_weighted_sum(d, &downs, &wts_buf, &acc_dev, hid, top_k).unwrap();
+                    // shared expert (single, not gathered)
+                    let sa = qrelu2(&xn, &format!("{p}.mixer.shared_experts.up_proj.weight"));
+                    qacc(&sa, &format!("{p}.mixer.shared_experts.down_proj.weight"), &acc_dev, &up(&[1.0f32]));
+                    xt = add(d, &xt, &acc_dev).unwrap();
+                }
+                '*' => {
+                    // q/k/v + RoPE stay ON-DEVICE; append k,v straight into the
+                    // device KV cache; sdpa reads the cache. No host KV traffic.
+                    let q = rope_llama(d, &qmv(&xn, &format!("{p}.mixer.q_proj.weight")).reshaped(vec![nq, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
+                    let k = rope_llama(d, &qmv(&xn, &format!("{p}.mixer.k_proj.weight")).reshaped(vec![nkv, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
+                    let v = qmv(&xn, &format!("{p}.mixer.v_proj.weight"));
+                    // F16 KV: halve the 32K KV read (sdpa = 34% of GPU). Cache + q/k/v in
+                    // f16, 2pass reads them natively (registry-tested f16), attn→f32 for o_proj.
+                    let (q, k, v) = if f16kv {
+                        (cast_f32_f16(d, &q).unwrap(), cast_f32_f16(d, &k).unwrap(), cast_f32_f16(d, &v).unwrap())
+                    } else { (q, k, v) };
+                    if kvcache[l].is_none() {
+                        kvcache[l] = if f16kv {
+                            let zf16 = || Tensor::new(d.upload(&vec![0u8; nkv * cap * hd * 2]).unwrap(), vec![nkv * cap * hd], DType::F16);
+                            Some((zf16(), zf16()))
+                        } else {
+                            Some((up(&vec![0.0f32; nkv * cap * hd]), up(&vec![0.0f32; nkv * cap * hd])))
+                        };
+                    }
+                    let (kcache, vcache) = kvcache[l].as_ref().unwrap();
+                    let pb = u32buf(pos as u32);
+                    kv_append(d, &k, kcache, &pb, hd, cap, nkv * hd).unwrap();
+                    kv_append(d, &v, vcache, &pb, hd, cap, nkv * hd).unwrap();
+                    let len = (pos + 1) as u32;
+                    // Diagnostic: skip the sdpa (placeholder output, right shape) to measure
+                    // its wall-time contribution via the internal A/B (NEMOTRON_AB=NEMOTRON_SKIPSDPA).
+                    let attn = if std::env::var("NEMOTRON_SKIPSDPA").is_ok() {
+                        q.clone()
+                    } else if !no_2pass && len > 1024 {
+                        let blocks: u32 = if len <= 1024 { 32 } else if len <= 8192 { 128 } else { 256 };
+                        let a = sdpa_decode_2pass(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap();
+                        if f16kv { cast_f16_f32(d, &a).unwrap() } else { a }
+                    } else {
+                        let a = sdpa_decode(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale).unwrap();
+                        if f16kv { cast_f16_f32(d, &a).unwrap() } else { a }
+                    };
+                    let o = qmv(&attn.reshaped(vec![qdim]), &format!("{p}.mixer.o_proj.weight"));
+                    xt = add(d, &xt, &o).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            if let Some(pt) = pt { d.synchronize().ok(); let e = pt.elapsed().as_secs_f64(); let c = match mix { 'M' => &tm, 'E' => &te, _ => &ta }; c.set(c.get() + e); }
+        }
+        let ht = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
+        let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap();
+        let logits = dl(&qmv(&xf, "language_model.lm_head.weight"), vocab);
+        if let Some(ht) = ht { d.synchronize().ok(); th.set(th.get() + ht.elapsed().as_secs_f64()); }
+        ffai_runtime::argmax(&logits)
+    };
+
+    let mut tok = 1234usize;
+    let mut pos = 0usize;
+    // For the 32K measurement, start at `fakectx` (the device KV cache is alloc'd
+    // to `cap` and zero-filled on first use, so the sdpa genuinely reads `fakectx`
+    // cached positions — the real 32K work — without a 38-min token prefill).
+    if fakectx > 0 { pos = fakectx; }
+    // warm the cache to `prefill` positions (untimed), then time `n_decode` steps
+    for _ in 0..prefill { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
+    let first = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); // 1 warm step (JIT) + correctness peek
+    tok = first; pos += 1;
+    if prefill == 0 && fakectx == 0 { eprintln!("Nemotron decode: token1234 → next argmax {first} (F32 ref argmax=1234; Q8 may perturb the near-tie)"); }
+    // Fast internal A/B: one model load, toggle an env flag (e.g. MT_GEMV_2ROW)
+    // between alternating decode batches IN-PROCESS — same thermal/clock state,
+    // order-alternated to cancel drift. Resets pos each batch so the KV cap holds.
+    if let Ok(ab) = std::env::var("NEMOTRON_AB") {
+        let rounds = 6usize;
+        let base_pos = pos;
+        let (mut t_off, mut t_on) = (0f64, 0f64);
+        for r in 0..rounds {
+            // alternate which config runs first each round to cancel position bias
+            let first_on = r % 2 == 1;
+            for &on in &[first_on, !first_on] {
+                unsafe { if on { std::env::set_var(&ab, "1"); } else { std::env::remove_var(&ab); } }
+                pos = base_pos;
+                let s = Instant::now();
+                for _ in 0..n_decode { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
+                let e = s.elapsed().as_secs_f64();
+                if on { t_on += e; } else { t_off += e; }
+            }
+        }
+        let off_tps = (rounds * n_decode) as f64 / t_off;
+        let on_tps = (rounds * n_decode) as f64 / t_on;
+        eprintln!("──── AB[{ab}] internal ({rounds} rounds × {n_decode} tok, ctx {}) ────", fakectx.max(prefill));
+        eprintln!("  OFF {off_tps:.2} tok/s | ON {on_tps:.2} tok/s | delta {:+.1}%", (on_tps / off_tps - 1.0) * 100.0);
+        let _ = tok;
+        return;
+    }
+    let t0 = Instant::now();
+    for _ in 0..n_decode { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!("──────── NemotronH-Nano RESIDENT-Q8 DECODE on {plat} ────────");
+    eprintln!("  context  start {} + {n_decode} timed (pos→{pos})", fakectx.max(prefill));
+    eprintln!("  decode   {n_decode} tok in {dt:.2}s = {:.2} tok/s ({:.1} ms/tok)", n_decode as f64 / dt, dt * 1000.0 / n_decode as f64);
+    if prof {
+        let n = (n_decode + 1) as f64; // includes the warm step
+        eprintln!("  profile/tok: M(mamba×23) {:.1}ms · E(moe×23) {:.1}ms · *(attn×6) {:.1}ms · head {:.1}ms",
+            tm.get() * 1e3 / n, te.get() * 1e3 / n, ta.get() * 1e3 / n, th.get() * 1e3 / n);
+    }
+    eprintln!("  (vs naive-reload baseline 0.003 tok/s; resident weights uploaded once in {load_s:.0}s setup)");
+    eprintln!("──────────────────────────────────────────────────────────────");
+}
