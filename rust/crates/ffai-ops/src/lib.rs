@@ -27,6 +27,9 @@ use std::sync::OnceLock;
 mod ssd_scan;
 pub use ssd_scan::ssm_prefill_scan_ssd;
 
+mod ssd_scan_portable;
+pub use ssd_scan_portable::ssm_prefill_scan_ssd_portable;
+
 /// Cache of resolved kernel IR keyed by (name, dtype). Resolving walks the
 /// whole test registry building setups, which is expensive — a forward pass
 /// dispatches the same handful of kernels hundreds of times, so cache them.
