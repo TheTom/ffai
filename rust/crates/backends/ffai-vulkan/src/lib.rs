@@ -3,40 +3,34 @@
 
 //! # ffai-vulkan
 //!
-//! Vulkan backend — the portable GPU path (AMD/Intel/Android/anything with
-//! a Vulkan driver) once metaltile gains a SPIR-V codegen target. Proof
-//! that the [`ffai_core::Device`] seam is genuinely backend-agnostic:
-//! adding a backend is one crate, not a fork. Skeleton: stub `Device` impl.
+//! Vulkan / SPIR-V backend — the portable GPU path (AMD / Intel / Android /
+//! anything with a Vulkan 1.2+ driver). Under `--features vulkan` it wraps
+//! `metaltile_runtime::VulkanDevice` (IR → GlslGenerator → shaderc → SPIR-V →
+//! VkPipeline → dispatch) behind the shared [`ffai_core::Device`] trait — the
+//! same seam the Metal / CUDA backends implement, so everything above it is
+//! backend-agnostic. Without the feature it is a stub so non-Vulkan hosts
+//! still build the workspace.
 
-use std::sync::Arc;
-use ffai_core::{Backend, Binding, Device, DeviceBuffer, Error, Grid, Kernel, Result};
+#[cfg(feature = "vulkan")]
+mod imp;
+#[cfg(feature = "vulkan")]
+pub use imp::{VulkanBuffer, VulkanDevice};
 
-pub struct VulkanDevice {
-    name: String,
+#[cfg(not(feature = "vulkan"))]
+mod stub {
+    use ffai_core::{Device, Result};
+    use std::sync::Arc;
+
+    /// Stub: the crate builds on non-Vulkan hosts, but no device is available
+    /// until compiled with `--features vulkan`.
+    pub struct VulkanDevice;
+
+    impl VulkanDevice {
+        pub fn create() -> Result<Option<Arc<dyn Device>>> {
+            Ok(None)
+        }
+    }
 }
 
-impl VulkanDevice {
-    pub fn create() -> Result<Option<Arc<dyn Device>>> {
-        Ok(None)
-    }
-}
-
-impl Device for VulkanDevice {
-    fn backend(&self) -> Backend { Backend::Vulkan }
-    fn name(&self) -> &str { &self.name }
-    fn alloc(&self, _len: usize) -> Result<Arc<dyn DeviceBuffer>> {
-        Err(Error::Unimplemented("ffai-vulkan::alloc (SPIR-V codegen pending)"))
-    }
-    fn upload(&self, _bytes: &[u8]) -> Result<Arc<dyn DeviceBuffer>> {
-        Err(Error::Unimplemented("ffai-vulkan::upload"))
-    }
-    fn download(&self, _buf: &dyn DeviceBuffer, _out: &mut [u8]) -> Result<()> {
-        Err(Error::Unimplemented("ffai-vulkan::download"))
-    }
-    fn dispatch(&self, _k: &Kernel, _b: &[Binding], _g: Grid) -> Result<()> {
-        Err(Error::Unimplemented("ffai-vulkan::dispatch"))
-    }
-    fn synchronize(&self) -> Result<()> {
-        Err(Error::Unimplemented("ffai-vulkan::synchronize"))
-    }
-}
+#[cfg(not(feature = "vulkan"))]
+pub use stub::VulkanDevice;
