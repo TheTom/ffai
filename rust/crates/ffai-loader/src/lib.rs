@@ -159,34 +159,201 @@ impl SafeTensors {
     /// ship in any of the three float widths.
     /// BF16 tensors are decoded in parallel across all available CPU cores to
     /// reduce the 62GB Nemotron load from ~110s to ~15-20s (stdlib threads only).
-    pub fn tensor_f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+    // ── MLX 4-bit affine quant support ───────────────────────────────────────
+    // MLX stores a quantized matrix as three tensors:
+    //   <name>.weight U32  [rows, in/8]   — 8 nibbles packed per u32, element j at
+    //                                        bits 4*j (low nibble = element 0)
+    //   <name>.scales BF16 [rows, in/gs]  — per-group scale
+    //   <name>.biases BF16 [rows, in/gs]  — per-group bias
+    // Dequant (mode="affine"): w = q * scale + bias, group_size gs along `in`.
+    // This lets the BF16-expecting model tests consume an MLX 4-bit checkpoint
+    // transparently — `tensor_f32` returns the dense [rows, in] f32 weight.
+
+    /// Decode a BF16/F16/F32 tensor's raw bytes to an f32 vec (small aux tensors).
+    fn bytes_to_f32(b: &[u8], dt: DType) -> Vec<f32> {
+        match dt {
+            DType::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+            DType::F16 => b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+            DType::BF16 => b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// True if `<base>.scales` exists — i.e. `<base>.weight` is MLX-quantized.
+    fn is_mlx_quant(&self, base: &str) -> bool {
+        self.index.contains_key(&format!("{base}.scales"))
+    }
+
+    /// MLX-affine-dequantize `<base>.weight` (+ `.scales`/`.biases`) to a dense
+    /// f32 matrix `[rows, in]` where `in = packed_cols * 8`. Handles both 2-D
+    /// `[rows, in/8]` and 3-D `[E, rows, in/8]` (flattened to `[E*rows, in]`).
+    fn mlx_dequant_f32(&self, base: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        let (wb, wdt, wsh) = self.tensor(&format!("{base}.weight"))?;
+        if wdt != DType::U32 {
+            return Err(Error::Msg(format!("mlx_dequant '{base}': weight dtype {wdt} not U32")));
+        }
+        let (sb, sdt, ssh) = self.tensor(&format!("{base}.scales"))?;
+        let scales = Self::bytes_to_f32(sb, sdt);
+        // biases optional (affine without bias is rare here, but guard anyway).
+        let biases = match self.tensor(&format!("{base}.biases")) {
+            Ok((bb, bdt, _)) => Self::bytes_to_f32(bb, bdt),
+            Err(_) => vec![0.0f32; scales.len()],
+        };
+        // Collapse leading expert dim if 3-D: [E, rows, packed] → rows' = E*rows.
+        let packed_cols = *wsh.last().unwrap();
+        let rows: usize = wsh[..wsh.len() - 1].iter().product();
+        let in_dim = packed_cols * 8;
+        let groups = *ssh.last().unwrap(); // scales last dim = in_dim / group_size
+        let group_size = in_dim / groups;
+        let words: Vec<u32> = wb.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        // Parallel dequant across rows (rows are independent; ~52×128 expert rows).
+        let mut out = vec![0f32; rows * in_dim];
+        let n_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(rows.max(1));
+        let chunk_rows = rows.div_ceil(n_threads);
+        let out_base = out.as_mut_ptr() as usize;
+        let words_ptr = words.as_ptr() as usize;
+        let scales_ptr = scales.as_ptr() as usize;
+        let biases_ptr = biases.as_ptr() as usize;
+        let words_len = words.len();
+        std::thread::scope(|scope| {
+            for t in 0..n_threads {
+                let r0 = t * chunk_rows;
+                let r1 = (r0 + chunk_rows).min(rows);
+                if r0 >= r1 { continue; }
+                scope.spawn(move || {
+                    // SAFETY: disjoint row ranges into `out`; read-only shared inputs.
+                    let out_s = unsafe { std::slice::from_raw_parts_mut(out_base as *mut f32, rows * in_dim) };
+                    let words_s = unsafe { std::slice::from_raw_parts(words_ptr as *const u32, words_len) };
+                    let scales_s = unsafe { std::slice::from_raw_parts(scales_ptr as *const f32, rows * groups) };
+                    let biases_s = unsafe { std::slice::from_raw_parts(biases_ptr as *const f32, rows * groups) };
+                    for r in r0..r1 {
+                        let wrow = r * packed_cols;
+                        let grow = r * groups;
+                        let orow = r * in_dim;
+                        for col in 0..in_dim {
+                            let word = words_s[wrow + col / 8];
+                            let q = (word >> (4 * (col % 8))) & 0xf;
+                            let g = col / group_size;
+                            out_s[orow + col] = q as f32 * scales_s[grow + g] + biases_s[grow + g];
+                        }
+                    }
+                });
+            }
+        });
+        Ok((out, vec![rows, in_dim]))
+    }
+
+    /// Resolve a model-test tensor NAME against this checkpoint, transparently
+    /// handling two real-world skews so the dense BF16-oriented model tests can
+    /// load an MLX 4-bit Nemotron-Cascade checkpoint unchanged:
+    ///   1. `language_model.` prefix present in the Omni naming but absent here.
+    ///   2. routed experts requested per-expert (`...experts.{e}.up_proj.weight`)
+    ///      but packed here as `...switch_mlp.fc1.weight[e]` (up) / `.fc2`(down).
+    /// Returns the dense f32 weight + shape, MLX-dequantizing on the fly when the
+    /// resolved tensor is MLX-quantized. Returns None if no remap applies (caller
+    /// falls back to the plain path).
+    fn resolve_f32(&self, name: &str) -> Option<Result<(Vec<f32>, Vec<usize>)>> {
+        // Candidate names: as-is, then with the `language_model.` prefix stripped.
+        let stripped = name.strip_prefix("language_model.").map(|s| s.to_string());
+        for cand in [Some(name.to_string()), stripped].into_iter().flatten() {
+            // (a) per-expert → packed switch_mlp slice.
+            if let Some(rest) = cand.strip_suffix(".weight") {
+                // ...mixer.experts.{e}.up_proj  /  .down_proj
+                if let Some(idx) = rest.find(".experts.") {
+                    let prefix = &rest[..idx]; // ...mixer
+                    let tail = &rest[idx + ".experts.".len()..]; // {e}.up_proj or {e}.down_proj
+                    if let Some((e_str, proj)) = tail.split_once('.') {
+                        if let Ok(e) = e_str.parse::<usize>() {
+                            let fc = if proj == "up_proj" { "fc1" } else { "fc2" };
+                            let packed = format!("{prefix}.switch_mlp.{fc}");
+                            if self.is_mlx_quant(&packed) {
+                                return Some(self.mlx_expert_slice_f32(&packed, e));
+                            }
+                        }
+                    }
+                }
+                // (b) plain MLX-quantized weight.
+                if self.is_mlx_quant(rest) {
+                    return Some(self.mlx_dequant_f32(rest));
+                }
+            }
+            // (c) plain present tensor under the candidate name (e.g. prefix strip
+            // for non-quantized tensors: norms, conv1d, A_log, D, gate bias…).
+            if cand != name && self.index.contains_key(&cand) {
+                return Some(self.tensor_f32_raw(&cand));
+            }
+        }
+        None
+    }
+
+    /// Dequant ONLY expert `e`'s slab from a packed MLX `switch_mlp.fcN` tensor
+    /// (3-D `[E, rows, packed]`) → dense `[rows, in]` f32. Touches only expert e's
+    /// bytes (not all E experts) so the per-expert MoE setup loop stays O(E), not
+    /// O(E²).
+    fn mlx_expert_slice_f32(&self, packed: &str, e: usize) -> Result<(Vec<f32>, Vec<usize>)> {
+        let (wb, wdt, wsh) = self.tensor(&format!("{packed}.weight"))?; // [E, rows, packed]
+        if wdt != DType::U32 {
+            return Err(Error::Msg(format!("mlx_expert_slice '{packed}': weight dtype {wdt} not U32")));
+        }
+        if wsh.len() != 3 {
+            return Err(Error::Msg(format!("mlx_expert_slice '{packed}': expected 3-D weight, got {wsh:?}")));
+        }
+        let (n_exp, rows, packed_cols) = (wsh[0], wsh[1], wsh[2]);
+        let in_dim = packed_cols * 8;
+        let (sb, sdt, ssh) = self.tensor(&format!("{packed}.scales"))?; // [E, rows, groups]
+        let groups = *ssh.last().unwrap();
+        let group_size = in_dim / groups;
+        let scales_all = Self::bytes_to_f32(sb, sdt);
+        let biases_all = match self.tensor(&format!("{packed}.biases")) {
+            Ok((bb, bdt, _)) => Self::bytes_to_f32(bb, bdt),
+            Err(_) => vec![0.0f32; scales_all.len()],
+        };
+        if e >= n_exp {
+            return Err(Error::Msg(format!("mlx_expert_slice '{packed}': expert {e} >= {n_exp}")));
+        }
+        // Byte/element offsets for expert e.
+        let words_per_exp = rows * packed_cols;
+        let w_off = e * words_per_exp; // in u32 words
+        let g_off = e * rows * groups; // in scale/bias elements
+        let w_bytes = &wb[w_off * 4..(w_off + words_per_exp) * 4];
+        let words: Vec<u32> = w_bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let scales = &scales_all[g_off..g_off + rows * groups];
+        let biases = &biases_all[g_off..g_off + rows * groups];
+        let mut out = vec![0f32; rows * in_dim];
+        for r in 0..rows {
+            let wrow = r * packed_cols;
+            let grow = r * groups;
+            let orow = r * in_dim;
+            for col in 0..in_dim {
+                let word = words[wrow + col / 8];
+                let q = (word >> (4 * (col % 8))) & 0xf;
+                let g = col / group_size;
+                out[orow + col] = q as f32 * scales[grow + g] + biases[grow + g];
+            }
+        }
+        Ok((out, vec![rows, in_dim]))
+    }
+
+    /// The original plain decode path (F32/F16/BF16 only), no MLX/remap.
+    fn tensor_f32_raw(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
         let (b, dt, shape) = self.tensor(name)?;
+        Self::decode_f32(b, dt, shape)
+    }
+
+    fn decode_f32(b: &[u8], dt: DType, shape: &[usize]) -> Result<(Vec<f32>, Vec<usize>)> {
         let v = match dt {
             DType::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
             DType::F16 => b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
             DType::BF16 => {
-                // Parallel BF16→F32 for large tensors (the Nemotron MoE experts are huge).
-                // Each BF16 word is 2 bytes → n_elems = b.len() / 2.
-                // Split into N chunks across available CPU threads using std::thread::scope
-                // (no external crates — keeps the spark Cargo.toml unchanged).
                 let n_elems = b.len() / 2;
-                let n_threads = std::thread::available_parallelism()
-                    .map(|p| p.get())
-                    .unwrap_or(1)
-                    .min(n_elems.max(1));
+                let n_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1).min(n_elems.max(1));
                 if n_threads <= 1 || n_elems < 4096 {
                     b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect()
                 } else {
-                    // Parallel BF16→F32 via std::thread::scope (stdlib only, no rayon).
-                    // Raw-pointer addresses as usize are always Send; we reconstruct
-                    // pointers inside each thread. SAFETY: disjoint non-overlapping
-                    // regions; scope ensures all threads complete before `out` returns.
                     let chunk_elems = (n_elems + n_threads - 1) / n_threads;
                     let mut out = vec![0f32; n_elems];
                     let out_base = out.as_mut_ptr();
                     let b_base = b.as_ptr();
-                    // Pre-build (dst_ptr, src_ptr, len) tuples as UnsafeSend<(usize, usize, usize)>
-                    // so the closure only captures plain integers (usize is always Send).
                     let jobs: Vec<(usize, usize, usize)> = (0..n_threads).filter_map(|t| {
                         let start = t * chunk_elems;
                         let len = chunk_elems.min(n_elems.saturating_sub(start));
@@ -197,9 +364,8 @@ impl SafeTensors {
                         for (dst_addr, src_addr, len) in &jobs {
                             let (dst_addr, src_addr, len) = (*dst_addr, *src_addr, *len);
                             scope.spawn(move || {
-                                // SAFETY: disjoint regions, aligned, scope ensures completion.
                                 let d: &mut [f32] = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut f32, len) };
-                                let s: &[u8]      = unsafe { std::slice::from_raw_parts(src_addr as *const u8, len * 2) };
+                                let s: &[u8] = unsafe { std::slice::from_raw_parts(src_addr as *const u8, len * 2) };
                                 for (di, c) in d.iter_mut().zip(s.chunks_exact(2)) {
                                     *di = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
                                 }
@@ -209,9 +375,27 @@ impl SafeTensors {
                     out
                 }
             }
-            other => return Err(Error::Msg(format!("tensor_f32 '{name}': dtype {other} unsupported"))),
+            other => return Err(Error::Msg(format!("decode_f32: dtype {other} unsupported"))),
         };
         Ok((v, shape.to_vec()))
+    }
+
+    pub fn tensor_f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+        // Fast path: tensor present verbatim AND not MLX-quantized.
+        if let Some(info) = self.index.get(name) {
+            if info.dtype != DType::U32 || !name.ends_with(".weight")
+                || !self.is_mlx_quant(name.strip_suffix(".weight").unwrap_or(name))
+            {
+                let (b, dt, shape) = self.tensor(name)?;
+                return Self::decode_f32(b, dt, shape);
+            }
+        }
+        // Remap / MLX-dequant path (name skew or 4-bit checkpoint).
+        if let Some(r) = self.resolve_f32(name) {
+            return r;
+        }
+        let (b, dt, shape) = self.tensor(name)?;
+        Self::decode_f32(b, dt, shape)
     }
 
     /// Raw bytes + dtype + shape of a tensor, or an error if absent.

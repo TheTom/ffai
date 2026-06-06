@@ -6,7 +6,7 @@
 //! ONCE. The per-backend test files (`ffai-metal/tests/*`, `ffai-cuda/tests/*`)
 //! are thin wrappers that build their device and call these — so a model's
 //! logic lives in exactly one place, not a Metal test + a sed'd CUDA twin.
-use ffai_core::{DType, Device, Tensor};
+use ffai_core::{Backend, DType, Device, Tensor};
 use ffai_loader::SafeTensors;
 use ffai_ops::{add, gelu, gemv, layer_norm, sdpa_decode};
 
@@ -1476,6 +1476,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                kvcache: &mut Vec<Option<(Tensor, Tensor)>>,
                                base: usize| -> usize {
             let s = ids.len();
+            // Backend gate: the CUDA-only escape hatches (gemm_cublas/cublasGemmEx,
+            // moe_grouped_gemm/moe_scatter_add via dispatch_raw_cuda, the Marlin MoE,
+            // and the SSD/TC-flash cuBLAS paths) hard-error on Metal. When the device
+            // is NOT CUDA we route the projection/MoE/shared GEMMs through the portable
+            // primitives that codegen to Metal hardware MMA: gemm_q4_mpp (Q4-native
+            // cooperative-tensor MMA) for the dense projections, and dequant_q4_off +
+            // matmul (f32 MMA) for the per-expert / shared-expert GEMMs. The scan
+            // (ssm_prefill_scan), attention (sdpa_multi), conv (host-bridge) and router
+            // (host top-k) defaults are already portable at d0/S≤4096. CUDA path is
+            // left byte-for-byte unchanged — gated purely on `is_cuda`.
+            let is_cuda = d.backend() == Backend::Cuda;
             // pf!(idx, flops, expr): sync-bracket + accumulate when profiling.
             macro_rules! pf { ($idx:expr, $flops:expr, $e:expr) => {{
                 if pf_on { d.synchronize().ok(); let _t0 = Instant::now(); let _r = $e; d.synchronize().ok();
@@ -1520,7 +1531,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 if use_f32_gemm {
                     let wf = pf!(3, (m * k) as f64, dequant_q4(d, qs, sc, *m, *k, DType::F32).unwrap());
                     pf!(2, flops, matmul(d, &wf, x).unwrap()) // [rows, m]
-                } else if use_mpp_gemm {
+                } else if use_mpp_gemm || !is_cuda {
+                    // Portable Metal path (also NEMOTRON_PREFILL_MPPGEMM): Q4-native
+                    // cooperative-tensor MMA — no cuBLAS, runs on Apple GPU hardware MMA.
                     let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
                     let oh = pf!(2, flops, gemm_q4_mpp(d, &xh, qs, sc, rows, *m, *k).unwrap());
                     pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
@@ -1541,6 +1554,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let (qs, sc, m, k) = &qw[name];
                 let rows = xh.elem_count() / *k;
                 let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if !is_cuda {
+                    // Portable Q4-native Metal MMA (xh already f16).
+                    let oh = pf!(2, flops, gemm_q4_mpp(d, xh, qs, sc, rows, *m, *k).unwrap());
+                    return pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()); // [rows, m]
+                }
                 let wf = deq16(name, qs, sc, *m, *k, 0);
                 let oh = pf!(2, flops, gemm_cublas(d, xh, &wf, rows, *m, *k).unwrap());
                 pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
@@ -1744,6 +1762,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let use_w4a16_marlin = std::env::var("NEMOTRON_W4A16_MARLIN").is_ok();
                         let use_w4a16 = std::env::var("NEMOTRON_W4A16").is_ok() || use_w4a16_marlin;
                         let use_bgemm = use_bgemm && !use_w4a16;
+                        // On non-CUDA (Metal): the bm64 BGEMM / W4A16 / grouped-GEMM MoE
+                        // expert paths all finish with moe_scatter_add (+relu2_scale_f16),
+                        // which dispatch_raw_cuda → hard-error on Metal. Force the portable
+                        // per-expert path (host scatter, host f32 relu2) whose only CUDA dep
+                        // is the GEMM — and that we swap below for dequant_q4_off + matmul.
+                        let (use_bgemm, use_w4a16, use_w4a16_marlin) =
+                            if is_cuda { (use_bgemm, use_w4a16, use_w4a16_marlin) } else { (false, false, false) };
                         // NEMOTRON_GROUPED_GEMM=1: async two-pass all-expert GEMM — all UP
                         //   GEMMs enqueued (no inter-expert sync), on-device relu2_scale_f16,
                         //   all DN GEMMs, then on-device scatter-add. Uses the device-gather
@@ -1940,8 +1965,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             //   cuBLAS stream uninterrupted for all ~128 experts per layer.
                             // Default: interleaved per-expert (original validated path).
                             // NEMOTRON_DEV_RELU2=1: per-expert with on-device relu2 (regresses).
-                            let two_pass = std::env::var("NEMOTRON_TWO_PASS").is_ok();
-                            let dev_relu2 = !two_pass && std::env::var("NEMOTRON_DEV_RELU2").is_ok();
+                            // two_pass uses gemm_cublas; dev_relu2 uses relu2_scale_f16
+                            // (CUDA-only). On Metal force the interleaved host-relu2 path.
+                            let two_pass = is_cuda && std::env::var("NEMOTRON_TWO_PASS").is_ok();
+                            let dev_relu2 = is_cuda && !two_pass && std::env::var("NEMOTRON_DEV_RELU2").is_ok();
                             if two_pass {
                                 // ── Pass 1: All UP GEMMs (async, no sync between experts) ────
                                 // IMPORTANT: keep xg and wup tensors ALIVE until all GEMMs complete
@@ -2009,6 +2036,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let mut g1 = g0 + 1;
                                     while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
                                     let rows = g1 - g0;
+                                    let dn_h = if !is_cuda {
+                                        // ── Portable Metal per-expert GEMM ──────────────────────
+                                        // dequant_q4_off → f32 expert weight slab (block offset into
+                                        // the shared up/down qs/sc), then portable f32 `matmul`.
+                                        // relu2 in host f32 (matches the CUDA host-relu2 default).
+                                        let xg = upm(&xs[g0*hid..g1*hid], vec![rows, hid]); // f32
+                                        let wup = pf!(3, (inter*hid) as f64, dequant_q4_off(d, uqs, usc, inter, hid, DType::F32, e*inter*up_bpr).unwrap());
+                                        let a = pf!(11, 2.0*rows as f64*inter as f64*hid as f64, matmul(d, &wup, &xg).unwrap()); // [rows, inter] f32
+                                        let a_h = dl(&a, rows*inter);
+                                        let a2_h: Vec<f32> = a_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                                        let a2 = upm(&a2_h, vec![rows, inter]); // f32
+                                        let wdn = pf!(3, (hid*inter) as f64, dequant_q4_off(d, dqs, dsc, hid, inter, DType::F32, e*hid*down_bpr).unwrap());
+                                        let dn = pf!(11, 2.0*rows as f64*hid as f64*inter as f64, matmul(d, &wdn, &a2).unwrap()); // [rows, hid] f32
+                                        dl(&dn, rows*hid)
+                                    } else {
                                     let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
                                     let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
                                     let a = pf!(11, 2.0*rows as f64*inter as f64*hid as f64, gemm_cublas(d, &xg, &wup, rows, inter, hid).unwrap());
@@ -2021,7 +2063,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     };
                                     let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, false);
                                     let dn = pf!(11, 2.0*rows as f64*hid as f64*inter as f64, gemm_cublas(d, &a2, &wdn, rows, hid, inter).unwrap());
-                                    let dn_h = dl(&cast_f16_f32(d, &dn).unwrap(), rows*hid);
+                                    dl(&cast_f16_f32(d, &dn).unwrap(), rows*hid)
+                                    };
                                     for r in 0..rows {
                                         let (_e2, t, w) = triples[g0+r];
                                         let dr = &dn_h[r*hid..(r+1)*hid];
@@ -2039,7 +2082,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // to avoid the relu2 overflow).
                         let (suqs, susc, sm_up, sk_up) = &qw[&format!("{p}.mixer.shared_experts.up_proj.weight")];
                         let (sdqs, sdsc, sm_dn, sk_dn) = &qw[&format!("{p}.mixer.shared_experts.down_proj.weight")];
-                        let sd_h: Vec<f32> = if std::env::var("NEMOTRON_SHARED_GEMV").is_ok() {
+                        let sd_h: Vec<f32> = if !is_cuda {
+                            // ── Portable Metal shared-expert: dequant→f32 + matmul, host relu2 ──
+                            // relu2 squares activations (can exceed f16 max) so we keep the
+                            // intermediate in f32 throughout — no overflow, fully portable.
+                            let xnf = xn.clone(); // [s, hid] f32
+                            let wsu = pf!(3, (*sm_up * *sk_up) as f64, dequant_q4(d, suqs, susc, *sm_up, *sk_up, DType::F32).unwrap());
+                            let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64, matmul(d, &wsu, &xnf).unwrap()); // [s, shared_inter] f32
+                            let sa_h = dl(&sa, s * shared_inter);
+                            let sa2_h: Vec<f32> = sa_h.iter().map(|&v| { let r = v.max(0.0); r * r / 256.0 }).collect();
+                            let sa2 = upm(&sa2_h, vec![s, shared_inter]);
+                            let wsd = pf!(3, (*sm_dn * *sk_dn) as f64, dequant_q4(d, sdqs, sdsc, *sm_dn, *sk_dn, DType::F32).unwrap());
+                            let sd = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64, matmul(d, &wsd, &sa2).unwrap()); // [s, hid] f32
+                            let sd_h = dl(&sd, s * hid);
+                            sd_h.iter().map(|&v| v * 256.0).collect()
+                        } else if std::env::var("NEMOTRON_SHARED_GEMV").is_ok() {
                             let mut out = vec![0.0f32; s * hid];
                             for ti in 0..s {
                                 let x1 = slice(d, &xn, ti*hid, hid).unwrap();
@@ -2112,7 +2169,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // on, =0 force off.
                         let avg_kv = base as f64 + s as f64 / 2.0;
                         let attn_flops = 4.0 * nq as f64 * hd as f64 * avg_kv * s as f64;
-                        let use_tc_attn = match std::env::var("NEMOTRON_PREFILL_TCATTN").ok().as_deref() {
+                        // sdpa_multi_tc is the cuBLAS tensor-core flash-attn (CUDA-only).
+                        // On Metal always use the portable software-MMA sdpa_multi.
+                        let use_tc_attn = is_cuda && match std::env::var("NEMOTRON_PREFILL_TCATTN").ok().as_deref() {
                             Some("0") => false,
                             Some(_) => true,
                             None => (base + s) >= 4096,
