@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_weighted_sum, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_weighted_sum, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1480,10 +1480,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // UP scratch: [n_exp * inter, hid] f16 (for all 128 experts, even if only ~107 active).
             // DN scratch: [n_exp * hid, inter] f16.
             // These are bounded: 128 * 1856 * 4096 * 2 ≈ 1.83 GB each, ≈ 3.67 GB total.
-            let grouped_up_scratch: Option<Tensor> = if std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok() {
+            // Pre-alloc grouped-gemm scratch for GROUPED_GEMM and W4A16 (which falls back
+            // to grouped_gemm at large S — needs scratch to avoid per-layer cuMemAlloc).
+            let needs_grouped_scratch = (std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok())
+                || std::env::var("NEMOTRON_W4A16").is_ok();
+            let grouped_up_scratch: Option<Tensor> = if needs_grouped_scratch {
                 Some(Tensor::new(d.alloc(n_exp * inter * hid * 2).unwrap(), vec![n_exp * inter, hid], DType::F16))
             } else { None };
-            let grouped_dn_scratch: Option<Tensor> = if std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok() {
+            let grouped_dn_scratch: Option<Tensor> = if needs_grouped_scratch {
                 Some(Tensor::new(d.alloc(n_exp * hid * inter * 2).unwrap(), vec![n_exp * hid, inter], DType::F16))
             } else { None };
             for (l, mix) in PATTERN.chars().enumerate() {
@@ -1641,11 +1645,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let mt = triples.len();
                         // Expert GEMM mode flags (read early so they're in scope for gather).
                         let use_bgemm = std::env::var("NEMOTRON_BGEMM").is_ok();
+                        // NEMOTRON_W4A16=1: W4A16 Marlin-style WMMA grouped GEMM (inline
+                        //   Q4 dequant, no f16 weight scratch). Same gather/scatter as BGEMM.
+                        //   Supersedes NEMOTRON_BGEMM when both are set.
+                        let use_w4a16 = std::env::var("NEMOTRON_W4A16").is_ok();
+                        let use_bgemm = use_bgemm && !use_w4a16;
                         // NEMOTRON_GROUPED_GEMM=1: async two-pass all-expert GEMM — all UP
                         //   GEMMs enqueued (no inter-expert sync), on-device relu2_scale_f16,
                         //   all DN GEMMs, then on-device scatter-add. Uses the device-gather
                         //   path for xs. Eliminates per-expert host syncs + cast overhead.
-                        let use_grouped_gemm = std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !use_bgemm;
+                        let use_grouped_gemm = std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !use_bgemm && !use_w4a16;
                         // Build sorted activation [mt, hid]:
                         // NEMOTRON_DEVICE_GATHER=1: stay on device (gather kernel + cast),
                         //   eliminates the 22MB dl(&xn) + 132MB host scatter per E-layer.
@@ -1657,14 +1666,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // For BGEMM: host gather → single device upload (avoids per-expert uploads).
                         // For DEVICE_GATHER: on-device gather (EXPERIMENTAL, may produce wrong output).
                         // Default: host gather (validated path).
-                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || dev_gather || use_grouped_gemm {
-                            // Need xn on host for BGEMM (host gather) or DEV_GATHER (gather source).
+                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || use_w4a16 || dev_gather || use_grouped_gemm {
+                            // Need xn on host for BGEMM/W4A16 (host gather) or DEV_GATHER (gather source).
                             Some(dl(&xn, s * hid))
                         } else {
                             None
                         };
-                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_grouped_gemm {
-                            // BGEMM: host gather → upload xs as one [mt, hid] f16 tensor.
+                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_w4a16 || use_grouped_gemm {
+                            // BGEMM/W4A16: host gather → upload xs as one [mt, hid] f16 tensor.
                             let xn_h = xn_h_opt.as_ref().unwrap();
                             let mut xs_h = vec![0.0f32; mt * hid];
                             for (r,(_e,t,_)) in triples.iter().enumerate() {
@@ -1703,7 +1712,56 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let inv = 1.0f32 / 256.0;
                         // use_bgemm already defined above (before gather block).
                         let mut acc_h = vec![0.0f32; s * hid];
-                        if use_bgemm {
+                        if use_w4a16 {
+                            // ── W4A16 WMMA path (NEMOTRON_W4A16=1) ───────────────────────
+                            // Small S (mt ≤ W4A16_THRESH): inline Q4 dequant + WMMA — wins
+                            //   because inline dequant saves 50% weight BW vs dequant-then-cuBLAS.
+                            // Large S (mt > W4A16_THRESH): fall back to grouped_gemm (dequant-
+                            //   once + cuBLAS) — wins because cuBLAS tiles are much larger and
+                            //   the amortized dequant cost is lower at high arithmetic intensity.
+                            // Threshold ~S=2048 → mt=S*top_k*n_active/n_exp≈96 per expert;
+                            //   total mt = S*top_k ≈ 12288 at S=2048. Use total mt threshold.
+                            let w4a16_thresh: usize = std::env::var("NEMOTRON_W4A16_THRESH")
+                                .ok().and_then(|v| v.parse().ok()).unwrap_or(12288);
+                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                            let wts_dev = upm(&wts_h, vec![mt]);
+                            let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
+                            let acc_dev = upm(&acc_h, vec![s, hid]);
+                            if mt <= w4a16_thresh {
+                                // Small S: W4A16 WMMA inline dequant
+                                let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
+                                let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
+                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                    moe_w4a16(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                                let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                let dn_out_f16 = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                    moe_w4a16(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap());
+                                let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            } else {
+                                // Large S: grouped_gemm (dequant-once + cuBLAS)
+                                let mut g_starts_l: Vec<usize> = vec![0];
+                                let mut expert_ids_l: Vec<usize> = Vec::new();
+                                let mut gi = 0usize;
+                                while gi < mt {
+                                    let eid = triples[gi].0 as usize;
+                                    expert_ids_l.push(eid);
+                                    let mut gi2 = gi + 1;
+                                    while gi2 < mt && triples[gi2].0 as usize == eid { gi2 += 1; }
+                                    g_starts_l.push(gi2);
+                                    gi = gi2;
+                                }
+                                let dn_out_f16 = pf!(11, 2.0*mt as f64*(inter+hid) as f64*hid as f64,
+                                    moe_grouped_gemm(d, uqs, usc, dqs, dsc, &xs_f16,
+                                        &g_starts_l, &expert_ids_l, hid, inter, up_bpr, down_bpr,
+                                        grouped_up_scratch.as_ref(), grouped_dn_scratch.as_ref()).unwrap());
+                                let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            }
+                            acc_h = dl(&acc_dev, s * hid);
+                        } else if use_bgemm {
                             // ── Batched bm64 BGEMM path ───────────────────────────────────
                             // xs_dev_f16 from device gather (set above when use_bgemm=true).
                             let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();

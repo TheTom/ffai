@@ -2633,6 +2633,222 @@ extern "C" __global__ void moe_batched_dequant_q4(
 /// `i*hid*inter*2`. Scratch must hold at least `n_active` slots.
 ///
 /// Returns `[mt, hid]` f16 output (relu² applied, 1/256 scaled). Caller scatter-adds.
+const MOE_W4A16_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <mma.h>
+using namespace nvcuda;
+
+extern "C" __global__ void moe_w4a16(
+    const unsigned int* __restrict__ qs,      // Q4 weights: n_exp*n_out*(k_in/32)*4
+    const __half*       __restrict__ scales,  // scales: n_exp*n_out*(k_in/32)
+    const __half*       __restrict__ x,       // [m_total, k_in] f16, sorted by expert
+    const unsigned int* __restrict__ indices, // [m_total] expert ids
+    __half*             __restrict__ out,     // [m_total, n_out] f16
+    int m_total, int n_out, int k_in)
+{
+    // ── Tile / warp coordinates ────────────────────────────────────────────
+    const int n_tile_base = blockIdx.x * 64;
+    const int m_tile_base = blockIdx.y * 64;
+    const int warp_id     = threadIdx.x >> 5;
+    // 2×2 warp layout: warp_id 0→(m=0,n=0), 1→(m=0,n=32), 2→(m=32,n=0), 3→(m=32,n=32)
+    (void)(threadIdx.x & 31); // lane — unused in this kernel (warp_id sufficient)
+    const int warp_m_base = (warp_id >> 1) * 32; // 0 or 32
+    const int warp_n_base = (warp_id  & 1) * 32; // 0 or 32
+
+    // ── Shared memory layout ───────────────────────────────────────────────
+    // smem_X  [64×32] f16  = 4096 bytes  — row-major [m_local, k_local]
+    // smem_WT [32×64] f16  = 4096 bytes  — row-major [k_local, n_local] = W transposed
+    // smem_C  [64×64] f32  = 16384 bytes — output accumulation tile
+    __shared__ __half smem_X [64 * 32]; // [m_local][k_local]
+    __shared__ __half smem_WT[32 * 64]; // [k_local][n_local]  ← W^T
+    __shared__ float  smem_C [64 * 64];
+
+    const int bpr             = k_in / 32;
+    const int nblk_per_expert = n_out * bpr;
+
+    // ── WMMA accumulators: 2 m-tiles × 2 n-tiles (each 16×16) per warp ───
+    // warp_m_base covers 32 rows  = 2 × m16, warp_n_base covers 32 cols = 2 × n16.
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[2][2];
+
+    // ── Per-expert sub-run loop (same as moe_bgemm_q4_bm64) ───────────────
+    int sub_offset = 0;
+    for (int _sub = 0; _sub < 64; _sub++) {
+        int cur_row = m_tile_base + sub_offset;
+        if (sub_offset >= 64 || cur_row >= m_total) break;
+        unsigned cur_exp = indices[cur_row];
+
+        // Find sub-run end.
+        int sub_end = sub_offset;
+        for (int ii = sub_offset; ii < 64; ii++) {
+            int r = m_tile_base + ii;
+            if (r >= m_total || indices[r] != cur_exp) break;
+            sub_end = ii + 1;
+        }
+
+        // Reset accumulators.
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+                wmma::fill_fragment(c_frag[mi][ni], 0.0f);
+
+        // ── K-loop: BK=32 per step ─────────────────────────────────────────
+        for (int kb = 0; kb < k_in; kb += 32) {
+
+            // Stage X: 128 threads load 64×32 = 2048 halves (16 each).
+            // Thread t → row = t/2, k_half = (t&1)*16 → 16 consecutive k-values.
+            {
+                int t          = threadIdx.x;
+                int local_row  = t >> 1;
+                int k_half     = (t & 1) << 4;     // 0 or 16
+                int global_row = m_tile_base + local_row;
+                bool in_run    = (local_row >= sub_offset) & (local_row < sub_end) & (global_row < m_total);
+                // Clamp global_row to avoid OOB pointer arithmetic when out of run.
+                int safe_row   = in_run ? global_row : 0;
+                const __half* xsrc = x + (size_t)safe_row * k_in + kb + k_half;
+                __half*       xdst = smem_X + local_row * 32 + k_half;
+                __half zero = __float2half(0.f);
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    xdst[i] = in_run ? xsrc[i] : zero;
+            }
+
+            // Dequant W → smem_WT[k_local * 64 + n_local].
+            // 128 threads × 16 elements = 2048 halves covering [32, 64].
+            // Thread t → flat=t*16+i → k_local=flat/64, n_local=flat%64.
+            {
+                int t = threadIdx.x;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    int flat    = t * 16 + i;           // 0..2047
+                    int k_local = flat >> 6;            // 0..31
+                    int n_local = flat & 63;            // 0..63
+                    int global_n = n_tile_base + n_local;
+                    int k        = kb + k_local;
+                    // Q4 block for (global_n, k):
+                    int row_blk  = global_n * bpr + k / 32;         // within-expert row block
+                    int blk      = (int)cur_exp * nblk_per_expert + row_blk;
+                    int lane_in_blk = k & 31;
+                    unsigned word = qs[(size_t)blk * 4 + lane_in_blk / 8];
+                    unsigned nib  = (word >> ((lane_in_blk & 7) * 4)) & 0xfu;
+                    int q_s       = (int)(nib >= 8u ? nib - 16u : nib);
+                    float sc_f    = __half2float(scales[blk]);
+                    smem_WT[k_local * 64 + n_local] = __float2half((float)q_s * sc_f);
+                }
+            }
+            __syncthreads();
+
+            // ── WMMA: 2 k-steps × 2 m-tiles × 2 n-tiles per warp ─────────
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
+            #pragma unroll
+            for (int ki = 0; ki < 2; ki++) {         // 2 k-steps of 16 in BK=32
+                int k_off = ki * 16;
+                #pragma unroll
+                for (int mi = 0; mi < 2; mi++) {
+                    // A: smem_X[(warp_m_base + mi*16)*32 + k_off], ld=32
+                    wmma::load_matrix_sync(a_frag,
+                        smem_X + (warp_m_base + mi * 16) * 32 + k_off,
+                        32);
+                    #pragma unroll
+                    for (int ni = 0; ni < 2; ni++) {
+                        // B: smem_WT[k_off * 64 + (warp_n_base + ni*16)], ld=64
+                        wmma::load_matrix_sync(b_frag,
+                            smem_WT + k_off * 64 + (warp_n_base + ni * 16),
+                            64);
+                        wmma::mma_sync(c_frag[mi][ni], a_frag, b_frag, c_frag[mi][ni]);
+                    }
+                }
+            }
+            __syncthreads();
+        } // end K-loop
+
+        // ── Store C frags → smem_C ─────────────────────────────────────────
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++) {
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++) {
+                wmma::store_matrix_sync(
+                    smem_C + (warp_m_base + mi * 16) * 64 + (warp_n_base + ni * 16),
+                    c_frag[mi][ni], 64, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+
+        // ── Write smem_C → global out (only rows in this expert's run) ─────
+        {
+            int t = threadIdx.x;
+            #pragma unroll
+            for (int e = 0; e < 32; e++) {
+                int flat      = t * 32 + e;
+                int local_row = flat >> 6;   // 0..63
+                int local_col = flat & 63;   // 0..63
+                int global_m  = m_tile_base + local_row;
+                int global_n  = n_tile_base + local_col;
+                bool valid    = (local_row >= sub_offset) & (local_row < sub_end)
+                              & (global_m < m_total) & (global_n < n_out);
+                if (valid)
+                    out[(size_t)global_m * n_out + global_n] =
+                        __float2half(smem_C[local_row * 64 + local_col]);
+            }
+        }
+        __syncthreads();
+
+        sub_offset = sub_end;
+    } // end per-expert sub-run loop
+}
+"#;
+
+/// W4A16 MoE grouped GEMM (Marlin-style, WMMA tensor cores, inline Q4 dequant).
+///
+/// Drop-in replacement for `moe_bgemm_q4_bm64`. Uses `mma.sync m16n16k16` with
+/// weights staged as W^T in smem — no f16 weight scratch in global memory, no
+/// 2× weight bandwidth. `n_out % 64 == 0` required.
+///
+/// Returns `[m_total, n_out]` f16 (same contract as `moe_bgemm_q4_bm64`).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16(
+    dev: &dyn Device,
+    x: &Tensor,       // [m_total, k_in] f16, sorted by expert
+    qs: &Tensor,      // Q4 weights
+    scales: &Tensor,  // f16 scales
+    indices: &Tensor, // [m_total] u32 expert ids
+    m_total: usize,
+    n_out: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    if n_out % 64 != 0 {
+        return Err(Error::Msg(format!("moe_w4a16: n_out {n_out} must be multiple of 64")));
+    }
+    let out = Tensor::empty(dev, vec![m_total, n_out], DType::F16)?;
+    let m_total_i = m_total as i32;
+    let n_out_i   = n_out   as i32;
+    let k_in_i    = k_in    as i32;
+    dev.dispatch_raw_cuda(
+        MOE_W4A16_SRC,
+        "moe_w4a16.cu",
+        "moe_w4a16",
+        &[
+            (qs.buffer.as_ref(),      qs.offset),
+            (scales.buffer.as_ref(),  scales.offset),
+            (x.buffer.as_ref(),       x.offset),
+            (indices.buffer.as_ref(), indices.offset),
+            (out.buffer.as_ref(),     0),
+        ],
+        &[
+            m_total_i.to_le_bytes().to_vec(),
+            n_out_i.to_le_bytes().to_vec(),
+            k_in_i.to_le_bytes().to_vec(),
+        ],
+        [(n_out as u32) / 64, (m_total as u32).div_ceil(64), 1],
+        [128, 1, 1],
+        // smem: X(4096) + WT(4096) + C(16384) = 24576 bytes
+        24576,
+        false,
+    )?;
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn moe_grouped_gemm(
     dev: &dyn Device,
