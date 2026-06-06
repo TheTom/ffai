@@ -1750,8 +1750,6 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     gi = gi2;
                                 }
                             }
-                            // Sync before grouped GEMM to flush any pending GPU errors.
-                            d.synchronize().unwrap();
                             let dn_out_f16 = pf!(11, 2.0*mt as f64*(inter+hid) as f64*hid as f64,
                                 moe_grouped_gemm(d, uqs, usc, dqs, dsc, &xs_f16,
                                     &g_starts, &expert_ids, hid, inter, up_bpr, down_bpr,

@@ -2618,14 +2618,19 @@ extern "C" __global__ void moe_batched_dequant_q4(
 
 /// Fused grouped-GEMM MoE expert pass (CUDA 13+, `NEMOTRON_GROUPED_GEMM=1`).
 ///
-/// Per-expert dequant → GEMM pipelined (interleaved): dequant expert i into its slot
-/// in the pre-allocated scratch buffer, immediately GEMM expert i, continue. No host
-/// sync between experts. Device relu2_scale_f16 eliminates the host relu2 round-trip.
+/// ONE batched NVRTC dequant kernel (`BATCHED_DEQUANT_Q4_SRC`) dequants ALL active
+/// experts' weights into a contiguous per-slot scratch buffer in a SINGLE dispatch
+/// (thread `i` → slot `i/(n_out*k_in)` → correct slot offset; reads `eid[slot]` for
+/// the global expert id). Then per-expert `gemm_tc_off` reads from each slot. The
+/// per-slot writes are what the plain `dispatch`+`ffai_dequant_q4` path could NOT do
+/// (that kernel always writes `out[0..n_elem]`, so every expert clobbered slot 0).
 ///
-/// Uses the pre-allocated scratch buffers (passed via `up_scratch`/`dn_scratch`) to
-/// avoid per-expert `cuMemAlloc`. Each expert's weight slot in the scratch is
-/// `slot * n_out * k_in * 2` bytes. The scratch must be pre-allocated to hold
-/// `n_exp * n_out * k_in * 2` bytes (at least `n_active` slots needed).
+/// Device `relu2_scale_f16` eliminates the host relu² round-trip. No host syncs
+/// between experts; everything stays on device.
+///
+/// Uses pre-allocated scratch (`up_scratch`/`dn_scratch`) to avoid per-layer
+/// `cuMemAlloc`. Slot `i` of the UP scratch is `i*inter*hid*2` bytes; DN is
+/// `i*hid*inter*2`. Scratch must hold at least `n_active` slots.
 ///
 /// Returns `[mt, hid]` f16 output (relu² applied, 1/256 scaled). Caller scatter-adds.
 #[allow(clippy::too_many_arguments)]
@@ -2645,18 +2650,31 @@ pub fn moe_grouped_gemm(
     up_scratch: Option<&Tensor>, // Pre-allocated [n_exp*inter, hid] f16
     dn_scratch: Option<&Tensor>, // Pre-allocated [n_exp*hid, inter] f16
 ) -> Result<Tensor> {
-    use ffai_core::DeviceBuffer;
     let n_active = expert_ids.len();
     let mt = g_starts.last().copied().unwrap_or(0);
     if n_active == 0 || mt == 0 {
         return Tensor::empty(dev, vec![mt.max(1), hid], DType::F16);
     }
 
-    let eid_bytes: Vec<u8> = expert_ids.iter().flat_map(|&e| (e as u32).to_le_bytes()).collect();
-    let eid_dev = dev.upload(&eid_bytes)
-        .map_err(|e| Error::Msg(format!("moe_grouped_gemm: upload eid: {e:?}")))?;
+    // Experts are processed in chunks of `chunk`: each chunk's weights are
+    // dequanted (one batched NVRTC launch) into distinct slots of the scratch,
+    // then GEMM'd. Smaller chunks keep the just-dequanted f16 weight L2-cache-hot
+    // for its GEMM (a full-slab dequant evicts the cache → the GEMM re-reads from
+    // HBM, ~2× weight bandwidth). Measured best at chunk=1 on GB10 (per-expert
+    // dequant→GEMM, cache-hot). NEMOTRON_MOE_CHUNK overrides (default 1).
+    // Note: chunks do NOT overlap on the GPU (single ordered stream); the win is
+    // purely cache locality. At large S (high tokens/expert) the GEMM dominates
+    // and this path beats the baseline per-expert loop (+6% @ S=4096, +17% @ S=8192).
+    let chunk: usize = std::env::var("NEMOTRON_MOE_CHUNK").ok()
+        .and_then(|v| v.parse().ok()).filter(|&c| c >= 1).unwrap_or(1);
+    let n_chunks = n_active.div_ceil(chunk);
 
-    // Allocate UP scratch (or use pre-allocated).
+    // Per-slot weight sizes (f16 elements).
+    let up_slot = inter * hid;
+    let dn_slot = hid * inter;
+
+    // ── UP scratch: full `n_active` slots (distinct regions per chunk so chunk
+    // N+1's dequant overlaps chunk N's GEMMs — same-buffer reuse would serialize). ──
     let up_w_owned: Option<Tensor>;
     let up_w = if let Some(scratch) = up_scratch {
         Tensor { buffer: scratch.buffer.clone(), offset: 0, shape: vec![n_active * inter, hid], dtype: DType::F16 }
@@ -2668,54 +2686,55 @@ pub fn moe_grouped_gemm(
     // [mt, inter] f16 output for UP pass.
     let up_out = Tensor::empty(dev, vec![mt, inter], DType::F16)?;
 
-    // ── UP pass: per-expert dequant (into scratch slot) → GEMM (immediately).
-    // All async on the same stream — the GPU pipelines dequant[i] with GEMM[i-1].
-    for (slot, &eid) in expert_ids.iter().enumerate() {
-        let rows = g_starts[slot+1] - g_starts[slot];
-        if rows == 0 { continue; }
-
-        // Dequant expert eid's UP weight into slot `slot` of the scratch buffer.
-        // Slot offset: slot * inter * hid * 2 bytes.
-        let slot_off = slot * inter * hid * 2;
-        let blk_off = eid * inter * bpr_up;
-        let n_elem = inter * hid;
-        let kern = cached_ir("ffai_dequant_q4", DType::F16, || {
-            use metaltile_core::ir::KernelMode;
-            let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(DType::F16);
-            kk.mode = KernelMode::Grid3D;
-            kk
-        });
-        let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
-        dev.dispatch(
-            &kern,
+    // ── UP pass: chunked dequant → GEMM ─────────────────────────────────────
+    for ci in 0..n_chunks {
+        let c0 = ci * chunk;
+        let c1 = (c0 + chunk).min(n_active);
+        let cn = c1 - c0;
+        // Upload this chunk's expert ids.
+        let eid_bytes: Vec<u8> = expert_ids[c0..c1].iter().flat_map(|&e| (e as u32).to_le_bytes()).collect();
+        let eid_dev = dev.upload(&eid_bytes)
+            .map_err(|e| Error::Msg(format!("moe_grouped_gemm: upload eid UP chunk {ci}: {e:?}")))?;
+        // Batched dequant for this chunk → slots 0..cn of up_w.
+        let total = (cn * up_slot) as u32;
+        let scalars = [
+            (cn as i32).to_le_bytes().to_vec(),
+            (inter as i32).to_le_bytes().to_vec(),
+            (hid as i32).to_le_bytes().to_vec(),
+            (bpr_up as i32).to_le_bytes().to_vec(),
+        ];
+        // Dequant writes to slots c0..c1 of the full scratch (distinct per chunk).
+        dev.dispatch_raw_cuda(
+            BATCHED_DEQUANT_Q4_SRC, "moe_batched_dequant_q4.cu", "moe_batched_dequant_q4",
             &[
-                Binding::Buffer(qs_up.buffer.clone()),
-                Binding::Buffer(sc_up.buffer.clone()),
-                Binding::Buffer(up_w.buffer.clone()),
-                u(hid as u32),
-                u(n_elem as u32),
-                u(blk_off as u32),
+                (qs_up.buffer.as_ref(), qs_up.offset),
+                (sc_up.buffer.as_ref(), sc_up.offset),
+                (eid_dev.as_ref(), 0),
+                (up_w.buffer.as_ref(), c0 * up_slot * 2),
             ],
-            Grid::d1((n_elem as u32).div_ceil(256), 256),
-        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: dequant UP eid={eid}: {e:?}")))?;
-        // NOTE: ^^ dequant_q4_off writes to `out[0..n_elem]` but our scratch has offset `slot_off`.
-        // We use gemm_tc_off to read from the correct offset.
-
-        // GEMM UP: xs_f16[g_starts[slot]:g_starts[slot+1], :] × up_w[slot*inter:..] → up_out[...]
-        dev.gemm_tc_off(
-            xs_f16.buffer.as_ref(), g_starts[slot] * hid * 2,
-            up_w.buffer.as_ref(), slot_off,
-            up_out.buffer.as_ref(), g_starts[slot] * inter * 2,
-            rows, inter, hid, DType::F16,
-        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: UP gemm eid={eid}: {e:?}")))?;
+            &scalars,
+            [total.div_ceil(256), 1, 1], [256, 1, 1], 0, false,
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: batched dequant UP chunk {ci}: {e:?}")))?;
+        // GEMM each expert in the chunk (reads its global slot in up_w).
+        for j in 0..cn {
+            let slot = c0 + j;
+            let rows = g_starts[slot + 1] - g_starts[slot];
+            if rows == 0 { continue; }
+            dev.gemm_tc_off(
+                xs_f16.buffer.as_ref(), xs_f16.offset + g_starts[slot] * hid * 2,
+                up_w.buffer.as_ref(), slot * up_slot * 2,
+                up_out.buffer.as_ref(), g_starts[slot] * inter * 2,
+                rows, inter, hid, DType::F16,
+            ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: UP gemm slot={slot}: {e:?}")))?;
+        }
     }
-    if up_scratch.is_none() { let _ = up_w_owned; }
 
-    // Device relu² + scale 1/256.
+    // Device relu² + scale 1/256 (no host round-trip).
     let up_relu2 = relu2_scale_f16(dev, &up_out, 1.0f32 / 256.0)?;
     drop(up_out);
+    if up_scratch.is_none() { drop(up_w); let _ = up_w_owned; }
 
-    // DN scratch.
+    // ── DN scratch: full `n_active` slots (distinct regions per chunk). ──────
     let dn_w_owned: Option<Tensor>;
     let dn_w = if let Some(scratch) = dn_scratch {
         Tensor { buffer: scratch.buffer.clone(), offset: 0, shape: vec![n_active * hid, inter], dtype: DType::F16 }
@@ -2726,42 +2745,45 @@ pub fn moe_grouped_gemm(
 
     let dn_out = Tensor::empty(dev, vec![mt, hid], DType::F16)?;
 
-    // ── DN pass: same pipelined dequant → GEMM pattern.
-    for (slot, &eid) in expert_ids.iter().enumerate() {
-        let rows = g_starts[slot+1] - g_starts[slot];
-        if rows == 0 { continue; }
-
-        let slot_off = slot * hid * inter * 2;
-        let blk_off = eid * hid * bpr_dn;
-        let n_elem = hid * inter;
-        let kern = cached_ir("ffai_dequant_q4", DType::F16, || {
-            use metaltile_core::ir::KernelMode;
-            let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(DType::F16);
-            kk.mode = KernelMode::Grid3D;
-            kk
-        });
-        let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
-        dev.dispatch(
-            &kern,
+    // ── DN pass: chunked dequant → GEMM ─────────────────────────────────────
+    for ci in 0..n_chunks {
+        let c0 = ci * chunk;
+        let c1 = (c0 + chunk).min(n_active);
+        let cn = c1 - c0;
+        let eid_bytes: Vec<u8> = expert_ids[c0..c1].iter().flat_map(|&e| (e as u32).to_le_bytes()).collect();
+        let eid_dev = dev.upload(&eid_bytes)
+            .map_err(|e| Error::Msg(format!("moe_grouped_gemm: upload eid DN chunk {ci}: {e:?}")))?;
+        let total = (cn * dn_slot) as u32;
+        let scalars = [
+            (cn as i32).to_le_bytes().to_vec(),
+            (hid as i32).to_le_bytes().to_vec(),
+            (inter as i32).to_le_bytes().to_vec(),
+            (bpr_dn as i32).to_le_bytes().to_vec(),
+        ];
+        dev.dispatch_raw_cuda(
+            BATCHED_DEQUANT_Q4_SRC, "moe_batched_dequant_q4.cu", "moe_batched_dequant_q4",
             &[
-                Binding::Buffer(qs_dn.buffer.clone()),
-                Binding::Buffer(sc_dn.buffer.clone()),
-                Binding::Buffer(dn_w.buffer.clone()),
-                u(inter as u32),
-                u(n_elem as u32),
-                u(blk_off as u32),
+                (qs_dn.buffer.as_ref(), qs_dn.offset),
+                (sc_dn.buffer.as_ref(), sc_dn.offset),
+                (eid_dev.as_ref(), 0),
+                (dn_w.buffer.as_ref(), c0 * dn_slot * 2),
             ],
-            Grid::d1((n_elem as u32).div_ceil(256), 256),
-        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: dequant DN eid={eid}: {e:?}")))?;
-
-        dev.gemm_tc_off(
-            up_relu2.buffer.as_ref(), g_starts[slot] * inter * 2,
-            dn_w.buffer.as_ref(), slot_off,
-            dn_out.buffer.as_ref(), g_starts[slot] * hid * 2,
-            rows, hid, inter, DType::F16,
-        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: DN gemm eid={eid}: {e:?}")))?;
+            &scalars,
+            [total.div_ceil(256), 1, 1], [256, 1, 1], 0, false,
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: batched dequant DN chunk {ci}: {e:?}")))?;
+        for j in 0..cn {
+            let slot = c0 + j;
+            let rows = g_starts[slot + 1] - g_starts[slot];
+            if rows == 0 { continue; }
+            dev.gemm_tc_off(
+                up_relu2.buffer.as_ref(), up_relu2.offset + g_starts[slot] * inter * 2,
+                dn_w.buffer.as_ref(), slot * dn_slot * 2,
+                dn_out.buffer.as_ref(), g_starts[slot] * hid * 2,
+                rows, hid, inter, DType::F16,
+            ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: DN gemm slot={slot}: {e:?}")))?;
+        }
     }
-    if dn_scratch.is_none() { let _ = dn_w_owned; }
+    if dn_scratch.is_none() { drop(dn_w); let _ = dn_w_owned; }
 
     Ok(dn_out)
 }
