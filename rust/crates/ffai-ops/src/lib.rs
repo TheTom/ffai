@@ -3168,6 +3168,266 @@ extern "C" __global__ void moe_w4a16_marlin(
 }
 "#;
 
+// ── 128×128×32 Marlin W4A16 WMMA kernel ───────────────────────────────────
+//
+// Upgrades from 64×64×32 (4-warp) to 128×128×32 (8-warp) tile:
+//   - 4× accumulator area → 4× compute density at the same global bandwidth
+//   - Scales preloaded into smem at the start of each K-iteration (128 f32
+//     values, avoids 8 __half2float per dequant inner loop)
+//   - Double-buffered X and WT staging (ping-pong, 2 smem slots each)
+//
+// Grid: [n_out/128, ceil(m_total/128)], block: [256, 1, 1] (8 warps).
+// Warp layout (2 rows × 4 cols):
+//   warp_m_base = (warp_id >> 2) * 64   → row 0 or 64 within 128-row M-tile
+//   warp_n_base = (warp_id  & 3) * 32   → col 0, 32, 64, or 96 in 128-col N-tile
+//   c_frag[4][2]: 4 mi × 2 ni = 8 WMMA frags covering 64×32 output per warp
+//
+// smem (per block):
+//   smem_X [2][128*32] f16  = 16384 bytes  double-buffer
+//   smem_WT[2][32*128] f16  = 16384 bytes  double-buffer
+//   smem_SC[128]       f32  =   512 bytes  scale preload (128 × f32)
+//   smem_C [128*128]   f32  = 65536 bytes  accumulator
+//   Total                   = 98816 bytes  (~96KB, within GB10 228KB/SM)
+//
+// WT tile load (Marlin layout, two consecutive 64-N tiles per 128-N block):
+//   First half  (n_local 0..63):  tile = qs_exp + nt*bpr*256 + kt*256
+//   Second half (n_local 64..127): tile = qs_exp + (nt+1)*bpr*256 + kt*256
+//   256 threads × 1 u32 each per tile → fully coalesced single-pass.
+//   Each u32 → 8 nibbles → 8 rows → written to smem_WT[k_local*128 + n_local].
+//
+// `n_out % 128 == 0` required; `k_in % 32 == 0` required.
+const MOE_W4A16_MARLIN128_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <mma.h>
+using namespace nvcuda;
+
+// ── Kernel: moe_w4a16_marlin128 ────────────────────────────────────────────
+//
+// 128(M)×128(N)×32(K) tile, 256 threads (8 warps), 2-row × 4-col warp layout.
+//
+// Three improvements over moe_w4a16_marlin (64×64×32):
+//   1. 4× larger tile: 128×128 accumulator → 4× compute density.
+//   2. Scale preload: 128 f32 scales loaded into smem at each K-step,
+//      eliminating __half2float() inside the per-nibble dequant loop.
+//   3. Double-buffered X and WT staging: next tile's loads overlap
+//      current tile's WMMA compute (ping-pong smem slots).
+//
+// qs layout: Marlin tile-major, same 64-row tiles as moe_w4a16_marlin.
+// A 128-N-tile block straddles two consecutive 64-N Marlin tiles (nt0, nt0+1).
+// 256 threads × 1 u32/tile → both tiles load in a single fully-coalesced pass.
+//
+// smem breakdown (per block):
+//   smem_X [2][128*32] f16 = 16384 B  (double-buffered X)
+//   smem_WT[2][32*128] f16 = 16384 B  (double-buffered W^T, already dequanted)
+//   smem_SC[128]       f32 =   512 B  (preloaded scales for this K-step)
+//   smem_C [128*128]   f32 = 65536 B  (accumulator)
+//   Total                  = 98816 B  (~96 KB; GB10 has 228 KB/SM)
+//
+// n_out % 128 == 0 and k_in % 32 == 0 required.
+extern "C" __global__ void moe_w4a16_marlin128(
+    const unsigned int* __restrict__ qs,      // Marlin Q4: n_exp*(n_out/64)*(k_in/32)*256
+    const __half*       __restrict__ scales,  // f16 scales: n_exp*n_out*(k_in/32)
+    const __half*       __restrict__ x,       // [m_total, k_in] f16
+    const unsigned int* __restrict__ indices, // [m_total] expert ids
+    __half*             __restrict__ out,     // [m_total, n_out] f16
+    int m_total, int n_out, int k_in)
+{
+    const int n_tile_base = blockIdx.x * 128;
+    const int m_tile_base = blockIdx.y * 128;
+    const int warp_id     = threadIdx.x >> 5;   // 0..7
+    const int t           = threadIdx.x;         // 0..255
+
+    // Warp covers [warp_m_base..+64) × [warp_n_base..+32) of the 128×128 tile.
+    const int warp_m_base = (warp_id >> 2) * 64; // 0 or 64
+    const int warp_n_base = (warp_id  & 3) * 32; // 0, 32, 64, or 96
+
+    // smem layout (all offsets in bytes):
+    //   [0       .. 16384) smem_X [2][128*32] __half
+    //   [16384   .. 32768) smem_WT[2][32*128] __half
+    //   [32768   .. 33280) smem_SC[128]       float
+    //   [33280   .. 98816) smem_C [128*128]   float
+    extern __shared__ char smem_raw[];
+    __half* smem_X  = (__half*)(smem_raw);
+    __half* smem_WT = (__half*)(smem_raw + 16384);
+    float*  smem_SC = (float* )(smem_raw + 32768);
+    float*  smem_C  = (float* )(smem_raw + 33280);
+
+    const int bpr             = k_in / 32;
+    const int n_tiles64       = n_out / 64;
+    const int nblk_per_expert = n_out * bpr;
+    const int nt0             = blockIdx.x * 2;  // first 64-N Marlin tile index
+
+    // 4×2 WMMA accumulator per warp: 4 m-frags × 2 n-frags = 64(m) × 32(n).
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[4][2];
+
+    // ── Helper: load scales for kt into smem_SC ────────────────────────────
+    // Threads 0..127 each load one scale; threads 128..255 idle.
+    // Caller must __syncthreads() after this before reading smem_SC.
+    #define LOAD_SCALES(kt_)                                                   \
+        if (t < 128) {                                                         \
+            int n_col = n_tile_base + t;                                       \
+            smem_SC[t] = __half2float(                                         \
+                scales[(size_t)cur_exp * nblk_per_expert + n_col * bpr + (kt_)]); \
+        }
+
+    // ── Helper: load X for kb_ into smem_X[slot_] ─────────────────────────
+    // Thread t: local_row = t>>1, k_half = (t&1)<<4 → 16 halves.
+    #define LOAD_X(slot_, kb_)                                                 \
+        {                                                                      \
+            int lr  = t >> 1, kh = (t & 1) << 4;                              \
+            int gr  = m_tile_base + lr;                                        \
+            bool ok = (lr >= sub_offset) & (lr < sub_end) & (gr < m_total);   \
+            int sr  = ok ? gr : 0;                                             \
+            const __half* xs = x + (size_t)sr * k_in + (kb_) + kh;           \
+            __half*       xd = smem_X + (slot_) * (128*32) + lr * 32 + kh;   \
+            __half zero = __float2half(0.f);                                   \
+            _Pragma("unroll")                                                  \
+            for (int _i = 0; _i < 16; _i++) xd[_i] = ok ? xs[_i] : zero;    \
+        }
+
+    // ── Helper: load WT for kt_ into smem_WT[slot_] ───────────────────────
+    // Two loads: half-0 (n_local 0..63 from nt0) and half-1 (64..127 from nt0+1).
+    // 256 threads × 1 u32 per tile (256 u32s/tile) → perfectly coalesced.
+    // smem_SC must already be populated for kt_.
+    #define LOAD_WT(slot_, kt_)                                                \
+        {                                                                      \
+            /* half-0: n_local 0..63, Marlin tile nt0 */                       \
+            {                                                                  \
+                unsigned w0 = qs_exp[(size_t)nt0 * bpr * 256 + (size_t)(kt_) * 256 + t]; \
+                int kl = t % 32, rg = t / 32;                                 \
+                _Pragma("unroll")                                               \
+                for (int _i = 0; _i < 8; _i++) {                              \
+                    int nl = rg * 8 + _i;                                      \
+                    unsigned nib = (w0 >> (_i*4)) & 0xf;                      \
+                    int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
+                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                        __float2half((float)qs_val * smem_SC[nl]);             \
+                }                                                              \
+            }                                                                  \
+            /* half-1: n_local 64..127, Marlin tile nt0+1 */                   \
+            {                                                                  \
+                unsigned w1 = qs_exp[(size_t)(nt0+1) * bpr * 256 + (size_t)(kt_) * 256 + t]; \
+                int kl = t % 32, rg = t / 32;                                 \
+                _Pragma("unroll")                                               \
+                for (int _i = 0; _i < 8; _i++) {                              \
+                    int nl = 64 + rg * 8 + _i;                                \
+                    unsigned nib = (w1 >> (_i*4)) & 0xf;                      \
+                    int qs_val = (int)(nib >= 8u ? nib - 16u : nib);          \
+                    smem_WT[(slot_)*(32*128) + kl*128 + nl] =                 \
+                        __float2half((float)qs_val * smem_SC[nl]);             \
+                }                                                              \
+            }                                                                  \
+        }
+
+    // ── Per-expert sub-run loop ────────────────────────────────────────────
+    int sub_offset = 0;
+    for (int _sub = 0; _sub < 128; _sub++) {
+        int cur_row = m_tile_base + sub_offset;
+        if (sub_offset >= 128 || cur_row >= m_total) break;
+        unsigned cur_exp = indices[cur_row];
+
+        int sub_end = sub_offset;
+        for (int ii = sub_offset; ii < 128; ii++) {
+            int r = m_tile_base + ii;
+            if (r >= m_total || indices[r] != cur_exp) break;
+            sub_end = ii + 1;
+        }
+
+        #pragma unroll
+        for (int mi = 0; mi < 4; mi++)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+                wmma::fill_fragment(c_frag[mi][ni], 0.0f);
+
+        const unsigned int* qs_exp = qs + (size_t)cur_exp * n_tiles64 * bpr * 256;
+
+        // ── Prologue: fill smem_SC[kt=0], then load buf=0 X + WT ──────────
+        LOAD_SCALES(0)
+        __syncthreads();
+        LOAD_X(0, 0)
+        LOAD_WT(0, 0)
+        __syncthreads();
+
+        // ── Main K-loop: compute buf, prefetch next into 1-buf ─────────────
+        for (int kb = 0; kb < k_in; kb += 32) {
+            const int kt       = kb / 32;
+            const int buf      = kt & 1;
+            const int next_buf = buf ^ 1;
+            const int next_kt  = kt + 1;
+            const int next_kb  = kb + 32;
+
+            // Start prefetching scales for next K-tile while we compute.
+            // The __syncthreads() at the end of this iteration makes them visible
+            // before the next LOAD_WT reads smem_SC.
+            if (next_kb < k_in) {
+                LOAD_SCALES(next_kt)
+            }
+
+            // WMMA compute on buf: 2 ki-steps × 4 mi-frags × 2 ni-frags.
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
+            #pragma unroll
+            for (int ki = 0; ki < 2; ki++) {
+                const int k_off = ki * 16;
+                #pragma unroll
+                for (int mi = 0; mi < 4; mi++) {
+                    wmma::load_matrix_sync(a_frag,
+                        smem_X + buf * (128*32) + (warp_m_base + mi*16) * 32 + k_off,
+                        32);
+                    #pragma unroll
+                    for (int ni = 0; ni < 2; ni++) {
+                        wmma::load_matrix_sync(b_frag,
+                            smem_WT + buf * (32*128) + k_off * 128 + (warp_n_base + ni*16),
+                            128);
+                        wmma::mma_sync(c_frag[mi][ni], a_frag, b_frag, c_frag[mi][ni]);
+                    }
+                }
+            }
+            __syncthreads(); // scales prefetch + compute done; safe to write next_buf
+
+            if (next_kb < k_in) {
+                LOAD_X(next_buf, next_kb)
+                LOAD_WT(next_buf, next_kt)
+                __syncthreads(); // next_buf ready for next iteration
+            }
+        } // end K-loop
+
+        // ── Store accumulators → smem_C ────────────────────────────────────
+        #pragma unroll
+        for (int mi = 0; mi < 4; mi++)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+                wmma::store_matrix_sync(
+                    smem_C + (warp_m_base + mi*16) * 128 + (warp_n_base + ni*16),
+                    c_frag[mi][ni], 128, wmma::mem_row_major);
+        __syncthreads();
+
+        // ── Write smem_C → global out ──────────────────────────────────────
+        // 256 threads × 64 elements = 16384 = 128×128 ✓
+        #pragma unroll
+        for (int e = 0; e < 64; e++) {
+            int flat      = t * 64 + e;
+            int local_row = flat >> 7;
+            int local_col = flat & 127;
+            int global_m  = m_tile_base + local_row;
+            int global_n  = n_tile_base + local_col;
+            bool valid    = (local_row >= sub_offset) & (local_row < sub_end)
+                          & (global_m < m_total) & (global_n < n_out);
+            if (valid)
+                out[(size_t)global_m * n_out + global_n] =
+                    __float2half(smem_C[local_row * 128 + local_col]);
+        }
+        __syncthreads();
+
+        sub_offset = sub_end;
+    } // end per-expert loop
+
+    #undef LOAD_SCALES
+    #undef LOAD_X
+    #undef LOAD_WT
+}
+"#;
+
 /// W4A16 MoE grouped GEMM — Marlin coalesced layout.
 ///
 /// Drop-in replacement for `moe_w4a16` but requires `qs` to be in Marlin
@@ -3175,7 +3435,11 @@ extern "C" __global__ void moe_w4a16_marlin(
 /// 128-bit global reads for Q4 weights: 4 cache lines per warp per K-step
 /// vs ~64 in the standard nibble-scattered layout.
 ///
-/// `n_out % 64 == 0` required.
+/// Dispatches the 128×128×32 tile (256-thread, 8-warp) kernel when
+/// `n_out % 128 == 0` for higher compute density; falls back to the
+/// 64×64×32 tile kernel otherwise (`n_out % 64 == 0` required).
+/// `n_out % 128 == 0` for higher compute density; falls back to the
+/// 64×64×32 tile kernel otherwise (`n_out % 64 == 0` required).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_w4a16_marlin(
     dev: &dyn Device,
@@ -3194,28 +3458,56 @@ pub fn moe_w4a16_marlin(
     let m_total_i = m_total as i32;
     let n_out_i   = n_out   as i32;
     let k_in_i    = k_in    as i32;
-    dev.dispatch_raw_cuda(
-        MOE_W4A16_MARLIN_SRC,
-        "moe_w4a16_marlin.cu",
-        "moe_w4a16_marlin",
-        &[
-            (qs.buffer.as_ref(),      qs.offset),
-            (scales.buffer.as_ref(),  scales.offset),
-            (x.buffer.as_ref(),       x.offset),
-            (indices.buffer.as_ref(), indices.offset),
-            (out.buffer.as_ref(),     0),
-        ],
-        &[
-            m_total_i.to_le_bytes().to_vec(),
-            n_out_i.to_le_bytes().to_vec(),
-            k_in_i.to_le_bytes().to_vec(),
-        ],
-        [(n_out as u32) / 64, (m_total as u32).div_ceil(64), 1],
-        [128, 1, 1],
-        // smem: X(4096) + WT(4096) + C(16384) = 24576 bytes
-        24576,
-        false,
-    )?;
+
+    // Use the 128×128 tile when n_out is a multiple of 128 (higher compute
+    // density: 4× accumulator, double-buffered loads, scale preload).
+    if n_out % 128 == 0 {
+        dev.dispatch_raw_cuda(
+            MOE_W4A16_MARLIN128_SRC,
+            "moe_w4a16_marlin128.cu",
+            "moe_w4a16_marlin128",
+            &[
+                (qs.buffer.as_ref(),      qs.offset),
+                (scales.buffer.as_ref(),  scales.offset),
+                (x.buffer.as_ref(),       x.offset),
+                (indices.buffer.as_ref(), indices.offset),
+                (out.buffer.as_ref(),     0),
+            ],
+            &[
+                m_total_i.to_le_bytes().to_vec(),
+                n_out_i.to_le_bytes().to_vec(),
+                k_in_i.to_le_bytes().to_vec(),
+            ],
+            [(n_out as u32) / 128, (m_total as u32).div_ceil(128), 1],
+            [256, 1, 1],
+            // smem: X_db(16384) + WT_db(16384) + SC(512) + C(65536) = 98816 bytes (~96 KB)
+            98816,
+            false,
+        )?;
+    } else {
+        dev.dispatch_raw_cuda(
+            MOE_W4A16_MARLIN_SRC,
+            "moe_w4a16_marlin.cu",
+            "moe_w4a16_marlin",
+            &[
+                (qs.buffer.as_ref(),      qs.offset),
+                (scales.buffer.as_ref(),  scales.offset),
+                (x.buffer.as_ref(),       x.offset),
+                (indices.buffer.as_ref(), indices.offset),
+                (out.buffer.as_ref(),     0),
+            ],
+            &[
+                m_total_i.to_le_bytes().to_vec(),
+                n_out_i.to_le_bytes().to_vec(),
+                k_in_i.to_le_bytes().to_vec(),
+            ],
+            [(n_out as u32) / 64, (m_total as u32).div_ceil(64), 1],
+            [128, 1, 1],
+            // smem: X(4096) + WT(4096) + C(16384) = 24576 bytes
+            24576,
+            false,
+        )?;
+    }
     Ok(out)
 }
 
