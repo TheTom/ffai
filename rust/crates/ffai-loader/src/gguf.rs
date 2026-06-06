@@ -50,6 +50,12 @@ pub struct Gguf {
     tensors: BTreeMap<String, GgufTensor>,
     pub metadata_u32: BTreeMap<String, u32>,
     pub metadata_str: BTreeMap<String, String>,
+    /// Scalar f32 metadata (e.g. `qwen2.rope.freq_base`, `*.rms_norm_eps`).
+    pub metadata_f32: BTreeMap<String, f32>,
+    /// String-array metadata (e.g. `tokenizer.ggml.tokens`, `.merges`).
+    pub metadata_arr_str: BTreeMap<String, Vec<String>>,
+    /// Int-array metadata (e.g. `tokenizer.ggml.token_type`).
+    pub metadata_arr_i32: BTreeMap<String, Vec<i32>>,
 }
 
 struct Cursor<'a> {
@@ -67,34 +73,44 @@ impl<'a> Cursor<'a> {
         self.p += 8;
         v
     }
+    fn f32(&mut self) -> f32 {
+        let v = f32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        self.p += 4;
+        v
+    }
     fn gstr(&mut self) -> String {
         let n = self.u64() as usize;
         let s = String::from_utf8_lossy(&self.b[self.p..self.p + n]).into_owned();
         self.p += n;
         s
     }
-    /// Consume a metadata value of `vtype`, returning a u32 if scalar-int or a
-    /// String if string (for the few config fields we keep), else None.
-    fn skip_value(&mut self, vtype: u32) -> (Option<u32>, Option<String>) {
+    /// Read a scalar metadata value of `vtype`, returning whichever of
+    /// {u32 (any scalar int/bool), f32, String} it decodes to. (Arrays are
+    /// handled separately by the caller so the elements can be collected.)
+    fn read_scalar(&mut self, vtype: u32) -> (Option<u32>, Option<f32>, Option<String>) {
         match vtype {
-            0 | 1 => { self.p += 1; (Some(self.b[self.p - 1] as u32), None) }
-            2 | 3 => { let v = u16::from_le_bytes(self.b[self.p..self.p + 2].try_into().unwrap()); self.p += 2; (Some(v as u32), None) }
-            4 | 5 => (Some(self.u32()), None),
-            6 => { self.p += 4; (None, None) } // f32
-            7 => { self.p += 1; (Some(self.b[self.p - 1] as u32), None) } // bool
-            8 => (None, Some(self.gstr())),
-            10 | 11 => { let v = self.u64(); self.p += 0; (Some(v as u32), None) }
-            12 => { self.p += 8; (None, None) } // f64
-            9 => {
-                // array: elem_type u32, len u64, then len elems
-                let et = self.u32();
-                let len = self.u64();
-                for _ in 0..len {
-                    self.skip_value(et);
-                }
-                (None, None)
-            }
-            _ => (None, None),
+            0 | 1 => { self.p += 1; (Some(self.b[self.p - 1] as u32), None, None) }
+            2 | 3 => { let v = u16::from_le_bytes(self.b[self.p..self.p + 2].try_into().unwrap()); self.p += 2; (Some(v as u32), None, None) }
+            4 | 5 => (Some(self.u32()), None, None),
+            6 => { let v = self.f32(); (None, Some(v), None) } // f32
+            7 => { self.p += 1; (Some(self.b[self.p - 1] as u32), None, None) } // bool
+            8 => (None, None, Some(self.gstr())),
+            10 | 11 => { let v = self.u64(); (Some(v as u32), None, None) }
+            12 => { self.p += 8; (None, None, None) } // f64
+            _ => (None, None, None),
+        }
+    }
+    /// Consume one metadata value of `vtype`, skipping its bytes (used to walk
+    /// past array elements we don't keep).
+    fn skip_one(&mut self, vtype: u32) {
+        match vtype {
+            0 | 1 | 7 => self.p += 1,
+            2 | 3 => self.p += 2,
+            4 | 5 | 6 => self.p += 4,
+            10 | 11 | 12 => self.p += 8,
+            8 => { let _ = self.gstr(); }
+            9 => { let et = self.u32(); let len = self.u64(); for _ in 0..len { self.skip_one(et); } }
+            _ => {}
         }
     }
 }
@@ -138,16 +154,46 @@ impl Gguf {
 
         let mut metadata_u32 = BTreeMap::new();
         let mut metadata_str = BTreeMap::new();
+        let mut metadata_f32 = BTreeMap::new();
+        let mut metadata_arr_str: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut metadata_arr_i32: BTreeMap<String, Vec<i32>> = BTreeMap::new();
         let mut alignment: u64 = 32;
         for _ in 0..n_kv {
             let key = c.gstr();
             let vtype = c.u32();
-            let (u, s) = c.skip_value(vtype);
+            if vtype == 9 {
+                // array: elem_type u32, len u64, then len elems. We collect
+                // string arrays (tokenizer vocab/merges) and int arrays
+                // (token_type/scores indices); everything else is skipped.
+                let et = c.u32();
+                let len = c.u64() as usize;
+                match et {
+                    8 => {
+                        let mut v = Vec::with_capacity(len);
+                        for _ in 0..len { v.push(c.gstr()); }
+                        metadata_arr_str.insert(key.clone(), v);
+                    }
+                    0 | 1 | 2 | 3 | 4 | 5 | 7 | 10 | 11 => {
+                        let mut v = Vec::with_capacity(len);
+                        for _ in 0..len {
+                            let (u, _, _) = c.read_scalar(et);
+                            v.push(u.unwrap_or(0) as i32);
+                        }
+                        metadata_arr_i32.insert(key.clone(), v);
+                    }
+                    _ => { for _ in 0..len { c.skip_one(et); } }
+                }
+                continue;
+            }
+            let (u, fl, s) = c.read_scalar(vtype);
             if let Some(u) = u {
                 if key == "general.alignment" {
                     alignment = u as u64;
                 }
                 metadata_u32.insert(key.clone(), u);
+            }
+            if let Some(fl) = fl {
+                metadata_f32.insert(key.clone(), fl);
             }
             if let Some(s) = s {
                 metadata_str.insert(key.clone(), s);
@@ -166,7 +212,29 @@ impl Gguf {
 
         // Align the data section start.
         let data_start = c.p.next_multiple_of(alignment as usize);
-        Ok(Gguf { bytes, data_start, tensors, metadata_u32, metadata_str })
+        Ok(Gguf {
+            bytes,
+            data_start,
+            tensors,
+            metadata_u32,
+            metadata_str,
+            metadata_f32,
+            metadata_arr_str,
+            metadata_arr_i32,
+        })
+    }
+
+    /// Read a `u32`/int scalar from metadata under `key`.
+    pub fn meta_u32(&self, key: &str) -> Option<u32> {
+        self.metadata_u32.get(key).copied()
+    }
+    /// Read an `f32` scalar from metadata under `key` (e.g. rope freq base, eps).
+    pub fn meta_f32(&self, key: &str) -> Option<f32> {
+        self.metadata_f32.get(key).copied()
+    }
+    /// Read a string scalar from metadata under `key`.
+    pub fn meta_str(&self, key: &str) -> Option<&str> {
+        self.metadata_str.get(key).map(|s| s.as_str())
     }
 
     pub fn tensor_names(&self) -> impl Iterator<Item = &String> {

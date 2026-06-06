@@ -21,5 +21,6 @@ pub trait Model: Send + Sync {
 }
 
 pub mod dsv4;
+pub mod gguf_tokenizer;
 pub mod llama;
 pub mod moe;

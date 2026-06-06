@@ -113,6 +113,7 @@ dependencies = [
  "ffai-models",
  "ffai-modeltests",
  "ffai-ops",
+ "ffai-runtime",
  "metaltile-core",
  "metaltile-runtime",
  "parking_lot",
@@ -160,6 +161,8 @@ name = "ffai-vulkan"
 version = "0.1.0"
 dependencies = [
  "ffai-core",
+ "metaltile-core",
+ "metaltile-runtime",
 ]
 
 [[package]]
