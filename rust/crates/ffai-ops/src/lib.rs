@@ -3601,6 +3601,14 @@ pub fn moe_grouped_gemm(
     let up_slot = inter * hid;
     let dn_slot = hid * inter;
 
+    // NOTE: A grouped-batched cuBLAS variant (one cublasGemmGroupedBatchedEx per
+    // pass instead of the per-expert gemm_tc_off loop) was measured on GB10 @
+    // S=2048 and found to be both INCORRECT (output garbage) and SLOWER than the
+    // per-expert loop: with ~107 active experts each group has only ~19 tokens, so
+    // the grouped GEMM is a skinny m≈19 GEMM that tiles poorly (≈10 TFLOP/s vs the
+    // per-expert path's 27), and the per-call cuMemAlloc/free of the device pointer
+    // arrays serializes the stream. Per-expert cuBLAS (27 TFLOP/s) remains best.
+
     // ── UP scratch: full `n_active` slots (distinct regions per chunk so chunk
     // N+1's dequant overlaps chunk N's GEMMs — same-buffer reuse would serialize). ──
     let up_w_owned: Option<Tensor>;

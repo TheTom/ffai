@@ -1071,7 +1071,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // internal A/B shows it neutral-to-negative — casts cost ≥ halved-read saves).
     // DEFAULT OFF (f32, no casts); opt in with NEMOTRON_F16KV.
     let f16kv = std::env::var("NEMOTRON_F16KV").is_ok();
-    let cap = fakectx.max(prefill) + n_decode + 8; // KV-cache capacity (positions)
+    // KV-cache capacity (positions). In the batched-prefill path the queries
+    // run at positions [fakectx, fakectx+prefill), so the cache must hold the
+    // full fakectx prefix PLUS the whole prefill block PLUS the decode tail —
+    // i.e. fakectx + prefill, NOT max(fakectx, prefill). Using max() under-sized
+    // the cache whenever both were nonzero, so sdpa_multi/kv_append_many walked
+    // past the buffer (base_kv + n_query > kv_stride) → illegal memory access at
+    // deep context. (Plain decode, where one of the two is 0, is unaffected.)
+    let cap = fakectx + prefill + n_decode + 8;
     // per-layer state, indexed by absolute layer id. KV cache is now ON-DEVICE
     // ([nkv,cap,hd] per attn layer), so the growing context never round-trips
     // through the host — the 32K decode fix.
@@ -1108,6 +1115,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // Because we can't use macros in closures portably, we inline this pattern.
     // The (tm, te, ta, th) coarse cells kept for backward compat display.
     let (tm, te, ta, th) = (std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64));
+
+    // INSTRUMENTATION (correctness audit): capture the last-token logit vector of
+    // the most recent `step()` call so the prefill gate can compute logit-level
+    // metrics (cosine, top-5 overlap, max-abs err) vs the batched path. REVERT.
+    thread_local! { static LAST_STEP_LOGITS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    thread_local! { static STEP_LAYER_TRACE: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    thread_local! { static BATCHED_LAYER_TRACE: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    thread_local! { static STEP0_FROZEN: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    type SsmDump = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+    thread_local! { static SEQ_SSM_DUMP: std::cell::RefCell<SsmDump> = const { std::cell::RefCell::new((Vec::new(),Vec::new(),Vec::new(),Vec::new())) }; }
+    thread_local! { static BAT_SSM_DUMP: std::cell::RefCell<SsmDump> = const { std::cell::RefCell::new((Vec::new(),Vec::new(),Vec::new(),Vec::new())) }; }
 
     // one decode step at absolute position `pos`; returns next-token logits' argmax
     let step = |token: usize, pos: usize,
@@ -1179,6 +1197,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             ssm_step(d, &x_ssm, &fwd[&format!("{p}.mixer.A_log")], &bmat, &cmat, &fwd[&format!("{p}.mixer.D")], &dt, ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap()
                         });
                         ssm_state[l] = Some(so);
+                        // INSTRUMENTATION (revert): dump L0 SSM in/out for the seq path.
+                        if l == 0 && std::env::var("NEMOTRON_DUMP_SSM").is_ok() {
+                            let xs = dl(&x_ssm, di); let yy = dl(&y_t, di);
+                            let bb = dl(&bmat, ng*ds); let cc = dl(&cmat, ng*ds);
+                            SEQ_SSM_DUMP.with(|c| *c.borrow_mut() = (xs, bb, cc, yy));
+                        }
                         // gated_group_rmsnorm: reads y_t (di*4B) + zt (di*4B) + norm weight (di*4B)
                         let yn = pt!(8, di * 12, gated_group_rmsnorm(d, &y_t, &zt, &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, di, gs).unwrap());
                         // out_proj gemv_q4/q8: recipe → Q8
@@ -1187,6 +1211,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // add residual: reads xt (hid*4B) + out (hid*4B)
                         xt = pt!(27, hid * 8, add(d, &xt, &out).unwrap());
                         if prof { d.synchronize().ok(); let e = step_t0.map(|_| 0.0).unwrap_or(0.0); let _ = e; tm.set(tm.get()); } // coarse compat
+                        if std::env::var("NEMOTRON_DUMP_LAYERS").is_ok() {
+                            let h = dl(&xt, hid);
+                            STEP_LAYER_TRACE.with(|c| { let mut v = c.borrow_mut(); if v.len() <= l { v.resize(l+1, Vec::new()); } v[l] = h; });
+                        }
                         continue;
                     }
                     let proj = dl(&pt!(1, if use_nvfp4_recipe { in_proj_out * hid + in_proj_out * 4 + hid * 4 } else { in_proj_out * hid / 2 + in_proj_out * 2 + hid * 4 },
@@ -1357,6 +1385,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let c = match mix { 'M' => &tm, 'E' => &te, _ => &ta };
                 let _ = c; // section totals now computed from fine-grained op_t
             }
+            // INSTRUMENTATION (revert): dump this token's hidden after layer l.
+            // Overwritten every step → after the seq loop holds the LAST token trace.
+            if std::env::var("NEMOTRON_DUMP_LAYERS").is_ok() {
+                let h = dl(&xt, hid);
+                STEP_LAYER_TRACE.with(|c| { let mut v = c.borrow_mut(); if v.len() <= l { v.resize(l+1, Vec::new()); } v[l] = h; });
+            }
         }
         // Final norm + lm_head
         let xf = pt!(25, hid * 8, rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap());
@@ -1376,6 +1410,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             step_wall.set(step_wall.get() + step_t0.unwrap().elapsed().as_secs_f64());
             step_count.set(step_count.get() + 1);
         }
+        LAST_STEP_LOGITS.with(|c| *c.borrow_mut() = logits.clone()); // INSTRUMENTATION: revert
         ffai_runtime::argmax(&logits)
     };
 
@@ -1494,6 +1529,22 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
                 }
             };
+            // Like `qmm` but takes a PRE-CAST f16 activation `xh` (skips the input
+            // cast_f32_f16). Lets multiple projections over the SAME normed input
+            // (q/k/v from `xn`, shared-expert up from `xn`) share one f16 cast
+            // instead of re-casting per projection — kills redundant slice/cast.
+            // cuBLAS tensor-core path only (the fast prefill path).
+            let qmm_h = |xh: &Tensor, name: &str| -> Tensor {
+                let (qs, sc, m, k) = &qw[name];
+                let rows = xh.elem_count() / *k;
+                let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                let wf = deq16(name, qs, sc, *m, *k, 0);
+                let oh = pf!(2, flops, gemm_cublas(d, xh, &wf, rows, *m, *k).unwrap());
+                pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
+            };
+            // Fuse-slice-cast opt-in (NEMOTRON_FUSE_QKV=1): cast xn→f16 once per
+            // attention/shared block and reuse via qmm_h. Default off (A/B).
+            let fuse_qkv = std::env::var("NEMOTRON_FUSE_QKV").is_ok() && !use_f32_gemm && !use_mpp_gemm;
             // Pre-allocate grouped-GEMM weight scratch buffers (max size, reused across layers).
             // Avoids per-layer cuMemAlloc which is expensive. Allocated once at max expert count.
             // UP scratch: [n_exp * inter, hid] f16 (for all 128 experts, even if only ~107 active).
@@ -1625,6 +1676,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         };
                         ssm_state[l] = Some(so);
                         let y = dl(&y_dev, s * di); // [s, di]
+                        // INSTRUMENTATION (revert): dump L0 last-token SSM in/out (batched).
+                        if l == 0 && std::env::var("NEMOTRON_DUMP_SSM").is_ok() {
+                            let o = (s-1)*di; let og = (s-1)*ng*ds;
+                            let xs = xssm[o..o+di].to_vec();
+                            let bb = bmat_all[og..og+ng*ds].to_vec();
+                            let cc = cmat_all[og..og+ng*ds].to_vec();
+                            let yy = y[o..o+di].to_vec();
+                            BAT_SSM_DUMP.with(|c| *c.borrow_mut() = (xs, bb, cc, yy));
+                        }
                         // gated group rmsnorm per token, then out_proj batched.
                         let nw = &fw[&format!("{p}.mixer.norm.weight")];
                         let mut yn = vec![0.0f32; s * di];
@@ -2004,9 +2064,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         xt = add(d, &xt, &upm(&acc_h, vec![s, hid])).unwrap();
                     }
                     '*' => {
-                        let q_all = qmm(&xn, &format!("{p}.mixer.q_proj.weight")); // [s, qdim]=[s,nq*hd]
-                        let k_all = qmm(&xn, &format!("{p}.mixer.k_proj.weight")); // [s, kvdim]=[s,nkv*hd]
-                        let v_all = qmm(&xn, &format!("{p}.mixer.v_proj.weight")); // [s, kvdim]
+                        // Cast xn→f16 ONCE, reuse for q/k/v (NEMOTRON_FUSE_QKV) — else per-proj cast.
+                        let (q_all, k_all, v_all) = if fuse_qkv {
+                            let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap());
+                            (qmm_h(&xnh, &format!("{p}.mixer.q_proj.weight")),
+                             qmm_h(&xnh, &format!("{p}.mixer.k_proj.weight")),
+                             qmm_h(&xnh, &format!("{p}.mixer.v_proj.weight")))
+                        } else {
+                            (qmm(&xn, &format!("{p}.mixer.q_proj.weight")),
+                             qmm(&xn, &format!("{p}.mixer.k_proj.weight")),
+                             qmm(&xn, &format!("{p}.mixer.v_proj.weight")))
+                        };
+                        // [s, qdim]=[s,nq*hd]; k/v [s, kvdim]=[s,nkv*hd]
                         // PART C: eliminate dl(q)/dl(k)/dl(v) + per-token rope dispatches.
                         // Build positions [s] once, use batched rope_llama_many + kv_append_many.
                         if kvcache[l].is_none() {
@@ -2032,6 +2101,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         xt = add(d, &xt, &o).unwrap();
                     }
                     _ => unreachable!(),
+                }
+                // INSTRUMENTATION (revert): dump a token's hidden after layer l.
+                // DUMP_TOK0=1 → token 0 (position 0, no cross-token influence);
+                // else last token.
+                if std::env::var("NEMOTRON_DUMP_LAYERS").is_ok() {
+                    let tsel = if std::env::var("NEMOTRON_DUMP_TOK0").is_ok() { 0 } else { s-1 };
+                    let h = dl(&slice(d, &xt, tsel*hid, hid).unwrap(), hid);
+                    BATCHED_LAYER_TRACE.with(|c| { let mut v = c.borrow_mut(); if v.len() <= l { v.resize(l+1, Vec::new()); } v[l] = h; });
                 }
             }
             // final norm + lm_head on the LAST token only.
@@ -2063,21 +2140,57 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
             let _ = &seq_convdev; let _ = &mut seq_conv;
             let mut seq_argmax = 0usize;
+            let dump_tok0 = std::env::var("NEMOTRON_DUMP_TOK0").is_ok();
             for (i, &id) in ids.iter().enumerate() {
                 seq_argmax = step(id, fakectx + i, &mut seq_conv, &mut seq_ssm, &mut seq_kv);
+                // INSTRUMENTATION (revert): when comparing token 0, freeze the
+                // sequential trace at the FIRST step (it's overwritten each call).
+                if dump_tok0 && i == 0 {
+                    let frozen = STEP_LAYER_TRACE.with(|c| c.borrow().clone());
+                    STEP0_FROZEN.with(|c| *c.borrow_mut() = frozen);
+                }
+            }
+            if dump_tok0 {
+                let f = STEP0_FROZEN.with(|c| c.borrow().clone());
+                STEP_LAYER_TRACE.with(|c| *c.borrow_mut() = f);
             }
             d.synchronize().ok();
             // reset shared conv_dev (step mutated the OUTER one) before batched run.
-            { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
-            let mut chk_ssm: Vec<Option<Tensor>> = (0..52).map(|_| None).collect();
-            let mut chk_kv: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
-            let bat_argmax = forward_batched(&ids, &conv_dev, &mut chk_ssm, &mut chk_kv, fakectx);
-            d.synchronize().ok();
+            // INSTRUMENTATION: snapshot the sequential reference logits BEFORE any
+            // batched run can overwrite shared thread_locals.
+            let seq_logits = LAST_STEP_LOGITS.with(|c| c.borrow().clone());
+            // ── NONDETERMINISM PROBE (correctness audit; REVERT) ─────────────────
+            // Run the batched forward N times with IDENTICAL ids + fresh states.
+            // Record per-run last-token argmax + max-abs logit delta vs run 0.
+            let n_repeat: usize = std::env::var("NEMOTRON_REPEAT").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let mut run0_logits: Vec<f32> = Vec::new();
+            let mut last_bat_logits: Vec<f32> = Vec::new();
+            let mut bat_argmax = 0usize;
+            for r in 0..n_repeat.max(1) {
+                { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+                let mut chk_ssm: Vec<Option<Tensor>> = (0..52).map(|_| None).collect();
+                let mut chk_kv: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
+                let am = forward_batched(&ids, &conv_dev, &mut chk_ssm, &mut chk_kv, fakectx);
+                d.synchronize().ok();
+                let bl = LAST_BATCHED_LOGITS.with(|c| c.borrow().clone());
+                if r == 0 { run0_logits = bl.clone(); bat_argmax = am; }
+                // max-abs delta vs run0
+                let maxd = if run0_logits.len() == bl.len() {
+                    run0_logits.iter().zip(bl.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max)
+                } else { f32::NAN };
+                // top-2 gap of this run (near-tie indicator)
+                let mut sorted: Vec<f32> = bl.clone(); sorted.sort_by(|a,b| b.partial_cmp(a).unwrap());
+                let top1 = sorted.get(0).copied().unwrap_or(0.0);
+                let top2 = sorted.get(1).copied().unwrap_or(0.0);
+                eprintln!("  [REPEAT {r}] batched argmax={am}  maxAbsΔ(vs run0)={maxd:.6}  top1={top1:.5} top2={top2:.5} top1-top2={:.6}", top1-top2);
+                last_bat_logits = bl;
+            }
+            let _ = last_bat_logits;
             // Near-tie diagnosis: rank the sequential argmax within the batched
             // logit distribution + report the gap between batched-argmax and the
             // sequential token's logit. If they differ but the gap is < a few %,
             // it's a precision near-tie (Q4-GEMV vs dequant→f32-GEMM), not a bug.
-            let blog = LAST_BATCHED_LOGITS.with(|c| c.borrow().clone());
+            let blog = if !run0_logits.is_empty() { run0_logits.clone() } else { LAST_BATCHED_LOGITS.with(|c| c.borrow().clone()) };
             let (rank, seq_logit, top_logit) = if !blog.is_empty() && seq_argmax < blog.len() {
                 let sv = blog[seq_argmax];
                 let top = blog[bat_argmax];
@@ -2102,6 +2215,78 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                               else if near_tie { "NEAR-TIE PASS ✓ (precision flip: same top-5, <2% gap)" }
                               else { "MISMATCH ✗ (structural bug)" });
             let _ = pass;
+            // ── LOGIT-LEVEL AGREEMENT (correctness audit; REVERT) ────────────────
+            // The real correctness question: does the FULL batched logit vector
+            // agree with the trusted sequential reference? argmax can flip on a
+            // near-tie; cosine + top-5 overlap + max-abs/rel err are the signal.
+            if seq_logits.len() == blog.len() && !blog.is_empty() {
+                let n = blog.len();
+                // cosine similarity
+                let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                let (mut maxabs, mut sumsq_err, mut sumsq_ref) = (0f64, 0f64, 0f64);
+                for i in 0..n {
+                    let (a, b) = (seq_logits[i] as f64, blog[i] as f64);
+                    dot += a*b; na += a*a; nb += b*b;
+                    let e = (a-b).abs();
+                    if e > maxabs { maxabs = e; }
+                    sumsq_err += (a-b)*(a-b); sumsq_ref += a*a;
+                }
+                let cos = dot / (na.sqrt()*nb.sqrt()).max(1e-30);
+                let rel_l2 = (sumsq_err.sqrt()) / (sumsq_ref.sqrt()).max(1e-30);
+                // top-5 of each
+                let top5 = |v: &[f32]| { let mut idx: Vec<usize> = (0..v.len()).collect();
+                    idx.sort_by(|&a,&b| v[b].partial_cmp(&v[a]).unwrap()); idx.truncate(5); idx };
+                let t5s = top5(&seq_logits); let t5b = top5(&blog);
+                let overlap = t5s.iter().filter(|x| t5b.contains(x)).count();
+                eprintln!("──────── LOGIT-LEVEL AGREEMENT (seq-ref vs batched, S={s}) ────────");
+                eprintln!("  cosine similarity   = {cos:.8}");
+                eprintln!("  max-abs logit error = {maxabs:.6}");
+                eprintln!("  relative L2 error   = {rel_l2:.6}");
+                eprintln!("  top-5 overlap       = {overlap}/5");
+                eprintln!("  seq-ref top5 = {:?}", t5s.iter().map(|&i| (i, seq_logits[i])).collect::<Vec<_>>());
+                eprintln!("  batched top5 = {:?}", t5b.iter().map(|&i| (i, blog[i])).collect::<Vec<_>>());
+            } else {
+                eprintln!("  LOGIT-LEVEL: length mismatch seq={} bat={} — skipped", seq_logits.len(), blog.len());
+            }
+            // ── PER-LAYER DIVERGENCE TRACE (NEMOTRON_DUMP_LAYERS=1; REVERT) ───────
+            if std::env::var("NEMOTRON_DUMP_LAYERS").is_ok() {
+                let st = STEP_LAYER_TRACE.with(|c| c.borrow().clone());
+                let bt = BATCHED_LAYER_TRACE.with(|c| c.borrow().clone());
+                eprintln!("──────── PER-LAYER LAST-TOKEN DIVERGENCE (seq vs batched) ────────");
+                eprintln!("  layer mix : cosine     maxAbs    relL2");
+                let nl = st.len().min(bt.len());
+                for l in 0..nl {
+                    if st[l].len() != bt[l].len() || st[l].is_empty() { continue; }
+                    let mix = PATTERN.chars().nth(l).unwrap_or('?');
+                    let (mut dot, mut na, mut nb, mut maxa, mut se, mut sr) = (0f64,0f64,0f64,0f64,0f64,0f64);
+                    for i in 0..st[l].len() {
+                        let (a,b) = (st[l][i] as f64, bt[l][i] as f64);
+                        dot+=a*b; na+=a*a; nb+=b*b; let e=(a-b).abs(); if e>maxa {maxa=e;} se+=(a-b)*(a-b); sr+=a*a;
+                    }
+                    let cos = dot/(na.sqrt()*nb.sqrt()).max(1e-30);
+                    let rl2 = se.sqrt()/sr.sqrt().max(1e-30);
+                    eprintln!("  L{l:>3} {mix}   : {cos:.6}  {maxa:.5}  {rl2:.5}");
+                }
+                eprintln!("──────────────────────────────────────────────────");
+            }
+            // ── L0 SSM IN/OUT COMPARISON (NEMOTRON_DUMP_SSM=1; REVERT) ───────────
+            if std::env::var("NEMOTRON_DUMP_SSM").is_ok() {
+                let (sx,sb,sc,sy) = SEQ_SSM_DUMP.with(|c| c.borrow().clone());
+                let (bx,bb,bc,by) = BAT_SSM_DUMP.with(|c| c.borrow().clone());
+                let cmp = |name: &str, a: &[f32], b: &[f32]| {
+                    if a.len()!=b.len() || a.is_empty() { eprintln!("  {name}: len mismatch {}/{}", a.len(), b.len()); return; }
+                    let (mut dot,mut na,mut nb,mut mx)=(0f64,0f64,0f64,0f64);
+                    for i in 0..a.len(){let(x,y)=(a[i]as f64,b[i]as f64);dot+=x*y;na+=x*x;nb+=y*y;let e=(x-y).abs();if e>mx{mx=e;}}
+                    let cos=dot/(na.sqrt()*nb.sqrt()).max(1e-30);
+                    eprintln!("  {name:>6}: cosine={cos:.7}  maxAbs={mx:.6}");
+                };
+                eprintln!("──────── L0 SSM IN/OUT (seq vs batched, LAST token) ────────");
+                cmp("x_ssm", &sx, &bx);
+                cmp("B", &sb, &bb);
+                cmp("C", &sc, &bc);
+                cmp("y(SSM)", &sy, &by);
+                eprintln!("──────────────────────────────────────────────────");
+            }
             eprintln!("──────────────────────────────────────────────────");
             // reset shared state after the gate.
             { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
