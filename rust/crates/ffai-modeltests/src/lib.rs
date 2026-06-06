@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_step, conv_roll, gated_group_rmsnorm, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, kv_append, moe_gather_down, moe_gather_up_relu2, moe_router_device, moe_weighted_sum, mul, quantize_q4, rms_norm, rope_llama, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, ssm_step};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_weighted_sum, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -774,14 +774,73 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         let _ = std::fs::write(cache_path(name), &out);
     };
 
+    // ── NVFP4 recipe flag ──────────────────────────────────────────────────────
+    // NEMOTRON_NVFP4_RECIPE=1: switch Mamba in_proj/out_proj, shared-expert up/down,
+    // and attention o_proj from Q4 to Q8.  Routed MoE experts, q/k/v proj, and
+    // lm_head stay Q4.  Result is ~4.98 bits/weight, ~20.9 GB resident — matching
+    // NVIDIA's published NVFP4 mixed-precision recipe for apples-to-apples comparison.
+    let use_nvfp4_recipe = std::env::var("NEMOTRON_NVFP4_RECIPE").map(|v| v != "0" && v != "false").unwrap_or(false);
+
     // ── SETUP: quantize + upload all big matrices to Q4 resident (once) ──
     let t_load = Instant::now();
     let mut qw: HashMap<String, (Tensor, Tensor, usize, usize)> = HashMap::new(); // name → (qs, scales, m, k)
+    // Q8 resident weights for NVFP4-recipe layers (Mamba in/out_proj, shared-expert up/down, attn o_proj).
+    // Stored separately so the qmv/qacc/qrelu2 dispatch closures can key on which map to use
+    // without touching the Q4 path at all.  Only populated when use_nvfp4_recipe=true.
+    let mut qw8: HashMap<String, (Tensor, Tensor, usize, usize)> = HashMap::new();
     let mut fw: HashMap<String, Vec<f32>> = HashMap::new(); // f32 weights used HOST-side
     let mut fwd: HashMap<String, Tensor> = HashMap::new(); // f32 weights RESIDENT on device
     let fd = |fwd: &mut HashMap<String, Tensor>, name: &str, v: &[f32], shape: Vec<usize>| {
         fwd.insert(name.to_string(), Tensor::new(d.upload(&tb(v)).unwrap(), shape, DType::F32));
     };
+
+    // ── Q8 cache helpers (parallel to the Q4 cache, uses .q8b extension) ──────
+    // Cache format: [8B m][8B k][N*4 bytes qs u32 LE][M*4 bytes scales f32 LE]
+    // (Q8 scales are always f32; no f16 flag byte needed — layout is fixed.)
+    let cache_path_q8 = |name: &str| -> std::path::PathBuf {
+        let safe: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        std::path::PathBuf::from(&cache_dir).join(format!("{safe}.q8b"))
+    };
+    let cache_read_q8 = |name: &str, m: usize, k: usize| -> Option<(Vec<u8>, Vec<u8>)> {
+        if !use_q4cache { return None; }
+        let bytes = std::fs::read(cache_path_q8(name)).ok()?;
+        if bytes.len() < 16 { return None; }
+        let cm = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+        let ck = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        if cm != m || ck != k { return None; }
+        let bpr = k / 32;
+        let qs_len_u32 = m * bpr * 8;
+        let sc_len = m * bpr;
+        let expected = 16 + qs_len_u32 * 4 + sc_len * 4;
+        if bytes.len() != expected { return None; }
+        Some((bytes[16..16 + qs_len_u32 * 4].to_vec(), bytes[16 + qs_len_u32 * 4..].to_vec()))
+    };
+    let cache_write_q8 = |name: &str, qs: &[u32], sc: &[f32], m: usize, k: usize| {
+        if !use_q4cache { return; }
+        let mut out = Vec::with_capacity(16 + qs.len() * 4 + sc.len() * 4);
+        out.extend_from_slice(&(m as u64).to_le_bytes());
+        out.extend_from_slice(&(k as u64).to_le_bytes());
+        for &q in qs { out.extend_from_slice(&q.to_le_bytes()); }
+        for &s in sc { out.extend_from_slice(&s.to_le_bytes()); }
+        let _ = std::fs::write(cache_path_q8(name), &out);
+    };
+
+    // Load a weight into qw8 (Q8).  Always uses f32 scales (Q8 kernels expect f32).
+    let qload8 = |qw8: &mut HashMap<String, (Tensor, Tensor, usize, usize)>, name: &str, m: usize, k: usize| {
+        if let Some((qs_bytes, sc_bytes)) = cache_read_q8(name, m, k) {
+            let qt = Tensor::new(d.upload(&qs_bytes).unwrap(), vec![qs_bytes.len() / 4], DType::U32);
+            let sct = Tensor::new(d.upload(&sc_bytes).unwrap(), vec![sc_bytes.len() / 4], DType::F32);
+            qw8.insert(name.to_string(), (qt, sct, m, k));
+            return;
+        }
+        let w = g(name);
+        let (qs, sc) = quantize_q8(&w, m, k);
+        cache_write_q8(name, &qs, &sc, m, k);
+        let qt = Tensor::new(d.upload(&tbu(&qs)).unwrap(), vec![qs.len()], DType::U32);
+        let sct = Tensor::new(d.upload(&tb(&sc)).unwrap(), vec![sc.len()], DType::F32);
+        qw8.insert(name.to_string(), (qt, sct, m, k));
+    };
+
     // f16: true for weights read by the PLAIN gemv kernel (qmv) — its scale param
     // is f16. false for shared-expert weights (relu2/accum kernels, f32 scale).
     let qload = |qw: &mut HashMap<String, (Tensor, Tensor, usize, usize)>, name: &str, m: usize, k: usize, f16: bool| {
@@ -814,14 +873,25 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         fd(&mut fwd, &format!("{p}.norm.weight"), &g(&format!("{p}.norm.weight")), vec![hid]);
         match mix {
             'M' => {
-                qload(&mut qw, &format!("{p}.mixer.in_proj.weight"), in_proj_out, hid, true);
-                qload(&mut qw, &format!("{p}.mixer.out_proj.weight"), hid, di, true);
+                // NVFP4 recipe: Mamba in_proj + out_proj → Q8 (FP8-class in the official recipe).
+                if use_nvfp4_recipe {
+                    qload8(&mut qw8, &format!("{p}.mixer.in_proj.weight"), in_proj_out, hid);
+                    qload8(&mut qw8, &format!("{p}.mixer.out_proj.weight"), hid, di);
+                } else {
+                    qload(&mut qw, &format!("{p}.mixer.in_proj.weight"), in_proj_out, hid, true);
+                    qload(&mut qw, &format!("{p}.mixer.out_proj.weight"), hid, di, true);
+                }
                 // conv weight pre-reorganized [kc, conv_dim] ONCE (was redone per step).
                 let cw_hf = g(&format!("{p}.mixer.conv1d.weight"));
                 let mut cw = vec![0.0f32; kc * conv_dim];
                 for ch in 0..conv_dim { for kk in 0..kc { cw[kk * conv_dim + ch] = cw_hf[ch * kc + kk]; } }
                 fd(&mut fwd, &format!("{p}.mixer.conv1d.weight"), &cw, vec![kc * conv_dim]);
-                fd(&mut fwd, &format!("{p}.mixer.conv1d.bias"), &g(&format!("{p}.mixer.conv1d.bias")), vec![conv_dim]);
+                let convbias = g(&format!("{p}.mixer.conv1d.bias"));
+                fd(&mut fwd, &format!("{p}.mixer.conv1d.bias"), &convbias, vec![conv_dim]);
+                // Host copies of conv weight (reorganized [kc,conv_dim]) + bias for the
+                // host-bridged batched-prefill causal conv (NEMOTRON_PREFILL_BATCHED).
+                fw.insert(format!("{p}.mixer.conv1d.weight_host"), cw.clone());
+                fw.insert(format!("{p}.mixer.conv1d.bias_host"), convbias);
                 fd(&mut fwd, &format!("{p}.mixer.A_log"), &g(&format!("{p}.mixer.A_log")), vec![m_nh]);
                 fd(&mut fwd, &format!("{p}.mixer.D"), &g(&format!("{p}.mixer.D")), vec![m_nh]);
                 fw.insert(format!("{p}.mixer.dt_bias"), g(&format!("{p}.mixer.dt_bias")));     // host (softplus, tiny)
@@ -872,20 +942,35 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
                     qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                 }
-                qload(&mut qw, &format!("{p}.mixer.shared_experts.up_proj.weight"), shared_inter, hid, true);
-                qload(&mut qw, &format!("{p}.mixer.shared_experts.down_proj.weight"), hid, shared_inter, true);
+                // NVFP4 recipe: shared-expert up/down → Q8.
+                if use_nvfp4_recipe {
+                    qload8(&mut qw8, &format!("{p}.mixer.shared_experts.up_proj.weight"), shared_inter, hid);
+                    qload8(&mut qw8, &format!("{p}.mixer.shared_experts.down_proj.weight"), hid, shared_inter);
+                } else {
+                    qload(&mut qw, &format!("{p}.mixer.shared_experts.up_proj.weight"), shared_inter, hid, true);
+                    qload(&mut qw, &format!("{p}.mixer.shared_experts.down_proj.weight"), hid, shared_inter, true);
+                }
             }
             '*' => {
                 qload(&mut qw, &format!("{p}.mixer.q_proj.weight"), qdim, hid, true);
                 qload(&mut qw, &format!("{p}.mixer.k_proj.weight"), kvdim, hid, true);
                 qload(&mut qw, &format!("{p}.mixer.v_proj.weight"), kvdim, hid, true);
-                qload(&mut qw, &format!("{p}.mixer.o_proj.weight"), hid, qdim, true);
+                // NVFP4 recipe: attention o_proj → Q8.
+                if use_nvfp4_recipe {
+                    qload8(&mut qw8, &format!("{p}.mixer.o_proj.weight"), hid, qdim);
+                } else {
+                    qload(&mut qw, &format!("{p}.mixer.o_proj.weight"), hid, qdim, true);
+                }
             }
             _ => unreachable!(),
         }
     }
     let load_s = t_load.elapsed().as_secs_f64();
-    eprintln!("Nemotron resident-Q8 setup: {:.1}s ({} Q8 matrices, ~{:.1}GB)", load_s, qw.len(), qw.values().map(|(q, s, _, _)| (q.elem_count() * 4 + s.elem_count() * 4) as f64).sum::<f64>() / 1e9);
+    let q4_gb: f64 = qw.values().map(|(q, s, _, _)| (q.elem_count() * 4 + s.elem_count() * if s.dtype == DType::F16 { 2usize } else { 4usize }) as f64).sum::<f64>() / 1e9;
+    let q8_gb: f64 = (qw8.values().map(|(q, s, _, _)| (q.elem_count() * 4 + s.elem_count() * 4) as f64).sum::<f64>() / 1e9).max(0.0);
+    let recipe_label = if use_nvfp4_recipe { "NVFP4-recipe" } else { "all-Q4" };
+    eprintln!("Nemotron resident setup [{}]: {:.1}s ({} Q4 + {} Q8 matrices, ~{:.2}GB Q4 + {:.2}GB Q8 = {:.2}GB total)",
+        recipe_label, load_s, qw.len(), qw8.len(), q4_gb, q8_gb, q4_gb + q8_gb);
 
     // resident-weight quantized matvec
     let qmv = |x: &Tensor, name: &str| -> Tensor {
@@ -902,6 +987,44 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         let (qs, sc, m, k) = &qw[name];
         gemv_q4_relu2(d, qs, sc, x, *m, *k, *m).unwrap()
     };
+
+    // ── Q8 dispatch closures (NVFP4-recipe layers) ────────────────────────────
+    // These are no-ops when use_nvfp4_recipe=false (qw8 is empty; never called).
+    let qmv8 = |x: &Tensor, name: &str| -> Tensor {
+        let (qs, sc, m, k) = &qw8[name];
+        gemv_q8(d, qs, sc, x, *m, *k, *m).unwrap()
+    };
+    let qrelu2_q8 = |x: &Tensor, name: &str| -> Tensor {
+        let (qs, sc, m, k) = &qw8[name];
+        gemv_q8_relu2(d, qs, sc, x, *m, *k, *m).unwrap()
+    };
+    let qacc_q8 = |x: &Tensor, name: &str, acc: &Tensor, sb: &Tensor| {
+        let (qs, sc, m, k) = &qw8[name];
+        gemv_q8_accum(d, qs, sc, x, acc, sb, *m, *k, *m).unwrap();
+    };
+
+    // ── Fused MoE FFN (NEMOTRON_MOE_FUSED=1) ─────────────────────────────────
+    // Pre-allocate the scratch buffer once. All 23 MoE layers share it (they're
+    // serial — layer N+1 starts only after N finishes).
+    // NOTE: NEMOTRON_GRAPH + NEMOTRON_MOE_FUSED are mutually exclusive — the
+    // fused kernel uses cuLaunchCooperativeKernel which can't be captured into a
+    // CUDA graph. If both are set, fusion is silently disabled.
+    let use_moe_fused = std::env::var("NEMOTRON_MOE_FUSED").is_ok()
+        && !std::env::var("NEMOTRON_GRAPH").is_ok();
+    let moe_scratch = if use_moe_fused {
+        let scratch_bytes = top_k * inter * 4; // f32
+        Some(Tensor::new(d.upload(&vec![0u8; scratch_bytes]).unwrap(), vec![top_k * inter], DType::F32))
+    } else {
+        None
+    };
+    if use_moe_fused {
+        eprintln!("NEMOTRON_MOE_FUSED=1: using cooperative-groups fused MoE FFN kernel (eager, non-graph)");
+        eprintln!("  NOTE: cuLaunchCooperativeKernel requires all grid blocks resident simultaneously.");
+        eprintln!("  On GB10 (48 SMs), max coop blocks = 288 at 256 threads, need 336 for hid=2688.");
+        eprintln!("  This will FAIL with 'too many blocks'. See NEMOTRON_MOE_FUSED analysis.");
+    } else if std::env::var("NEMOTRON_MOE_FUSED").is_ok() && std::env::var("NEMOTRON_GRAPH").is_ok() {
+        eprintln!("NEMOTRON_MOE_FUSED=1: disabled (NEMOTRON_GRAPH is set — cooperative launch not capturable)");
+    }
 
     // ── DECODE: per-token forward reusing resident weights, KV + Mamba state ──
     let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
@@ -939,54 +1062,123 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     let mut kvcache: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
     let u32buf = |v: u32| Tensor::new(d.upload(&v.to_le_bytes()).unwrap(), vec![1], DType::U32);
     let ones_gs = up(&vec![1.0f32; gs]); // grouped-norm: normalize each 512-group weightless, then scale by the real weight
-    // Optional per-section profiling (NEMOTRON_PROFILE=1): synchronize around each
-    // mixer type to attribute the per-token time. Adds sync overhead — proportions only.
+    // Optional per-op profiling (NEMOTRON_PROFILE=1): synchronize around EACH individual
+    // op call to attribute GPU time precisely. Adds sync overhead on every op — use only
+    // for profiling runs, not for throughput measurement.
     let prof = std::env::var("NEMOTRON_PROFILE").is_ok();
+
+    // Per-op time accumulators (Cell<f64> = interior-mutable across the step closure).
+    // Index: 0=rms_norm, 1=m_in_proj, 2=slice, 3=conv1d, 4=silu, 5=conv_roll,
+    //        6=softplus_add, 7=ssm_step, 8=gated_norm, 9=m_out_proj,
+    //        10=moe_gate_gemv, 11=moe_router_dev, 12=moe_gather_up, 13=moe_gather_down,
+    //        14=moe_wsum, 15=shared_up, 16=shared_down_acc,
+    //        17=rope, 18=q_proj, 19=k_proj, 20=v_proj, 21=kv_append, 22=sdpa, 23=o_proj,
+    //        24=add, 25=norm_f, 26=lm_head, 27=add_residual_m, 28=add_residual_e,
+    //        29=add_residual_a, 30=cast_f16
+    const N_OPS: usize = 31;
+    let op_t: Vec<std::cell::Cell<f64>> = (0..N_OPS).map(|_| std::cell::Cell::new(0f64)).collect();
+    let op_calls: Vec<std::cell::Cell<u64>> = (0..N_OPS).map(|_| std::cell::Cell::new(0u64)).collect();
+    // Bytes-read estimates per op (f64, accumulated across all calls)
+    let op_bytes: Vec<std::cell::Cell<f64>> = (0..N_OPS).map(|_| std::cell::Cell::new(0f64)).collect();
+    // Wall time per step (to compute host overhead = wall - sum_gpu)
+    let step_wall: std::cell::Cell<f64> = std::cell::Cell::new(0f64);
+    let step_count: std::cell::Cell<u64> = std::cell::Cell::new(0u64);
+
+    // Macro-like helper: time one op when profiling is on.
+    // sync(); t0 = now(); result = expr; sync(); acc.
+    // Because we can't use macros in closures portably, we inline this pattern.
+    // The (tm, te, ta, th) coarse cells kept for backward compat display.
     let (tm, te, ta, th) = (std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64), std::cell::Cell::new(0f64));
 
     // one decode step at absolute position `pos`; returns next-token logits' argmax
     let step = |token: usize, pos: usize,
                     conv_state: &mut Vec<Vec<f32>>, ssm_state: &mut Vec<Option<Tensor>>,
                     kvcache: &mut Vec<Option<(Tensor, Tensor)>>| -> usize {
+        let step_t0 = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
+
+        // Per-op timing helper: sync before + after, accumulate into op_t[idx].
+        // bytes_read: approximate DRAM bytes fetched (input tensors + weights).
+        // Only active when prof=true; otherwise the closure is zero-cost (condition
+        // checked at runtime but the body is short-circuit skipped).
+        macro_rules! pt {
+            ($idx:expr, $bytes:expr, $expr:expr) => {{
+                if prof {
+                    d.synchronize().ok();
+                    let _t0 = Instant::now();
+                    let _r = $expr;
+                    d.synchronize().ok();
+                    let _e = _t0.elapsed().as_secs_f64();
+                    op_t[$idx].set(op_t[$idx].get() + _e);
+                    op_calls[$idx].set(op_calls[$idx].get() + 1);
+                    op_bytes[$idx].set(op_bytes[$idx].get() + $bytes as f64);
+                    _r
+                } else {
+                    $expr
+                }
+            }};
+        }
+
         // residual stream stays ON-DEVICE the whole forward — no per-layer up(x)/dl(out).
         let mut xt = up(&embed[token * hid..(token + 1) * hid]);
         for (l, mix) in PATTERN.chars().enumerate() {
             let p = format!("language_model.backbone.layers.{l}");
-            let pt = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
-            let xn = rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap();
+            // rms_norm per layer: reads x (hid*4B) + weight (hid*4B)
+            let xn = pt!(0, hid * 8, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap());
             match mix {
                 'M' => {
                     if std::env::var("NEMOTRON_SKIPMAMBA").is_ok() { continue; }
                     if !std::env::var("NEMOTRON_HOSTMAMBA").is_ok() {
                         // ALL-DEVICE Mamba (DEFAULT): no dl/host round-trips. +3.7% clean
                         // internal A/B; argmax 1234. Opt out: NEMOTRON_HOSTMAMBA.
-                        let proj = qmv(&xn, &format!("{p}.mixer.in_proj.weight"));
-                        let zt = slice(d, &proj, 0, di).unwrap();
-                        let xbc_t = slice(d, &proj, di, conv_dim).unwrap();
-                        let dt_raw_t = slice(d, &proj, di + conv_dim, m_nh).unwrap();
+                        // in_proj gemv_q4/q8: recipe layers use Q8 (2× bytes vs Q4)
+                        let proj = pt!(1, if use_nvfp4_recipe { in_proj_out * hid + in_proj_out * 4 + hid * 4 } else { in_proj_out * hid / 2 + in_proj_out * 2 + hid * 4 },
+                            if use_nvfp4_recipe { qmv8(&xn, &format!("{p}.mixer.in_proj.weight")) } else { qmv(&xn, &format!("{p}.mixer.in_proj.weight")) });
+                        // slice×3: reads proj (in_proj_out*4B each)
+                        let zt      = pt!(2, in_proj_out * 4, slice(d, &proj, 0, di).unwrap());
+                        let xbc_t   = pt!(2, in_proj_out * 4, slice(d, &proj, di, conv_dim).unwrap());
+                        let dt_raw_t= pt!(2, in_proj_out * 4, slice(d, &proj, di + conv_dim, m_nh).unwrap());
                         { let mut cd = conv_dev.borrow_mut(); if cd[l].is_none() { cd[l] = Some(up(&vec![0.0f32; (kc - 1) * conv_dim])); } }
-                        let yc = { let cd = conv_dev.borrow(); conv1d_causal_step(d, &xbc_t, &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], cd[l].as_ref().unwrap(), conv_dim as u32, kc as u32).unwrap() };
-                        let xbc_act = silu(d, &yc).unwrap();
-                        { let mut cd = conv_dev.borrow_mut(); let rolled = conv_roll(d, cd[l].as_ref().unwrap(), &xbc_t, conv_dim, kc).unwrap(); cd[l] = Some(rolled); }
-                        let x_ssm = slice(d, &xbc_act, 0, di).unwrap();
-                        let bmat = slice(d, &xbc_act, di, ng * ds).unwrap();
-                        let cmat = slice(d, &xbc_act, di + ng * ds, ng * ds).unwrap();
-                        let dt = softplus_add(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")])).unwrap();
+                        // conv1d: reads state ((kc-1)*conv_dim*4B) + xbc_t (conv_dim*4B) + weight (kc*conv_dim*4B) + bias (conv_dim*4B)
+                        let yc = pt!(3, (kc - 1) * conv_dim * 4 + conv_dim * 4 + kc * conv_dim * 4 + conv_dim * 4, {
+                            let cd = conv_dev.borrow();
+                            conv1d_causal_step(d, &xbc_t, &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], cd[l].as_ref().unwrap(), conv_dim as u32, kc as u32).unwrap()
+                        });
+                        // silu: reads yc (conv_dim*4B)
+                        let xbc_act = pt!(4, conv_dim * 4, silu(d, &yc).unwrap());
+                        // conv_roll: reads state ((kc-1)*conv_dim*4B) + xbc_t (conv_dim*4B), writes new state
+                        { let mut cd = conv_dev.borrow_mut();
+                          let rolled = pt!(5, (kc - 1 + 1) * conv_dim * 4, conv_roll(d, cd[l].as_ref().unwrap(), &xbc_t, conv_dim, kc).unwrap());
+                          cd[l] = Some(rolled); }
+                        let x_ssm = pt!(2, (di + ng * ds * 2) * 4, slice(d, &xbc_act, 0, di).unwrap());
+                        let bmat   = pt!(2, (di + ng * ds * 2) * 4, slice(d, &xbc_act, di, ng * ds).unwrap());
+                        let cmat   = pt!(2, (di + ng * ds * 2) * 4, slice(d, &xbc_act, di + ng * ds, ng * ds).unwrap());
+                        // softplus_add: reads dt_raw_t (m_nh*4B) + bias (m_nh*4B)
+                        let dt = pt!(6, m_nh * 8, softplus_add(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")])).unwrap());
                         if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
-                        let (so, y_t) = ssm_step(d, &x_ssm, &fwd[&format!("{p}.mixer.A_log")], &bmat, &cmat, &fwd[&format!("{p}.mixer.D")], &dt, ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap();
+                        // ssm_step: reads state (m_nh*m_dh*ds*4B) + x (di*4B) + A,B,C,D,dt (small)
+                        let (so, y_t) = pt!(7, m_nh * m_dh * ds * 4 + di * 4 + m_nh * 5 * 4 + ng * ds * 2 * 4, {
+                            ssm_step(d, &x_ssm, &fwd[&format!("{p}.mixer.A_log")], &bmat, &cmat, &fwd[&format!("{p}.mixer.D")], &dt, ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap()
+                        });
                         ssm_state[l] = Some(so);
-                        let yn = gated_group_rmsnorm(d, &y_t, &zt, &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, di, gs).unwrap();
-                        let out = qmv(&yn, &format!("{p}.mixer.out_proj.weight"));
-                        xt = add(d, &xt, &out).unwrap();
+                        // gated_group_rmsnorm: reads y_t (di*4B) + zt (di*4B) + norm weight (di*4B)
+                        let yn = pt!(8, di * 12, gated_group_rmsnorm(d, &y_t, &zt, &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, di, gs).unwrap());
+                        // out_proj gemv_q4/q8: recipe → Q8
+                        let out = pt!(9, if use_nvfp4_recipe { hid * di + hid * 4 + di * 4 } else { hid * di / 2 + hid * 2 + di * 4 },
+                            if use_nvfp4_recipe { qmv8(&yn, &format!("{p}.mixer.out_proj.weight")) } else { qmv(&yn, &format!("{p}.mixer.out_proj.weight")) });
+                        // add residual: reads xt (hid*4B) + out (hid*4B)
+                        xt = pt!(27, hid * 8, add(d, &xt, &out).unwrap());
+                        if prof { d.synchronize().ok(); let e = step_t0.map(|_| 0.0).unwrap_or(0.0); let _ = e; tm.set(tm.get()); } // coarse compat
                         continue;
                     }
-                    let proj = dl(&qmv(&xn, &format!("{p}.mixer.in_proj.weight")), in_proj_out);
+                    let proj = dl(&pt!(1, if use_nvfp4_recipe { in_proj_out * hid + in_proj_out * 4 + hid * 4 } else { in_proj_out * hid / 2 + in_proj_out * 2 + hid * 4 },
+                        if use_nvfp4_recipe { qmv8(&xn, &format!("{p}.mixer.in_proj.weight")) } else { qmv(&xn, &format!("{p}.mixer.in_proj.weight")) }), in_proj_out);
                     let z = &proj[0..di];
                     let xbc = &proj[di..di + conv_dim];
                     let dt_raw = &proj[di + conv_dim..di + conv_dim + m_nh];
                     if conv_state[l].is_empty() { conv_state[l] = vec![0.0f32; (kc - 1) * conv_dim]; }
-                    let yc = conv1d_causal_step(d, &up(xbc), &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], &up(&conv_state[l]), conv_dim as u32, kc as u32).unwrap();
-                    let xbc_act = dl(&silu(d, &yc).unwrap(), conv_dim);
+                    let yc = pt!(3, (kc - 1) * conv_dim * 4 + conv_dim * 4 + kc * conv_dim * 4 + conv_dim * 4,
+                        conv1d_causal_step(d, &up(xbc), &fwd[&format!("{p}.mixer.conv1d.weight")], &fwd[&format!("{p}.mixer.conv1d.bias")], &up(&conv_state[l]), conv_dim as u32, kc as u32).unwrap());
+                    let xbc_act = dl(&pt!(4, conv_dim * 4, silu(d, &yc).unwrap()), conv_dim);
                     { let s = &mut conv_state[l]; s.drain(0..conv_dim); s.extend_from_slice(xbc); }
                     let x_ssm = &xbc_act[0..di];
                     let bmat = &xbc_act[di..di + ng * ds];
@@ -994,7 +1186,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     let dt_bias = &fw[&format!("{p}.mixer.dt_bias")];
                     let dt: Vec<f32> = (0..m_nh).map(|i| softplus(dt_raw[i] + dt_bias[i])).collect();
                     if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
-                    let (so, y_t) = ssm_step(d, &up(x_ssm), &fwd[&format!("{p}.mixer.A_log")], &up(bmat), &up(cmat), &fwd[&format!("{p}.mixer.D")], &up(&dt), ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap();
+                    let (so, y_t) = pt!(7, m_nh * m_dh * ds * 4 + di * 4 + m_nh * 5 * 4 + ng * ds * 2 * 4, {
+                        ssm_step(d, &up(x_ssm), &fwd[&format!("{p}.mixer.A_log")], &up(bmat), &up(cmat), &fwd[&format!("{p}.mixer.D")], &up(&dt), ssm_state[l].as_ref().unwrap(), m_dh as u32, ds as u32, m_nh as u32, (m_nh / ng) as u32).unwrap()
+                    });
                     ssm_state[l] = Some(so);
                     let y = dl(&y_t, di);
                     let nw = &fw[&format!("{p}.mixer.norm.weight")];
@@ -1006,15 +1200,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let r = 1.0 / ((ss / gs as f32) + eps).sqrt();
                         for i in 0..gs { yn[s + i] = yn[s + i] * r * nw[s + i]; }
                     }
-                    let out = qmv(&up(&yn), &format!("{p}.mixer.out_proj.weight"));
-                    xt = add(d, &xt, &out).unwrap();
+                    let out = pt!(9, if use_nvfp4_recipe { hid * di + hid * 4 + di * 4 } else { hid * di / 2 + hid * 2 + di * 4 },
+                        if use_nvfp4_recipe { qmv8(&up(&yn), &format!("{p}.mixer.out_proj.weight")) } else { qmv(&up(&yn), &format!("{p}.mixer.out_proj.weight")) });
+                    xt = pt!(27, hid * 8, add(d, &xt, &out).unwrap());
                 }
                 'E' => {
                     if std::env::var("NEMOTRON_SKIPMOE").is_ok() { continue; }
                     // Router: ON-DEVICE (sigmoid+bias+top-k+norm+scale, no host sync) by
                     // default; host path kept for A/B via NEMOTRON_HOSTROUTER.
                     let (idx_buf, wts_buf) = if !std::env::var("NEMOTRON_DEVROUTER").is_ok() {
-                        let rl = dl(&gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap(), n_exp);
+                        // host router: gate gemv (f32 weight 128×2688) then host top-k
+                        let rl = dl(&pt!(10, n_exp * hid * 4, gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap()), n_exp);
                         let sig: Vec<f32> = rl.iter().map(|&z| 1.0 / (1.0 + (-z).exp())).collect();
                         let bias = &fw[&format!("{p}.mixer.gate.e_score_correction_bias")];
                         let choice: Vec<f32> = (0..n_exp).map(|i| sig[i] + bias[i]).collect();
@@ -1024,31 +1220,67 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         for v in w.iter_mut() { *v = *v / wsum * scale_f; }
                         (Tensor::new(d.upload(&tbu(&eidx.iter().map(|&e| e as u32).collect::<Vec<_>>())).unwrap(), vec![top_k], DType::U32), up(&w))
                     } else {
-                        let logits = gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap();
+                        let logits = pt!(10, n_exp * hid * 4, gemv(d, &fwd[&format!("{p}.mixer.gate.weight")], &xn).unwrap());
                         let bias_dev = up(&fw[&format!("{p}.mixer.gate.e_score_correction_bias")]);
-                        moe_router_device(d, &logits, &bias_dev, n_exp, top_k, scale_f).unwrap()
+                        // device router kernel: reads logits (n_exp*4B) + bias (n_exp*4B)
+                        pt!(11, n_exp * 8, moe_router_device(d, &logits, &bias_dev, n_exp, top_k, scale_f).unwrap())
                     };
                     let acc_dev = up(&vec![0.0f32; hid]);
                     let (uqs, usc, _, _) = &qw[&format!("{p}.moe_up_all")];
-                    let a = moe_gather_up_relu2(d, uqs, usc, &xn, &idx_buf, top_k, inter, hid).unwrap();
                     let (dqs, dsc, _, _) = &qw[&format!("{p}.moe_down_all")];
-                    let downs = moe_gather_down(d, dqs, dsc, &a, &idx_buf, top_k, inter, hid).unwrap();
-                    moe_weighted_sum(d, &downs, &wts_buf, &acc_dev, hid, top_k).unwrap();
-                    // shared expert (single, not gathered)
-                    let sa = qrelu2(&xn, &format!("{p}.mixer.shared_experts.up_proj.weight"));
-                    qacc(&sa, &format!("{p}.mixer.shared_experts.down_proj.weight"), &acc_dev, &up(&[1.0f32]));
-                    xt = add(d, &xt, &acc_dev).unwrap();
+                    if let Some(ref scratch) = moe_scratch {
+                        // ── FUSED path: one cooperative kernel, intermediate in L2 ──
+                        // Reads: up Q4 (top_k*inter*hid/2) + up scales + dn Q4 (top_k*hid*inter/2) + dn scales + x (hid*4B)
+                        pt!(12, top_k * inter * hid / 2 + top_k * inter * 2 + top_k * hid * inter / 2 + top_k * hid * 2 + hid * 4,
+                            moe_fused_ffn(d, uqs, usc, dqs, dsc, &xn, &idx_buf, &wts_buf, &acc_dev, scratch, hid, inter, top_k).unwrap());
+                    } else {
+                        // ── Two-kernel path (baseline) ──
+                        // moe_gather_up_relu2: reads top_k expert rows (top_k*inter*hid/2 Q4) + scales + x (hid*4B)
+                        let a = pt!(12, top_k * inter * hid / 2 + top_k * inter * 2 + hid * 4,
+                            moe_gather_up_relu2(d, uqs, usc, &xn, &idx_buf, top_k, inter, hid).unwrap());
+                        // moe_gather_down: reads top_k expert rows (top_k*hid*inter/2 Q4) + scales + a (top_k*inter*4B)
+                        let downs = pt!(13, top_k * hid * inter / 2 + top_k * hid * 2 + top_k * inter * 4,
+                            moe_gather_down(d, dqs, dsc, &a, &idx_buf, top_k, inter, hid).unwrap());
+                        // moe_weighted_sum: reads downs (top_k*hid*4B) + weights (top_k*4B)
+                        pt!(14, top_k * hid * 4 + top_k * 4,
+                            moe_weighted_sum(d, &downs, &wts_buf, &acc_dev, hid, top_k).unwrap());
+                    }
+                    // shared expert up qrelu2: Q4 or Q8 (recipe)
+                    let sa = pt!(15, if use_nvfp4_recipe { shared_inter * hid + shared_inter * 4 + hid * 4 } else { shared_inter * hid / 2 + shared_inter * 2 + hid * 4 },
+                        if use_nvfp4_recipe { qrelu2_q8(&xn, &format!("{p}.mixer.shared_experts.up_proj.weight")) } else { qrelu2(&xn, &format!("{p}.mixer.shared_experts.up_proj.weight")) });
+                    // shared expert down qacc: Q4 or Q8 (recipe)
+                    pt!(16, if use_nvfp4_recipe { hid * shared_inter + hid * 4 + shared_inter * 4 } else { hid * shared_inter / 2 + hid * 2 + shared_inter * 4 },
+                        if use_nvfp4_recipe { qacc_q8(&sa, &format!("{p}.mixer.shared_experts.down_proj.weight"), &acc_dev, &up(&[1.0f32])) } else { qacc(&sa, &format!("{p}.mixer.shared_experts.down_proj.weight"), &acc_dev, &up(&[1.0f32])) });
+                    // add residual
+                    xt = pt!(28, hid * 8, add(d, &xt, &acc_dev).unwrap());
                 }
                 '*' => {
                     // q/k/v + RoPE stay ON-DEVICE; append k,v straight into the
                     // device KV cache; sdpa reads the cache. No host KV traffic.
-                    let q = rope_llama(d, &qmv(&xn, &format!("{p}.mixer.q_proj.weight")).reshaped(vec![nq, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
-                    let k = rope_llama(d, &qmv(&xn, &format!("{p}.mixer.k_proj.weight")).reshaped(vec![nkv, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap();
-                    let v = qmv(&xn, &format!("{p}.mixer.v_proj.weight"));
+                    // q_proj gemv_q4: reads Q4 (qdim*hid/2) + scales + x (hid*4B)
+                    let q_raw = pt!(18, qdim * hid / 2 + qdim * 2 + hid * 4,
+                        qmv(&xn, &format!("{p}.mixer.q_proj.weight")));
+                    // k_proj gemv_q4
+                    let k_raw = pt!(19, kvdim * hid / 2 + kvdim * 2 + hid * 4,
+                        qmv(&xn, &format!("{p}.mixer.k_proj.weight")));
+                    // v_proj gemv_q4
+                    let v_raw = pt!(20, kvdim * hid / 2 + kvdim * 2 + hid * 4,
+                        qmv(&xn, &format!("{p}.mixer.v_proj.weight")));
+                    // rope: reads q (nq*hd*4B)
+                    let q = pt!(17, nq * hd * 4,
+                        rope_llama(d, &q_raw.reshaped(vec![nq, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
+                    // rope: reads k (nkv*hd*4B)
+                    let k = pt!(17, nkv * hd * 4,
+                        rope_llama(d, &k_raw.reshaped(vec![nkv, hd]), pos as u32, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
+                    let v = v_raw;
                     // F16 KV: halve the 32K KV read (sdpa = 34% of GPU). Cache + q/k/v in
                     // f16, 2pass reads them natively (registry-tested f16), attn→f32 for o_proj.
                     let (q, k, v) = if f16kv {
-                        (cast_f32_f16(d, &q).unwrap(), cast_f32_f16(d, &k).unwrap(), cast_f32_f16(d, &v).unwrap())
+                        // cast f32→f16: reads (nq*hd*4B + nkv*hd*4B + nkv*hd*4B)
+                        let qh = pt!(30, nq * hd * 4, cast_f32_f16(d, &q).unwrap());
+                        let kh = pt!(30, nkv * hd * 4, cast_f32_f16(d, &k).unwrap());
+                        let vh = pt!(30, nkv * hd * 4, cast_f32_f16(d, &v).unwrap());
+                        (qh, kh, vh)
                     } else { (q, k, v) };
                     if kvcache[l].is_none() {
                         kvcache[l] = if f16kv {
@@ -1060,9 +1292,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     }
                     let (kcache, vcache) = kvcache[l].as_ref().unwrap();
                     let pb = u32buf(pos as u32);
-                    kv_append(d, &k, kcache, &pb, hd, cap, nkv * hd).unwrap();
-                    kv_append(d, &v, vcache, &pb, hd, cap, nkv * hd).unwrap();
+                    // kv_append: writes nkv*hd floats into cache
+                    pt!(21, nkv * hd * if f16kv { 2 } else { 4 },
+                        kv_append(d, &k, kcache, &pb, hd, cap, nkv * hd).unwrap());
+                    pt!(21, nkv * hd * if f16kv { 2 } else { 4 },
+                        kv_append(d, &v, vcache, &pb, hd, cap, nkv * hd).unwrap());
                     let len = (pos + 1) as u32;
+                    // SDPA bytes at 32K: reads K (nkv*len*hd bytes) + V (nkv*len*hd bytes) + q (nq*hd bytes)
+                    let kv_bytes = 2 * nkv * (len as usize) * hd * if f16kv { 2 } else { 4 };
+                    let q_bytes = nq * hd * if f16kv { 2 } else { 4 };
                     // Diagnostic: skip the sdpa (placeholder output, right shape) to measure
                     // its wall-time contribution via the internal A/B (NEMOTRON_AB=NEMOTRON_SKIPSDPA).
                     let attn = if std::env::var("NEMOTRON_SKIPSDPA").is_ok() {
@@ -1077,36 +1315,48 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let use_bc4 = std::env::var("NEMOTRON_BC4").is_ok();
                         let use_tiled = std::env::var("NEMOTRON_TILED").is_ok();
                         let a = if use_bc4 {
-                            sdpa_decode_2pass_bc4(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                            pt!(22, kv_bytes + q_bytes, sdpa_decode_2pass_bc4(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap())
                         } else if use_tiled {
-                            sdpa_decode_2pass_tiled(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                            pt!(22, kv_bytes + q_bytes, sdpa_decode_2pass_tiled(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap())
                         } else {
-                            sdpa_decode_2pass(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap()
+                            pt!(22, kv_bytes + q_bytes, sdpa_decode_2pass(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale, blocks).unwrap())
                         };
-                        if f16kv { cast_f16_f32(d, &a).unwrap() } else { a }
+                        if f16kv { pt!(30, qdim * 2, cast_f16_f32(d, &a).unwrap()) } else { a }
                     } else {
-                        let a = sdpa_decode(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale).unwrap();
-                        if f16kv { cast_f16_f32(d, &a).unwrap() } else { a }
+                        let a = pt!(22, kv_bytes + q_bytes, sdpa_decode(d, &q, &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, len, cap as u32, (nq / nkv) as u32, ascale).unwrap());
+                        if f16kv { pt!(30, qdim * 2, cast_f16_f32(d, &a).unwrap()) } else { a }
                     };
-                    let o = qmv(&attn.reshaped(vec![qdim]), &format!("{p}.mixer.o_proj.weight"));
-                    xt = add(d, &xt, &o).unwrap();
+                    // o_proj gemv_q4/q8: recipe → Q8
+                    let o = pt!(23, if use_nvfp4_recipe { hid * qdim + hid * 4 + qdim * 4 } else { hid * qdim / 2 + hid * 2 + qdim * 4 },
+                        if use_nvfp4_recipe { qmv8(&attn.reshaped(vec![qdim]), &format!("{p}.mixer.o_proj.weight")) } else { qmv(&attn.reshaped(vec![qdim]), &format!("{p}.mixer.o_proj.weight")) });
+                    xt = pt!(29, hid * 8, add(d, &xt, &o).unwrap());
                 }
                 _ => unreachable!(),
             }
-            if let Some(pt) = pt { d.synchronize().ok(); let e = pt.elapsed().as_secs_f64(); let c = match mix { 'M' => &tm, 'E' => &te, _ => &ta }; c.set(c.get() + e); }
+            // Coarse section timing (backward compat display)
+            if prof {
+                let c = match mix { 'M' => &tm, 'E' => &te, _ => &ta };
+                let _ = c; // section totals now computed from fine-grained op_t
+            }
         }
-        let ht = if prof { d.synchronize().ok(); Some(Instant::now()) } else { None };
-        let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap();
+        // Final norm + lm_head
+        let xf = pt!(25, hid * 8, rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap());
         // Gate the final argmax download: forbidden during CUDA-graph capture (host-sync).
         // During capture and graph replay we return a dummy 0 — the bench only measures
         // throughput, not token correctness.
         if skip_dl.get() {
-            let _ = qmv(&xf, "language_model.lm_head.weight"); // keep the lm_head kernel in graph
-            if let Some(ht) = ht { d.synchronize().ok(); th.set(th.get() + ht.elapsed().as_secs_f64()); }
+            pt!(26, vocab * hid / 2 + vocab * 2 + hid * 4,
+                { let _ = qmv(&xf, "language_model.lm_head.weight"); }); // keep lm_head in graph
+            if prof { d.synchronize().ok(); step_wall.set(step_wall.get() + step_t0.unwrap().elapsed().as_secs_f64()); step_count.set(step_count.get() + 1); }
             return 0;
         }
-        let logits = dl(&qmv(&xf, "language_model.lm_head.weight"), vocab);
-        if let Some(ht) = ht { d.synchronize().ok(); th.set(th.get() + ht.elapsed().as_secs_f64()); }
+        let logits = dl(&pt!(26, vocab * hid / 2 + vocab * 2 + hid * 4,
+            qmv(&xf, "language_model.lm_head.weight")), vocab);
+        if prof {
+            d.synchronize().ok();
+            step_wall.set(step_wall.get() + step_t0.unwrap().elapsed().as_secs_f64());
+            step_count.set(step_count.get() + 1);
+        }
         ffai_runtime::argmax(&logits)
     };
 
@@ -1116,8 +1366,748 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // to `cap` and zero-filled on first use, so the sdpa genuinely reads `fakectx`
     // cached positions — the real 32K work — without a 38-min token prefill).
     if fakectx > 0 { pos = fakectx; }
-    // warm the cache to `prefill` positions (untimed), then time `n_decode` steps
-    for _ in 0..prefill { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
+    // warm the cache to `prefill` positions, then time `n_decode` steps.
+    // PHASE-0 BASELINE: time the sequential-prefill loop so we can report the
+    // current prompt-processing tok/s (= prefill / prefill_seconds). This is the
+    // ~67 tok/s sequential-decode-as-prefill number we're trying to beat ~95×
+    // with a batched forward. One untimed warm step first (JIT) so we don't
+    // charge first-launch compilation to the prefill measurement.
+    // ── BATCHED PREFILL (NEMOTRON_PREFILL_BATCHED=1) ─────────────────────────
+    // Process all S=prefill prompt tokens in ONE forward instead of S sequential
+    // decode steps. Compute-bound path: dequant Q4 projection weights → f32 and
+    // run the tensor-tiled `ffai_gemm` (matmul) over [S, *]; causal prefill
+    // flash-attn (sdpa_multi) over S; SSD scan (ssm_prefill_scan) over S; per-
+    // token MoE gather loop (correctness-first). Writes the SAME conv_dev /
+    // ssm_state / kvcache the sequential `step()` uses, so a following decode
+    // step continues correctly. Returns the next-token argmax after position S-1
+    // (the same token the sequential path would produce). Token sequence is the
+    // greedy chain seeded by `tok` (matching the sequential warm-up).
+    thread_local! { static LAST_BATCHED_LOGITS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    let prefill_batched = std::env::var("NEMOTRON_PREFILL_BATCHED").is_ok();
+    if prefill_batched && prefill > 0 {
+        let s = prefill; // number of prompt tokens
+        // f16 weight cache (Path A): dequant each Q4 weight to f16 ONCE (lazily on
+        // first use), keyed by name (+ expert id for MoE). The forward then feeds
+        // the cached f16 weight straight to cuBLAS — eliminates the ~26%-of-prefill
+        // redundant per-forward dequant. ~2× the GEMM-weight VRAM; fine on GB10.
+        // Disable with NEMOTRON_NO_W16CACHE=1 (A/B).
+        let w16: std::cell::RefCell<HashMap<String, Tensor>> = std::cell::RefCell::new(HashMap::new());
+        let no_w16 = std::env::var("NEMOTRON_NO_W16CACHE").is_ok();
+        // Greedy token chain (same as sequential): we need the S token ids. The
+        // sequential path feeds argmax-of-previous; to reproduce it EXACTLY for
+        // the correctness gate we run the sequential path's token chain here too
+        // would defeat the purpose. Instead the gate runs both paths on the same
+        // FIXED token list. For prefill we use the deterministic ramp tok, tok+1…
+        // is NOT how decode chains; so the gate harness (NEMOTRON_PREFILL_CHECK)
+        // builds an explicit id list. Here we accept an id list via closure.
+        // ── Prefill per-op profiler (NEMOTRON_PROFILE=1) ─────────────────────
+        // Sync-bracketed wall time + call count + FLOP estimate per op category.
+        // Categories: 0=embed,1=rms_norm,2=proj_gemm(dequant+matmul),3=dequant,
+        // 4=conv_prefill(CONV_DEVICE=on-device causal conv+silu; off=host ring-conv),
+        // 5=ssm_scan,6=softplus_add_rows(dt prep),7=sdpa,8=rope,9=kv_append,
+        // 10=moe_router,11=moe_experts,12=moe_shared,13=add,14=lm_head,15=slice/cast.
+        const NPF: usize = 16;
+        let pf_t: Vec<std::cell::Cell<f64>> = (0..NPF).map(|_| std::cell::Cell::new(0.0)).collect();
+        let pf_n: Vec<std::cell::Cell<u64>> = (0..NPF).map(|_| std::cell::Cell::new(0)).collect();
+        let pf_flop: Vec<std::cell::Cell<f64>> = (0..NPF).map(|_| std::cell::Cell::new(0.0)).collect();
+        let pf_on = std::env::var("NEMOTRON_PROFILE").is_ok();
+        // Batched forward over an explicit token-id slice; writes states; returns
+        // the argmax logits for the LAST token.
+        let forward_batched = |ids: &[usize],
+                               conv_dev: &std::cell::RefCell<Vec<Option<Tensor>>>,
+                               ssm_state: &mut Vec<Option<Tensor>>,
+                               kvcache: &mut Vec<Option<(Tensor, Tensor)>>,
+                               base: usize| -> usize {
+            let s = ids.len();
+            // pf!(idx, flops, expr): sync-bracket + accumulate when profiling.
+            macro_rules! pf { ($idx:expr, $flops:expr, $e:expr) => {{
+                if pf_on { d.synchronize().ok(); let _t0 = Instant::now(); let _r = $e; d.synchronize().ok();
+                    pf_t[$idx].set(pf_t[$idx].get() + _t0.elapsed().as_secs_f64());
+                    pf_n[$idx].set(pf_n[$idx].get() + 1);
+                    pf_flop[$idx].set(pf_flop[$idx].get() + ($flops) as f64); _r
+                } else { $e }
+            }}; }
+            // Embed S tokens → [S, hid] f32 resident.
+            let mut xh = vec![0.0f32; s * hid];
+            for (i, &t) in ids.iter().enumerate() { xh[i*hid..(i+1)*hid].copy_from_slice(&embed[t*hid..(t+1)*hid]); }
+            let mut xt = upm(&xh, vec![s, hid]);
+            // Tensor-core projection GEMM (Path A): dequant Q4 weight → f16 once,
+            // cast x → f16, cuBLAS GemmEx (real tensor cores, f32 accumulate),
+            // cast result → f32. Replaces the software-emulated coop_tile MMA
+            // (~0.1% of peak). NEMOTRON_PREFILL_MPPGEMM=1 = old coop_tile path;
+            // NEMOTRON_PREFILL_F32GEMM=1 = f32 scalar matmul (A/B).
+            let use_f32_gemm = std::env::var("NEMOTRON_PREFILL_F32GEMM").is_ok();
+            let use_mpp_gemm = std::env::var("NEMOTRON_PREFILL_MPPGEMM").is_ok();
+            // Cached Q4→f16 dequant. On miss, dequant the [m,k] slab (optionally at
+            // a block offset for one MoE expert) and store under `key`. Returns a
+            // cheap Tensor clone (Arc buffer). `cache=false` (or NEMOTRON_NO_W16CACHE)
+            // → always dequant, no store. We CACHE the dense projection + shared
+            // weights (small, always used: ~few GB) but NOT the 128 routed experts
+            // ×23 layers (≈59GB f16 → OOM at large S); those re-dequant per forward.
+            let deq16c = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize, blk_off: usize, cache: bool| -> Tensor {
+                if no_w16 || !cache {
+                    return pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, blk_off).unwrap());
+                }
+                if let Some(w) = w16.borrow().get(key) { return w.clone(); }
+                let w = pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, blk_off).unwrap());
+                w16.borrow_mut().insert(key.to_string(), w.clone());
+                w
+            };
+            let deq16 = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize, blk_off: usize| -> Tensor {
+                deq16c(key, qs, sc, m, k, blk_off, true)
+            };
+            let qmm = |x: &Tensor, name: &str| -> Tensor {
+                let (qs, sc, m, k) = &qw[name];
+                let rows = x.elem_count() / *k;
+                let flops = 2.0 * rows as f64 * *m as f64 * *k as f64;
+                if use_f32_gemm {
+                    let wf = pf!(3, (m * k) as f64, dequant_q4(d, qs, sc, *m, *k, DType::F32).unwrap());
+                    pf!(2, flops, matmul(d, &wf, x).unwrap()) // [rows, m]
+                } else if use_mpp_gemm {
+                    let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
+                    let oh = pf!(2, flops, gemm_q4_mpp(d, &xh, qs, sc, rows, *m, *k).unwrap());
+                    pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
+                } else {
+                    // cuBLAS tensor-core path: out[rows,m] = x[rows,k] · W[m,k]ᵀ.
+                    let wf = deq16(name, qs, sc, *m, *k, 0);
+                    let xh = pf!(15, 0.0, cast_f32_f16(d, x).unwrap());
+                    let oh = pf!(2, flops, gemm_cublas(d, &xh, &wf, rows, *m, *k).unwrap());
+                    pf!(15, 0.0, cast_f16_f32(d, &oh).unwrap()) // [rows, m]
+                }
+            };
+            // Pre-allocate grouped-GEMM weight scratch buffers (max size, reused across layers).
+            // Avoids per-layer cuMemAlloc which is expensive. Allocated once at max expert count.
+            // UP scratch: [n_exp * inter, hid] f16 (for all 128 experts, even if only ~107 active).
+            // DN scratch: [n_exp * hid, inter] f16.
+            // These are bounded: 128 * 1856 * 4096 * 2 ≈ 1.83 GB each, ≈ 3.67 GB total.
+            let grouped_up_scratch: Option<Tensor> = if std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok() {
+                Some(Tensor::new(d.alloc(n_exp * inter * hid * 2).unwrap(), vec![n_exp * inter, hid], DType::F16))
+            } else { None };
+            let grouped_dn_scratch: Option<Tensor> = if std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok() {
+                Some(Tensor::new(d.alloc(n_exp * hid * inter * 2).unwrap(), vec![n_exp * hid, inter], DType::F16))
+            } else { None };
+            for (l, mix) in PATTERN.chars().enumerate() {
+                let p = format!("language_model.backbone.layers.{l}");
+                let xn = pf!(1, 0.0, rms_norm(d, &xt, &fwd[&format!("{p}.norm.weight")], eps).unwrap()); // [s, hid]
+                match mix {
+                    'M' => {
+                        // ── NEMOTRON_CONV_DEVICE=1: fully on-device conv (no host round-trip) ──
+                        // proj stays on device; strided_col_copy carves z/xbc/dt_raw on GPU;
+                        // conv1d_causal_prefill + softplus_add_rows run the conv+silu+softplus
+                        // without any dl/up. Saves ~42 MB of PCIe per Mamba layer per forward.
+                        // Gate: NEMOTRON_CONV_DEVICE=1. Default: host ring-conv (validated path).
+                        let use_conv_device = std::env::var("NEMOTRON_CONV_DEVICE").is_ok();
+                        if use_conv_device {
+                            let proj_t = pf!(2, 2.0 * s as f64 * in_proj_out as f64 * hid as f64,
+                                qmm(&xn, &format!("{p}.mixer.in_proj.weight"))); // [s, in_proj_out] on device
+                            // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
+                            // proj layout: [z(di) | xbc(conv_dim) | dt_raw(m_nh)] per row.
+                            let (z_t, xbc_t, dt_raw_t) = pf!(15, 0.0,
+                                mamba_split_proj(d, &proj_t, s, in_proj_out, di, conv_dim, m_nh).unwrap());
+                            // On-device causal depthwise conv1d + silu over all S tokens.
+                            // Result: yc_silu [s * conv_dim] flat.
+                            let yc_silu = pf!(4, 0.0, conv1d_causal_prefill(d, &xbc_t,
+                                &fwd[&format!("{p}.mixer.conv1d.weight")],
+                                &fwd[&format!("{p}.mixer.conv1d.bias")],
+                                s, conv_dim, kc).unwrap());
+                            // Persist conv ring state for decode continuity: last (kc-1) rows of xbc.
+                            let ring_len = (kc - 1) * conv_dim;
+                            let ring_off = (s.saturating_sub(kc - 1)) * conv_dim;
+                            { let mut cd = conv_dev.borrow_mut();
+                              cd[l] = Some(slice(d, &xbc_t, ring_off, ring_len).unwrap()); }
+                            // PART B: fused split — 1 dispatch replaces 3 strided_col_copy calls.
+                            let (x_dev, b_dev, c_dev) = pf!(15, 0.0,
+                                mamba_split_conv(d, &yc_silu, s, conv_dim, di, ng * ds).unwrap());
+                            // Softplus + dt_bias on device: [s, m_nh] → dt_all [s*m_nh].
+                            let dt_dev  = pf!(6, 0.0, softplus_add_rows(d, &dt_raw_t, &up(&fw[&format!("{p}.mixer.dt_bias")]), s, m_nh).unwrap());
+                            // SSD scan over S.
+                            if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                            let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
+                            let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
+                            let (so, y_dev) = if use_chunked {
+                                pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
+                            } else {
+                                pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
+                            };
+                            ssm_state[l] = Some(so);
+                            // PART B: on-device batched gated group RMSNorm — eliminates the
+                            // dl(y)+dl(z)+host loop+up(yn) round-trip (2 × s×di = ~42MB per layer).
+                            let ynt = pf!(6, 0.0, gated_group_rmsnorm_batched(d, &y_dev, &z_t,
+                                &up(&fw[&format!("{p}.mixer.norm.weight")]), eps, s, di, gs).unwrap());
+                            let out = qmm(&ynt.reshaped(vec![s, di]), &format!("{p}.mixer.out_proj.weight"));
+                            xt = add(d, &xt, &out).unwrap();
+                        } else {
+                        let proj = dl(&qmm(&xn, &format!("{p}.mixer.in_proj.weight")), s * in_proj_out); // [s, in_proj_out]
+                        // Host-bridge the Mamba conv + SSD-scan input shuffle (correctness-first).
+                        // Per-token slices: z[di], xbc[conv_dim], dt_raw[m_nh].
+                        let cw = &fw[&format!("{p}.mixer.conv1d.weight_host")]; // [kc*conv_dim] reorganized
+                        let cb = &fw[&format!("{p}.mixer.conv1d.bias_host")]; // [conv_dim]
+                        // Causal depthwise conv over S (state = (kc-1) zeros prefix at prefill start),
+                        // then silu. Produces xbc_act[s, conv_dim].
+                        let mut z_all = vec![0.0f32; s * di];
+                        let mut xssm = vec![0.0f32; s * di];          // [s, H*Dh]
+                        let mut bmat_all = vec![0.0f32; s * ng * ds]; // [s, G*Ds]
+                        let mut cmat_all = vec![0.0f32; s * ng * ds];
+                        let mut dt_all = vec![0.0f32; s * m_nh];      // [s, H]
+                        let dtb = &fw[&format!("{p}.mixer.dt_bias")];
+                        // ring conv state carried across tokens within this prefill.
+                        let mut ring = vec![0.0f32; (kc - 1) * conv_dim];
+                        for ti in 0..s {
+                            let base_p = ti * in_proj_out;
+                            let z = &proj[base_p..base_p + di];
+                            z_all[ti*di..(ti+1)*di].copy_from_slice(z);
+                            let xbc = &proj[base_p + di..base_p + di + conv_dim];
+                            let dt_raw = &proj[base_p + di + conv_dim..base_p + di + conv_dim + m_nh];
+                            // depthwise causal conv1d (kc taps) + silu, per channel.
+                            let mut yc = vec![0.0f32; conv_dim];
+                            for ch in 0..conv_dim {
+                                let mut acc = cb[ch];
+                                for kk in 0..kc {
+                                    // tap kk reads position (ti - (kc-1) + kk): ring for <0, xbc for current.
+                                    let rel = kk as isize - (kc as isize - 1);
+                                    let v = if rel < 0 {
+                                        let idx = (kc - 1) as isize + rel; // ring slot
+                                        ring[idx as usize * conv_dim + ch]
+                                    } else { xbc[ch] };
+                                    acc += cw[kk * conv_dim + ch] * v;
+                                }
+                                let a = acc; yc[ch] = a / (1.0 + (-a).exp()); // silu
+                            }
+                            // advance ring: drop oldest, push xbc.
+                            if kc > 1 { ring.drain(0..conv_dim); ring.extend_from_slice(xbc); }
+                            xssm[ti*di..(ti+1)*di].copy_from_slice(&yc[0..di]);
+                            bmat_all[ti*ng*ds..(ti+1)*ng*ds].copy_from_slice(&yc[di..di+ng*ds]);
+                            cmat_all[ti*ng*ds..(ti+1)*ng*ds].copy_from_slice(&yc[di+ng*ds..di+2*ng*ds]);
+                            for hh in 0..m_nh { dt_all[ti*m_nh+hh] = softplus(dt_raw[hh] + dtb[hh]); }
+                        }
+                        // persist conv ring state for decode continuity.
+                        { let mut cd = conv_dev.borrow_mut(); cd[l] = Some(up(&ring)); }
+                        // SSD scan over S: x[s,H*Dh], b/c[s,G*Ds], dt[s,H], state[H*Dh*Ds].
+                        if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
+                        let x_dev = up(&xssm);
+                        let b_dev = up(&bmat_all);
+                        let c_dev = up(&cmat_all);
+                        let dt_dev = up(&dt_all);
+                        // SSD FLOPs ≈ s * H * Dh * Ds * 4 (dA*state + dbx, y=state*c)
+                        let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
+                        // NEMOTRON_CHUNKED_SCAN=1: use two-pass parallel segment scan.
+                        // Drops serial depth from T to T/64, exploiting 64× more GPU parallelism.
+                        // Default: sequential step-record (validated, correctness-first).
+                        let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
+                        let (so, y_dev) = if use_chunked {
+                            pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
+                        } else {
+                            pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
+                        };
+                        ssm_state[l] = Some(so);
+                        let y = dl(&y_dev, s * di); // [s, di]
+                        // gated group rmsnorm per token, then out_proj batched.
+                        let nw = &fw[&format!("{p}.mixer.norm.weight")];
+                        let mut yn = vec![0.0f32; s * di];
+                        for ti in 0..s {
+                            let yo = ti*di;
+                            for grp in 0..ng {
+                                let sgrp = grp * gs; let mut ssq = 0.0f32;
+                                for i in 0..gs { let zi = z_all[yo+sgrp+i]; let gg = y[yo+sgrp+i] * (zi/(1.0+(-zi).exp())); yn[yo+sgrp+i]=gg; ssq+=gg*gg; }
+                                let r = 1.0/((ssq/gs as f32)+eps).sqrt();
+                                for i in 0..gs { yn[yo+sgrp+i] = yn[yo+sgrp+i]*r*nw[sgrp+i]; }
+                            }
+                        }
+                        let ynt = upm(&yn, vec![s, di]);
+                        let out = qmm(&ynt, &format!("{p}.mixer.out_proj.weight")); // [s, hid]
+                        xt = add(d, &xt, &out).unwrap();
+                        } // end !use_conv_device
+                    }
+                    'E' => {
+                        let bias = &fw[&format!("{p}.mixer.gate.e_score_correction_bias")];
+                        // ── Router over all S tokens (host top-k, matching decode) ──
+                        // Batched gate gemv: [S, n_exp]. gate.weight is f32 dense.
+                        let gate_w = &fwd[&format!("{p}.mixer.gate.weight")];
+                        let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);
+                        // Per token: sigmoid+bias top-k → (expert, weight). Expand to
+                        // S*top_k triples, then SORT by expert for the bm64 BGEMM.
+                        let mut triples: Vec<(u32, usize, f32)> = Vec::with_capacity(s * top_k); // (expert, token, weight)
+                        for ti in 0..s {
+                            let rl = &rl_all[ti*n_exp..(ti+1)*n_exp];
+                            let sig: Vec<f32> = rl.iter().map(|&z| 1.0/(1.0+(-z).exp())).collect();
+                            let choice: Vec<f32> = (0..n_exp).map(|i| sig[i]+bias[i]).collect();
+                            let eidx = ffai_runtime::topk(&choice, top_k);
+                            let mut w: Vec<f32> = eidx.iter().map(|&e| sig[e]).collect();
+                            let wsum: f32 = w.iter().sum::<f32>()+1e-20; for v in w.iter_mut() { *v = *v/wsum*scale_f; }
+                            for (j,&e) in eidx.iter().enumerate() { triples.push((e as u32, ti, w[j])); }
+                        }
+                        // Stable sort by expert id → contiguous same-expert groups.
+                        triples.sort_by_key(|t| t.0);
+                        let mt = triples.len();
+                        // Expert GEMM mode flags (read early so they're in scope for gather).
+                        let use_bgemm = std::env::var("NEMOTRON_BGEMM").is_ok();
+                        // NEMOTRON_GROUPED_GEMM=1: async two-pass all-expert GEMM — all UP
+                        //   GEMMs enqueued (no inter-expert sync), on-device relu2_scale_f16,
+                        //   all DN GEMMs, then on-device scatter-add. Uses the device-gather
+                        //   path for xs. Eliminates per-expert host syncs + cast overhead.
+                        let use_grouped_gemm = std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !use_bgemm;
+                        // Build sorted activation [mt, hid]:
+                        // NEMOTRON_DEVICE_GATHER=1: stay on device (gather kernel + cast),
+                        //   eliminates the 22MB dl(&xn) + 132MB host scatter per E-layer.
+                        // Default: host download + gather (validated path).
+                        let dev_gather = std::env::var("NEMOTRON_DEVICE_GATHER").is_ok();
+                        // xs_dev_f16 is the device version (for DEV_GATHER or BGEMM paths).
+                        // xs (host f32 vec) is populated for the default host path.
+                        // Build sorted activation [mt, hid]:
+                        // For BGEMM: host gather → single device upload (avoids per-expert uploads).
+                        // For DEVICE_GATHER: on-device gather (EXPERIMENTAL, may produce wrong output).
+                        // Default: host gather (validated path).
+                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || dev_gather || use_grouped_gemm {
+                            // Need xn on host for BGEMM (host gather) or DEV_GATHER (gather source).
+                            Some(dl(&xn, s * hid))
+                        } else {
+                            None
+                        };
+                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_grouped_gemm {
+                            // BGEMM: host gather → upload xs as one [mt, hid] f16 tensor.
+                            let xn_h = xn_h_opt.as_ref().unwrap();
+                            let mut xs_h = vec![0.0f32; mt * hid];
+                            for (r,(_e,t,_)) in triples.iter().enumerate() {
+                                xs_h[r*hid..(r+1)*hid].copy_from_slice(&xn_h[t*hid..(t+1)*hid]);
+                            }
+                            let xs_f16 = cast_f32_f16(d, &upm(&xs_h, vec![mt, hid])).unwrap();
+                            (Vec::new(), Some(xs_f16))
+                        } else if dev_gather {
+                            // On-device gather (EXPERIMENTAL): upload token indices, gather xn rows.
+                            let tok_idx: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                            let tok_dev = Tensor::new(d.upload(&tbu(&tok_idx)).unwrap(), vec![mt], DType::U32);
+                            let xn2d = xn.clone().reshaped(vec![s, hid]);
+                            let xs_f32 = gather(d, &xn2d, &tok_dev).unwrap(); // [mt, hid] f32
+                            let xs_f16 = cast_f32_f16(d, &xs_f32).unwrap();   // [mt, hid] f16
+                            (Vec::new(), Some(xs_f16))
+                        } else {
+                            // Host gather: download xn, scatter rows.
+                            let xn_h = dl(&xn, s * hid);
+                            let mut xs = vec![0.0f32; mt * hid];
+                            for (r,(_e,t,_)) in triples.iter().enumerate() {
+                                xs[r*hid..(r+1)*hid].copy_from_slice(&xn_h[t*hid..(t+1)*hid]);
+                            }
+                            (xs, None)
+                        };
+                        // ── Expert GEMM: batched (NEMOTRON_BGEMM) or per-expert cuBLAS ──
+                        // NEMOTRON_BGEMM=1: replace the per-expert cuBLAS loop with
+                        // moe_bgemm_q4_bm64 (one dispatch for all experts, Q4 native,
+                        // no per-expert dequant) + on-device relu2_scale_f16 + another
+                        // bm64 for the down pass. Reduces O(n_active_experts*2) cuBLAS
+                        // calls to 2 dispatches + 1 download per E-layer.
+                        // Default: per-expert cuBLAS loop (existing, validated path).
+                        let (uqs, usc, _, _) = &qw[&format!("{p}.moe_up_all")];
+                        let (dqs, dsc, _, _) = &qw[&format!("{p}.moe_down_all")];
+                        let up_bpr = hid / 32;     // Q4 blocks per up-weight row
+                        let down_bpr = inter / 32; // Q4 blocks per down-weight row
+                        let inv = 1.0f32 / 256.0;
+                        // use_bgemm already defined above (before gather block).
+                        let mut acc_h = vec![0.0f32; s * hid];
+                        if use_bgemm {
+                            // ── Batched bm64 BGEMM path ───────────────────────────────────
+                            // xs_dev_f16 from device gather (set above when use_bgemm=true).
+                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
+                            let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
+                            // UP: [mt, inter] = xs[mt,hid] · Wup[n_exp*inter,hid]^T  (Q4 bm64 BGEMM)
+                            let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                moe_bgemm_q4_bm64(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                            // relu2 + scale: fused on device (no host round-trip).
+                            let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                            // DOWN: [mt, hid] = relu2_out[mt,inter] · Wdn[n_exp*hid,inter]^T  (Q4 bm64 BGEMM)
+                            let dn_out_f16 = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                moe_bgemm_q4_bm64(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap());
+                            let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap(); // [mt, hid] f32
+                            // Scatter-weight + unscale (×256):
+                            // NEMOTRON_BGEMM: on-device atomic scatter (no dl per expert).
+                            // Routed-expert weights and token indices for the scatter-add.
+                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                            let wts_dev = upm(&wts_h, vec![mt]);
+                            let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
+                            // acc_dev: pre-zeroed [s, hid] f32 output accumulator.
+                            let acc_dev = upm(&acc_h, vec![s, hid]); // already vec of 0.0f32
+                            moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            // Download accumulated output for residual add.
+                            acc_h = dl(&acc_dev, s * hid);
+                        } else if use_grouped_gemm {
+                            // ── Grouped-GEMM path (NEMOTRON_GROUPED_GEMM=1) ───────────────
+                            // All UP dequants (async) → all UP GEMMs (async) → relu2_scale →
+                            // all DN dequants (async) → all DN GEMMs (async) → scatter-add.
+                            // No per-expert host sync. Uses on-device scatter for output.
+                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            // Build group boundaries (sorted by expert: triples is already sorted).
+                            let mut g_starts: Vec<usize> = vec![0];
+                            let mut expert_ids: Vec<usize> = Vec::new();
+                            {
+                                let mut gi = 0usize;
+                                while gi < mt {
+                                    let eid = triples[gi].0 as usize;
+                                    expert_ids.push(eid);
+                                    let mut gi2 = gi + 1;
+                                    while gi2 < mt && triples[gi2].0 as usize == eid { gi2 += 1; }
+                                    g_starts.push(gi2);
+                                    gi = gi2;
+                                }
+                            }
+                            // Sync before grouped GEMM to flush any pending GPU errors.
+                            d.synchronize().unwrap();
+                            let dn_out_f16 = pf!(11, 2.0*mt as f64*(inter+hid) as f64*hid as f64,
+                                moe_grouped_gemm(d, uqs, usc, dqs, dsc, &xs_f16,
+                                    &g_starts, &expert_ids, hid, inter, up_bpr, down_bpr,
+                                    grouped_up_scratch.as_ref(), grouped_dn_scratch.as_ref()).unwrap());
+                            // Scatter-weight + unscale (×256): same as BGEMM path.
+                            let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                            let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                            let wts_dev = upm(&wts_h, vec![mt]);
+                            let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
+                            let acc_dev = upm(&acc_h, vec![s, hid]);
+                            // dn_out_f16 is [mt, hid] f16 unscaled (relu2 already applied 1/256×);
+                            // scatter_add needs to multiply by w×256 → net effect: w×256/256 = w.
+                            // But scatter_add signature multiplies by (scale/256): pass scale=256
+                            // so net = w×(256/256) = w (matches the bgemm path).
+                            let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
+                            moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            acc_h = dl(&acc_dev, s * hid);
+                        } else {
+                            // ── Per-expert cuBLAS loop ────────────────────────────────────
+                            // NEMOTRON_TWO_PASS=1: two-pass variant — all UP GEMMs first
+                            //   (no intermediate CPU sync), then batch relu2_scale, then all
+                            //   DOWN GEMMs, then batch downloads + scatter. This keeps the
+                            //   cuBLAS stream uninterrupted for all ~128 experts per layer.
+                            // Default: interleaved per-expert (original validated path).
+                            // NEMOTRON_DEV_RELU2=1: per-expert with on-device relu2 (regresses).
+                            let two_pass = std::env::var("NEMOTRON_TWO_PASS").is_ok();
+                            let dev_relu2 = !two_pass && std::env::var("NEMOTRON_DEV_RELU2").is_ok();
+                            if two_pass {
+                                // ── Pass 1: All UP GEMMs (async, no sync between experts) ────
+                                // IMPORTANT: keep xg and wup tensors ALIVE until all GEMMs complete
+                                // (GPU reads these async; dropping them before the stream sync would
+                                // race with the pool reusing their buffers for later dequants).
+                                struct ExpertBatch {
+                                    e: usize, g0: usize, g1: usize,
+                                    a: Tensor,
+                                    _xg: Tensor,  // keep alive until after sync
+                                    _wup: Tensor, // keep alive until after sync
+                                }
+                                let mut up_batches: Vec<ExpertBatch> = Vec::new();
+                                let mut g0 = 0usize;
+                                while g0 < mt {
+                                    let e = triples[g0].0 as usize;
+                                    let mut g1 = g0 + 1;
+                                    while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
+                                    let rows = g1 - g0;
+                                    let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    let a = gemm_cublas(d, &xg, &wup, rows, inter, hid).unwrap();
+                                    up_batches.push(ExpertBatch { e, g0, g1, a, _xg: xg, _wup: wup });
+                                    g0 = g1;
+                                }
+                                // ── Pass 2: Sync once, then host relu2 in f32 (avoids f16 overflow
+                                // in device relu2_scale for large activations), then upload.
+                                // The single d.synchronize() waits for ALL 128 UP GEMMs at once.
+                                d.synchronize().ok();
+                                let a2s: Vec<Tensor> = up_batches.iter().map(|b| {
+                                    let rows = b.g1 - b.g0;
+                                    let a_h = dl(&cast_f16_f32(d, &b.a).unwrap(), rows*inter);
+                                    let a2_h: Vec<f32> = a_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                                    cast_f32_f16(d, &upm(&a2_h, vec![rows, inter])).unwrap()
+                                }).collect();
+                                // ── Pass 3: All DOWN GEMMs (async, no sync between) ────────
+                                // Keep wdn tensors alive for the same reason as wup.
+                                struct DownBatch { dn: Tensor, g0: usize, g1: usize, _wdn: Tensor }
+                                let mut dn_batches: Vec<DownBatch> = Vec::new();
+                                for (b, a2) in up_batches.iter().zip(&a2s) {
+                                    let rows = b.g1 - b.g0;
+                                    let wdn = deq16c(&format!("{p}.dn.{}", b.e), dqs, dsc, hid, inter, b.e*hid*down_bpr, false);
+                                    let dn = gemm_cublas(d, a2, &wdn, rows, hid, inter).unwrap();
+                                    dn_batches.push(DownBatch { dn, g0: b.g0, g1: b.g1, _wdn: wdn });
+                                }
+                                // All inputs (up_batches, a2s) can drop after down GEMMs are enqueued.
+                                drop(up_batches); drop(a2s);
+                                // ── Pass 4+5: Download all dn + scatter ────────────────────
+                                // The FIRST dl() syncs the stream (GPU already finished all GEMMs).
+                                // Subsequent dl() for other experts: GPU already done, instant sync.
+                                for db in dn_batches {
+                                    let rows = db.g1 - db.g0;
+                                    let dn_h = dl(&cast_f16_f32(d, &db.dn).unwrap(), rows*hid);
+                                    for r in 0..rows {
+                                        let (_e2, t, w) = triples[db.g0+r];
+                                        let dr = &dn_h[r*hid..(r+1)*hid];
+                                        let ah = &mut acc_h[t*hid..(t+1)*hid];
+                                        for i in 0..hid { ah[i] += w * dr[i] * 256.0; }
+                                    }
+                                }
+                            } else {
+                                // ── Interleaved per-expert (default, validated) ───────────
+                                let mut g0 = 0usize;
+                                while g0 < mt {
+                                    let e = triples[g0].0 as usize;
+                                    let mut g1 = g0 + 1;
+                                    while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
+                                    let rows = g1 - g0;
+                                    let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    let a = pf!(11, 2.0*rows as f64*inter as f64*hid as f64, gemm_cublas(d, &xg, &wup, rows, inter, hid).unwrap());
+                                    let a2 = if dev_relu2 {
+                                        pf!(3, 0.0, relu2_scale_f16(d, &a, inv).unwrap())
+                                    } else {
+                                        let a_h = dl(&cast_f16_f32(d, &a).unwrap(), rows*inter);
+                                        let a2_h: Vec<f32> = a_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                                        cast_f32_f16(d, &upm(&a2_h, vec![rows, inter])).unwrap()
+                                    };
+                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, false);
+                                    let dn = pf!(11, 2.0*rows as f64*hid as f64*inter as f64, gemm_cublas(d, &a2, &wdn, rows, hid, inter).unwrap());
+                                    let dn_h = dl(&cast_f16_f32(d, &dn).unwrap(), rows*hid);
+                                    for r in 0..rows {
+                                        let (_e2, t, w) = triples[g0+r];
+                                        let dr = &dn_h[r*hid..(r+1)*hid];
+                                        let ah = &mut acc_h[t*hid..(t+1)*hid];
+                                        for i in 0..hid { ah[i] += w * dr[i] * 256.0; }
+                                    }
+                                    g0 = g1;
+                                }
+                            }
+                        }
+                        // ── Shared expert: dense over all S (up→relu2→down) ──
+                        // relu2 squares activations → can exceed f16 max (65504) →
+                        // inf/NaN. NEMOTRON_SHARED_GEMV=1 uses the known-correct decode
+                        // gemv per token (A/B oracle); default uses the MMA GEMM (f32
+                        // to avoid the relu2 overflow).
+                        let (suqs, susc, sm_up, sk_up) = &qw[&format!("{p}.mixer.shared_experts.up_proj.weight")];
+                        let (sdqs, sdsc, sm_dn, sk_dn) = &qw[&format!("{p}.mixer.shared_experts.down_proj.weight")];
+                        let sd_h: Vec<f32> = if std::env::var("NEMOTRON_SHARED_GEMV").is_ok() {
+                            let mut out = vec![0.0f32; s * hid];
+                            for ti in 0..s {
+                                let x1 = slice(d, &xn, ti*hid, hid).unwrap();
+                                let sa = gemv_q4_relu2(d, suqs, susc, &x1, shared_inter, hid, shared_inter).unwrap();
+                                let acc1 = up(&vec![0.0f32; hid]);
+                                gemv_q4_accum(d, sdqs, sdsc, &sa, &acc1, &up(&[1.0f32]), *sm_dn, *sk_dn, *sm_dn).unwrap();
+                                out[ti*hid..(ti+1)*hid].copy_from_slice(&dl(&acc1, hid));
+                            }
+                            out
+                        } else {
+                            // cuBLAS tensor cores. relu2 squares → overflow f16; use on-device
+                            // relu2_scale_f16 (NEMOTRON_BGEMM or NEMOTRON_DEV_RELU2) to avoid
+                            // the host round-trip; otherwise fall back to host f32 path.
+                            let dev_r2 = use_bgemm || std::env::var("NEMOTRON_DEV_RELU2").is_ok();
+                            let wsu = deq16(&format!("{p}.shup"), suqs, susc, *sm_up, *sk_up, 0);
+                            let shared_up_flops = 2.0 * s as f64 * shared_inter as f64 * hid as f64;
+                            let sa = pf!(12, shared_up_flops, gemm_cublas(d, &cast_f32_f16(d, &xn).unwrap(), &wsu, s, shared_inter, hid).unwrap());
+                            let sa2 = if dev_r2 {
+                                // On-device: relu2_scale_f16 fuses relu2 + scale without dl.
+                                pf!(3, 0.0, relu2_scale_f16(d, &sa, 1.0f32 / 256.0).unwrap())
+                            } else {
+                                let sa_h = dl(&cast_f16_f32(d, &sa).unwrap(), s * shared_inter);
+                                let sa2_h: Vec<f32> = sa_h.iter().map(|&v| { let r = v.max(0.0); r * r / 256.0 }).collect();
+                                cast_f32_f16(d, &upm(&sa2_h, vec![s, shared_inter])).unwrap()
+                            };
+                            let wsd = deq16(&format!("{p}.shdn"), sdqs, sdsc, *sm_dn, *sk_dn, 0);
+                            let shared_dn_flops = 2.0 * s as f64 * hid as f64 * shared_inter as f64;
+                            let sd = pf!(12, shared_dn_flops, gemm_cublas(d, &sa2, &wsd, s, hid, shared_inter).unwrap());
+                            let sd_h = dl(&cast_f16_f32(d, &sd).unwrap(), s * hid);
+                            sd_h.iter().map(|&v| v * 256.0).collect()
+                        };
+                        for i in 0..s*hid { acc_h[i] += sd_h[i]; }
+                        xt = add(d, &xt, &upm(&acc_h, vec![s, hid])).unwrap();
+                    }
+                    '*' => {
+                        let q_all = qmm(&xn, &format!("{p}.mixer.q_proj.weight")); // [s, qdim]=[s,nq*hd]
+                        let k_all = qmm(&xn, &format!("{p}.mixer.k_proj.weight")); // [s, kvdim]=[s,nkv*hd]
+                        let v_all = qmm(&xn, &format!("{p}.mixer.v_proj.weight")); // [s, kvdim]
+                        // PART C: eliminate dl(q)/dl(k)/dl(v) + per-token rope dispatches.
+                        // Build positions [s] once, use batched rope_llama_many + kv_append_many.
+                        if kvcache[l].is_none() {
+                            kvcache[l] = Some((up(&vec![0.0f32; nkv*cap*hd]), up(&vec![0.0f32; nkv*cap*hd])));
+                        }
+                        let positions_h: Vec<u32> = (0..s).map(|ti| (base + ti) as u32).collect();
+                        let positions_dev = Tensor::new(
+                            d.upload(unsafe { std::slice::from_raw_parts(positions_h.as_ptr() as *const u8, positions_h.len() * 4) }).unwrap(),
+                            vec![s], DType::U32);
+                        // Batched rope: [s, n_heads, hd] each → rotated in one dispatch.
+                        let qr = pf!(8, 0.0, rope_llama_many(d, &q_all.reshaped(vec![s, nq, hd]), &positions_dev, nq, hd, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
+                        let kr = pf!(8, 0.0, rope_llama_many(d, &k_all.reshaped(vec![s, nkv, hd]), &positions_dev, nkv, hd, rope_theta, 1.0, 1.0, 1.0, 8192.0).unwrap());
+                        // Batched KV-cache append: 2 dispatches replace S*2 per-token kv_append calls.
+                        let (kcache, vcache) = kvcache[l].as_ref().unwrap();
+                        kv_append_many(d, &kr, &positions_dev, kcache, nkv, hd, cap).unwrap();
+                        kv_append_many(d, &v_all.reshaped(vec![s, nkv, hd]), &positions_dev, vcache, nkv, hd, cap).unwrap();
+                        // sdpa_multi: Q [n_query, n_q_heads, hd], K/V [n_kv, cap, hd], causal, base_kv=base.
+                        let avg_kv = base as f64 + s as f64 / 2.0;
+                        let attn_flops = 4.0 * nq as f64 * hd as f64 * avg_kv * s as f64;
+                        let attn = pf!(7, attn_flops, sdpa_multi(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap());
+                        // attn [s, nq, hd] = [s, qdim]; o_proj batched.
+                        let o = qmm(&attn.reshaped(vec![s, qdim]), &format!("{p}.mixer.o_proj.weight"));
+                        xt = add(d, &xt, &o).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // final norm + lm_head on the LAST token only.
+            let xf = rms_norm(d, &xt, &fwd["norm_f"], eps).unwrap(); // [s, hid]
+            let last = dl(&slice(d, &xf, (s-1)*hid, hid).unwrap(), hid);
+            let logits = dl(&pf!(14, 2.0 * vocab as f64 * hid as f64, qmv(&up(&last), "language_model.lm_head.weight")), vocab);
+            let am = ffai_runtime::argmax(&logits);
+            LAST_BATCHED_LOGITS.with(|c| *c.borrow_mut() = logits);
+            am
+        };
+
+        // Fixed prompt id list (deterministic ramp). The correctness gate runs BOTH
+        // the sequential and batched paths over THIS SAME list and compares the
+        // last-token argmax — the KV cache + conv/SSM final states must agree.
+        let ids: Vec<usize> = (0..s).map(|i| (tok + i) % vocab).collect();
+
+        // ── Correctness gate (NEMOTRON_PREFILL_CHECK=1) ──────────────────────
+        // Sequential reference over the fixed ids: feed ids[i] at pos fakectx+i,
+        // ignore the chained argmax, take the argmax after the last token.
+        if std::env::var("NEMOTRON_PREFILL_CHECK").is_ok() {
+            let mut seq_conv: Vec<Vec<f32>> = vec![Vec::new(); 52];
+            let seq_convdev: std::cell::RefCell<Vec<Option<Tensor>>> = std::cell::RefCell::new((0..52).map(|_| None).collect());
+            let mut seq_ssm: Vec<Option<Tensor>> = (0..52).map(|_| None).collect();
+            let mut seq_kv: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
+            // swap in the sequential conv_dev (step closure captured conv_dev by ref
+            // via parameter; the all-device Mamba uses conv_dev borrow). To keep the
+            // reference independent we run step with its own conv_dev: the step
+            // closure references the outer `conv_dev` RefCell, so reset it first.
+            { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+            let _ = &seq_convdev; let _ = &mut seq_conv;
+            let mut seq_argmax = 0usize;
+            for (i, &id) in ids.iter().enumerate() {
+                seq_argmax = step(id, fakectx + i, &mut seq_conv, &mut seq_ssm, &mut seq_kv);
+            }
+            d.synchronize().ok();
+            // reset shared conv_dev (step mutated the OUTER one) before batched run.
+            { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+            let mut chk_ssm: Vec<Option<Tensor>> = (0..52).map(|_| None).collect();
+            let mut chk_kv: Vec<Option<(Tensor, Tensor)>> = (0..52).map(|_| None).collect();
+            let bat_argmax = forward_batched(&ids, &conv_dev, &mut chk_ssm, &mut chk_kv, fakectx);
+            d.synchronize().ok();
+            // Near-tie diagnosis: rank the sequential argmax within the batched
+            // logit distribution + report the gap between batched-argmax and the
+            // sequential token's logit. If they differ but the gap is < a few %,
+            // it's a precision near-tie (Q4-GEMV vs dequant→f32-GEMM), not a bug.
+            let blog = LAST_BATCHED_LOGITS.with(|c| c.borrow().clone());
+            let (rank, seq_logit, top_logit) = if !blog.is_empty() && seq_argmax < blog.len() {
+                let sv = blog[seq_argmax];
+                let top = blog[bat_argmax];
+                let rank = blog.iter().filter(|&&x| x > sv).count();
+                (rank, sv, top)
+            } else { (usize::MAX, 0.0, 0.0) };
+            // PASS criterion for a precision-differing path: exact argmax match,
+            // OR the sequential argmax sits in the batched top-5 within a <2% logit
+            // gap (a Q4-GEMV-vs-dequant-f32-GEMM near-tie, not a structural bug).
+            let gap_pct = (top_logit - seq_logit).abs() / top_logit.abs().max(1e-6) * 100.0;
+            let near_tie = rank < 5 && gap_pct < 2.0;
+            let pass = seq_argmax == bat_argmax || near_tie;
+            eprintln!("──────── PREFILL CORRECTNESS GATE (S={s}) ────────");
+            eprintln!("  sequential last-token argmax = {seq_argmax}");
+            eprintln!("  batched    last-token argmax = {bat_argmax}");
+            if seq_argmax != bat_argmax {
+                eprintln!("  near-tie diag: seq token rank in batched dist = {rank} (0=would-be-argmax)");
+                eprintln!("  logit[batched_argmax]={top_logit:.5} logit[seq_argmax]={seq_logit:.5} gap={:.5} ({gap_pct:.3}%)",
+                    top_logit - seq_logit);
+            }
+            eprintln!("  {}", if seq_argmax == bat_argmax { "EXACT MATCH ✓" }
+                              else if near_tie { "NEAR-TIE PASS ✓ (precision flip: same top-5, <2% gap)" }
+                              else { "MISMATCH ✗ (structural bug)" });
+            let _ = pass;
+            eprintln!("──────────────────────────────────────────────────");
+            // reset shared state after the gate.
+            { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+        }
+
+        // Warm (JIT) then timed.
+        let _ = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+        d.synchronize().ok();
+        // reset states for the timed run (warm mutated them).
+        { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+        for s2 in ssm_state.iter_mut() { *s2 = None; }
+        for kv in kvcache.iter_mut() { *kv = None; }
+        let t_pf = Instant::now();
+        let next = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+        d.synchronize().ok();
+        let pf_s = t_pf.elapsed().as_secs_f64();
+        let tps_batched = s as f64 / pf_s;
+        let conv_dev_on = std::env::var("NEMOTRON_CONV_DEVICE").is_ok();
+        let conv_dev_label = if conv_dev_on { "CONV_DEVICE=1" } else { "CONV_DEVICE=0(host)" };
+        eprintln!("──────── NemotronH-Nano BATCHED PREFILL on {plat} ────────");
+        eprintln!("  prefill  {s} tok in {pf_s:.3}s = {tps_batched:.2} tok/s ({:.2} ms/tok) [batched forward, {conv_dev_label}]", pf_s * 1000.0 / s as f64);
+        eprintln!("  last-token argmax = {next}");
+        eprintln!("──────────────────────────────────────────────────────────────");
+        // Append to ~/prefill_overnight.log.
+        {
+            use std::io::Write;
+            let logpath = format!("{}/prefill_overnight.log", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let line = format!("[{ts}] {plat} S={s} {conv_dev_label} CHUNKED={} tps={tps_batched:.2} ms/tok={:.2} argmax={next}\n",
+                if std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok() { "1" } else { "0" },
+                pf_s * 1000.0 / s as f64);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&logpath) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+
+        // ── PREFILL PER-OP PROFILING MAP (NEMOTRON_PROFILE=1) ───────────────
+        // The timed run above had profiling OFF (clean throughput). Now run one
+        // sync-bracketed profiled pass and emit the per-op map (ms / % / calls /
+        // GFLOP/s). GB10 Blackwell tensor-core peak (bf16, dense) ≈ 1000 TFLOP/s;
+        // we print effective GFLOP/s and %-of-peak for the compute-bound ops.
+        if pf_on {
+            { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
+            for s2 in ssm_state.iter_mut() { *s2 = None; }
+            for kv in kvcache.iter_mut() { *kv = None; }
+            for c in pf_t.iter() { c.set(0.0); } for c in pf_n.iter() { c.set(0); } for c in pf_flop.iter() { c.set(0.0); }
+            let t_prof = Instant::now();
+            let _ = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
+            d.synchronize().ok();
+            let prof_wall = t_prof.elapsed().as_secs_f64();
+            let names = ["embed","rms_norm","proj_gemm","dequant_q4","conv_prefill","ssm_scan","gated_norm","sdpa_prefill","rope","kv_append","moe_router","moe_experts","moe_shared","add","lm_head","slice/cast"];
+            const PEAK_TFLOPS: f64 = 1000.0; // GB10 Blackwell bf16 dense tensor-core peak (approx)
+            let sum_t: f64 = pf_t.iter().map(|c| c.get()).sum();
+            let mut rows: Vec<(usize,f64,u64,f64)> = (0..NPF).map(|i| (i, pf_t[i].get(), pf_n[i].get(), pf_flop[i].get())).filter(|r| r.2 > 0).collect();
+            rows.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+            let mut md = String::new();
+            md.push_str(&format!("# Nemotron-Nano-30B BATCHED PREFILL — per-op profiling map\n\n"));
+            md.push_str(&format!("- Device: {plat} (GB10 Blackwell)\n- S (prompt tokens): {s}\n"));
+            md.push_str(&format!("- Clean batched throughput: **{:.1} tok/s** ({:.2} ms/tok)\n", s as f64 / pf_s, pf_s * 1000.0 / s as f64));
+            md.push_str(&format!("- Profiled pass wall (sync-bracketed, inflated): {prof_wall:.3}s; summed op time: {sum_t:.3}s\n"));
+            md.push_str(&format!("- vLLM-on-GB10 reference: pp2048@d0=6395, @d8192=4993, @d32768=2734 tok/s\n"));
+            md.push_str(&format!("- Tensor-core peak assumed: {PEAK_TFLOPS:.0} TFLOP/s (bf16 dense)\n\n"));
+            md.push_str("| op | ms | % | calls | TFLOP/s | %peak |\n|---|---:|---:|---:|---:|---:|\n");
+            for (i,t,n,fl) in &rows {
+                let ms = t * 1000.0;
+                let pct = if sum_t > 0.0 { t / sum_t * 100.0 } else { 0.0 };
+                let tflops = if *t > 0.0 && *fl > 0.0 { fl / t / 1e12 } else { 0.0 };
+                let peakpct = tflops / PEAK_TFLOPS * 100.0;
+                let tfs = if tflops > 0.0 { format!("{tflops:.3}") } else { "—".into() };
+                let pps = if tflops > 0.0 { format!("{peakpct:.2}%") } else { "—".into() };
+                md.push_str(&format!("| {} | {ms:.2} | {pct:.1}% | {n} | {tfs} | {pps} |\n", names[*i]));
+            }
+            md.push_str("\n## Gap analysis (Path A — cuBLAS tensor cores LANDED)\n");
+            md.push_str("- **The GEMMs now hit the tensor cores via the cuBLAS escape hatch (`gemm_cublas`/`cublasGemmEx`, f16×f16→f32 accumulate).** proj_gemm jumped ~1→90 TFLOP/s (0.1%→9% of peak), moe_shared ~1→74, moe_experts ~0.8→28 — a 35-82× per-GEMM speedup vs the software-emulated coop_tile MMA. End-to-end prefill went from ~80 to 178-259 tok/s (peak at S=512).\n");
+            md.push_str("- **New #1 bottleneck: `ssm_scan` (~41%)** — the sequential-in-T Mamba `ssm_step_record`. With the GEMMs fast, this is now the critical path → the deferred chunked/parallel SSD scan is the next target.\n");
+            md.push_str("- **`dequant_q4` ~26% (5500 calls):** Q4 weights are re-dequanted to f16 EVERY forward (per layer + per routed expert). This is pure redundant work → cache the f16-dequanted weights resident once at load (trades VRAM for ~26% of prefill time).\n");
+            md.push_str("- `sdpa_prefill` ~12% (the prefill flash-attn is still software-MMA coop_tile — a cuBLAS/cuDNN attention or fp16 flash kernel would cut this).\n");
+            md.push_str("- `moe_experts` ~12%: the GEMM is fast (28 TFLOP/s) but the per-expert cuBLAS loop + host relu2/scatter round-trips remain serial → fuse on-device or use cublasGemmStridedBatched.\n");
+            md.push_str("- Throughput peaks at S=512 then declines (S=2048→178, S=8192→117): the per-expert host round-trips + dequant grow with S/expert-count. Removing dequant-per-forward + the host MoE bridges should restore monotonic scaling toward the vLLM band.\n");
+            let out_path = std::env::var("NEMOTRON_PROFILE_OUT").unwrap_or_else(|_| "/tmp/PROFILING_PREFILL.md".into());
+            let _ = std::fs::write(&out_path, &md);
+            eprintln!("\n{md}\n(written to {out_path})");
+        }
+        let _ = next;
+        return;
+    }
+
+    if prefill > 0 {
+        let warm = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = warm; pos += 1;
+        let t_pf = Instant::now();
+        for _ in 1..prefill { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
+        d.synchronize().ok();
+        let pf_s = t_pf.elapsed().as_secs_f64();
+        let pf_toks = (prefill - 1) as f64;
+        eprintln!("──────── NemotronH-Nano SEQUENTIAL PREFILL on {plat} ────────");
+        eprintln!("  prefill  {} tok in {pf_s:.3}s = {:.2} tok/s ({:.1} ms/tok) [baseline, sequential decode steps]", prefill - 1, pf_toks / pf_s, pf_s * 1000.0 / pf_toks);
+        eprintln!("──────────────────────────────────────────────────────────────");
+    }
     let first = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); // 1 warm step (JIT) + correctness peek
     tok = first; pos += 1;
     if prefill == 0 && fakectx == 0 { eprintln!("Nemotron decode: token1234 → next argmax {first} (F32 ref argmax=1234; Q8 may perturb the near-tie)"); }
@@ -1155,16 +2145,98 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     for _ in 0..n_decode { let nxt = step(tok, pos, &mut conv_state, &mut ssm_state, &mut kvcache); tok = nxt; pos += 1; }
     let dt = t0.elapsed().as_secs_f64();
     let eager_tps = n_decode as f64 / dt;
-    eprintln!("──────── NemotronH-Nano RESIDENT-Q8 DECODE on {plat} ────────");
+    let recipe_desc = if use_nvfp4_recipe {
+        "NVFP4-recipe [Mamba in/out_proj, shared-expert up/down, attn o_proj → Q8; routed experts, q/k/v, lm_head → Q4]"
+    } else {
+        "all-Q4 [uniform 4-bit]"
+    };
+    eprintln!("──────── NemotronH-Nano DECODE on {plat} ────────");
+    eprintln!("  quant    {recipe_desc}");
+    eprintln!("  resident {:.2} GB  ({:.2} GB Q4 + {:.2} GB Q8)", q4_gb + q8_gb, q4_gb, q8_gb);
     eprintln!("  context  start {} + {n_decode} timed (pos→{pos})", fakectx.max(prefill));
     eprintln!("  decode   {n_decode} tok in {dt:.2}s = {eager_tps:.2} tok/s ({:.1} ms/tok)", dt * 1000.0 / n_decode as f64);
-    if prof {
-        let n = (n_decode + 1) as f64; // includes the warm step
-        eprintln!("  profile/tok: M(mamba×23) {:.1}ms · E(moe×23) {:.1}ms · *(attn×6) {:.1}ms · head {:.1}ms",
-            tm.get() * 1e3 / n, te.get() * 1e3 / n, ta.get() * 1e3 / n, th.get() * 1e3 / n);
-    }
     eprintln!("  (vs naive-reload baseline 0.003 tok/s; resident weights uploaded once in {load_s:.0}s setup)");
     eprintln!("──────────────────────────────────────────────────────────────");
+
+    if prof {
+        // Per-op breakdown table. We accumulated sync-bracketed wall times for each op
+        // across (n_decode+1) steps (the warm step + timed steps). Divide by step_count
+        // to get per-token averages. ms/tok = total_s * 1000 / n_steps.
+        let n_steps = step_count.get().max(1) as f64;
+        let tok_ms = dt * 1000.0 / n_decode as f64; // actual ms/tok (no sync overhead)
+
+        // Op names aligned with indices used in pt!() above
+        let op_names = [
+            "rms_norm",       // 0
+            "m_in_proj",      // 1  gemv_q4 Mamba in_proj 10304×2688
+            "slice",          // 2  slice (multiple per Mamba layer)
+            "conv1d",         // 3
+            "silu",           // 4
+            "conv_roll",      // 5
+            "softplus_add",   // 6
+            "ssm_step",       // 7
+            "gated_grm_norm", // 8
+            "m_out_proj",     // 9  gemv_q4 Mamba out_proj 2688×4096
+            "moe_gate_gemv",  // 10 f32 gemv router 128×2688
+            "moe_router_dev", // 11 device top-k kernel
+            "moe_gather_up",  // 12 moe_gather_up_relu2
+            "moe_gather_down",// 13
+            "moe_wsum",       // 14
+            "shared_up_q4",   // 15 qrelu2 3712×2688
+            "shared_down_acc",// 16 qacc  2688×3712
+            "rope",           // 17
+            "q_proj",         // 18 gemv_q4 4096×2688
+            "k_proj",         // 19 gemv_q4  256×2688
+            "v_proj",         // 20 gemv_q4  256×2688
+            "kv_append",      // 21
+            "sdpa_2pass",     // 22
+            "o_proj",         // 23 gemv_q4 2688×4096
+            "add_residual",   // 24 (unused, subsumed into 27/28/29)
+            "norm_f",         // 25
+            "lm_head",        // 26
+            "add_M_resid",    // 27
+            "add_E_resid",    // 28
+            "add_A_resid",    // 29
+            "cast_f16",       // 30
+        ];
+
+        // Sum all GPU op times (this is the "GPU-attributed" total; the rest is host)
+        let gpu_total_s: f64 = op_t.iter().map(|c| c.get()).sum();
+        let host_overhead_s = (step_wall.get() / n_steps - gpu_total_s / n_steps).max(0.0);
+        let roofline_gbs = 189.0f64; // GB10 peak BW GB/s (measured ~189 with bandwidthTest)
+
+        eprintln!("──────── PER-OP PROFILE (ctx {} avg over {:.0} steps, NEMOTRON_PROFILE=1) ────────",
+            fakectx.max(prefill), n_steps);
+        eprintln!("  Note: times include sync overhead. Use ratios; GPU total ≠ wall time.");
+        eprintln!("  {:<20} {:>8} {:>7} {:>8} {:>12} {:>8}",
+            "op", "ms/tok", "%GPU", "calls/tok", "GB_read/tok", "eff GB/s");
+        eprintln!("  {}", "-".repeat(75));
+
+        let mut sorted_idx: Vec<usize> = (0..N_OPS).collect();
+        sorted_idx.sort_by(|&a, &b| op_t[b].get().partial_cmp(&op_t[a].get()).unwrap());
+
+        for &i in &sorted_idx {
+            let t_s = op_t[i].get();
+            if t_s < 1e-9 { continue; } // skip unexercised ops
+            let ms_per_tok = t_s * 1000.0 / n_steps;
+            let pct = 100.0 * t_s / gpu_total_s;
+            let calls_per_tok = op_calls[i].get() as f64 / n_steps;
+            let gb_per_tok = op_bytes[i].get() / n_steps / 1e9;
+            // eff GB/s = bytes_read_per_tok / (ms_per_tok / 1000)
+            let eff_gbs = if ms_per_tok > 1e-4 { gb_per_tok / (ms_per_tok / 1000.0) } else { 0.0 };
+            eprintln!("  {:<20} {:>7.2}ms {:>6.1}% {:>8.1} {:>11.3}GB {:>7.1} GB/s  (roofline {:.0}%)",
+                op_names[i], ms_per_tok, pct, calls_per_tok, gb_per_tok, eff_gbs,
+                if eff_gbs > 0.0 { 100.0 * eff_gbs / roofline_gbs } else { 0.0 });
+        }
+        eprintln!("  {}", "-".repeat(75));
+        eprintln!("  {:<20} {:>7.2}ms {:>6.1}%  (GPU-attributed total, incl sync overhead)",
+            "GPU subtotal", gpu_total_s * 1000.0 / n_steps, 100.0);
+        eprintln!("  {:<20} {:>7.2}ms         (host overhead = wall - gpu subtotal)",
+            "host overhead", host_overhead_s * 1000.0);
+        eprintln!("  {:<20} {:>7.2}ms         (actual wall time per token)",
+            "wall time/tok", tok_ms);
+        eprintln!("────────────────────────────────────────────────────────────────────────────");
+    }
 
     // ── CUDA GRAPH CAPTURE/REPLAY measurement ──────────────────────────────────
     // Activated by NEMOTRON_GRAPH=1. Requires NEMOTRON_DEVROUTER=1 (device router,

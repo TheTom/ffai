@@ -229,4 +229,161 @@ impl Device for CudaDevice {
     fn graph_launch_batch(&self, exec: u64, n: usize) -> Result<()> {
         self.dev.graph_launch_batch(exec as usize as *mut std::ffi::c_void, n).map_err(dispatch_err)
     }
+
+    fn dispatch_raw_cuda(
+        &self,
+        src: &str,
+        prog_name: &str,
+        fn_name: &str,
+        ptrs: &[(&dyn ffai_core::DeviceBuffer, usize)],
+        scalars: &[Vec<u8>],
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        cooperative: bool,
+    ) -> ffai_core::Result<()> {
+        // Compile (or reuse cached) module.
+        let module = {
+            let r = self.modules.read().unwrap();
+            r.get(fn_name).cloned()
+        };
+        let module = if let Some(m) = module {
+            m
+        } else {
+            let m = self.dev.compile(src, prog_name).map_err(dispatch_err)?;
+            let cached = Arc::new(CachedModule(m));
+            self.modules.write().unwrap().insert(fn_name.to_string(), cached.clone());
+            cached
+        };
+        let func = module.0.function(fn_name).map_err(dispatch_err)?;
+
+        // Build args: device pointers (with offset applied) then scalar bytes.
+        let mut ptr_store: Vec<u64> = Vec::new();
+        let mut scalar_store: Vec<Vec<u8>> = Vec::new();
+        enum Slot { Ptr(usize), Scalar(usize) }
+        let mut slots: Vec<Slot> = Vec::new();
+
+        for (buf, offset) in ptrs {
+            let cb = buf.as_any().downcast_ref::<CudaBuffer>()
+                .ok_or_else(|| ffai_core::Error::Msg("dispatch_raw_cuda: buffer is not CudaBuffer".into()))?;
+            slots.push(Slot::Ptr(ptr_store.len()));
+            ptr_store.push(cb.ptr + *offset as u64);
+        }
+        for s in scalars {
+            slots.push(Slot::Scalar(scalar_store.len()));
+            scalar_store.push(s.clone());
+        }
+
+        let mut args: Vec<*mut c_void> = slots.iter().map(|s| match s {
+            Slot::Ptr(i)    => &ptr_store[*i]    as *const u64 as *mut c_void,
+            Slot::Scalar(i) => scalar_store[*i].as_ptr() as *mut c_void,
+        }).collect();
+
+        // Use cooperative launch only when NOT inside a CUDA graph capture
+        // (cuLaunchCooperativeKernel is not capturable). Fall back to regular
+        // launch during capture — the caller (moe_fused_ffn) must not use
+        // grid.sync() in that code path (handled by NEMOTRON_GRAPH exclusion).
+        if cooperative && !self.dev.is_capturing() {
+            self.dev.launch_async_coop(func, grid, block, shared_bytes, &mut args).map_err(dispatch_err)
+        } else {
+            self.dev.launch_async(func, grid, block, shared_bytes, &mut args).map_err(dispatch_err)
+        }
+    }
+
+    fn gemm_tc(
+        &self,
+        x: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc: x not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublas(xb.ptr, wb.ptr, ob.ptr, m, n, k, dtype).map_err(dispatch_err)
+    }
+
+    fn gemm_tc_off(
+        &self,
+        x: &dyn DeviceBuffer, x_off: usize,
+        w: &dyn DeviceBuffer, w_off: usize,
+        out: &dyn DeviceBuffer, out_off: usize,
+        m: usize, n: usize, k: usize, dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_off: x not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_off: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_off: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublas(
+            xb.ptr + x_off as u64,
+            wb.ptr + w_off as u64,
+            ob.ptr + out_off as u64,
+            m, n, k, dtype,
+        ).map_err(dispatch_err)
+    }
+
+    fn gemm_strided_batched(
+        &self,
+        x: &dyn DeviceBuffer, stride_x: i64,
+        w: &dyn DeviceBuffer, stride_w: i64,
+        out: &dyn DeviceBuffer, stride_out: i64,
+        m: usize, n: usize, k: usize,
+        batch_count: usize,
+        dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched: x not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublas_strided_batched(
+            xb.ptr, stride_x,
+            wb.ptr, stride_w,
+            ob.ptr, stride_out,
+            m, n, k, batch_count, dtype,
+        ).map_err(dispatch_err)
+    }
+
+    fn gemm_strided_batched_off(
+        &self,
+        x: &dyn DeviceBuffer, x_off: usize, stride_x: i64,
+        w: &dyn DeviceBuffer, w_off: usize, stride_w: i64,
+        out: &dyn DeviceBuffer, out_off: usize, stride_out: i64,
+        m: usize, n: usize, k: usize,
+        batch_count: usize,
+        dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched_off: x not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched_off: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_strided_batched_off: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublas_strided_batched(
+            xb.ptr + x_off as u64, stride_x,
+            wb.ptr + w_off as u64, stride_w,
+            ob.ptr + out_off as u64, stride_out,
+            m, n, k, batch_count, dtype,
+        ).map_err(dispatch_err)
+    }
+
+    fn gemm_grouped(
+        &self,
+        x_buf: &dyn ffai_core::DeviceBuffer,
+        x_offsets: &[usize],
+        w_buf: &dyn ffai_core::DeviceBuffer,
+        w_offsets: &[usize],
+        out_buf: &dyn ffai_core::DeviceBuffer,
+        out_offsets: &[usize],
+        m_per_group: &[i32],
+        n: usize,
+        k: usize,
+        dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb  = x_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_grouped: x_buf not CudaBuffer".into()))?;
+        let wb  = w_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_grouped: w_buf not CudaBuffer".into()))?;
+        let ob  = out_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_grouped: out_buf not CudaBuffer".into()))?;
+        let x_ptrs:   Vec<u64> = x_offsets.iter().map(|&off| xb.ptr + off as u64).collect();
+        let w_ptrs:   Vec<u64> = w_offsets.iter().map(|&off| wb.ptr + off as u64).collect();
+        let out_ptrs: Vec<u64> = out_offsets.iter().map(|&off| ob.ptr + off as u64).collect();
+        self.dev.gemm_cublas_grouped(&x_ptrs, &w_ptrs, &out_ptrs, m_per_group, n, k, dtype)
+            .map_err(dispatch_err)
+    }
 }

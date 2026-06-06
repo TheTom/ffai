@@ -635,6 +635,98 @@ pub fn conv_roll(dev: &dyn Device, old: &Tensor, xbc: &Tensor, conv_dim: usize, 
     Ok(out)
 }
 
+/// Mamba2 batched-prefill causal depthwise conv1d with inline SiLU (NEMOTRON_CONV_DEVICE path).
+///
+/// Processes all S prompt tokens in one dispatch with zero initial state (prefill
+/// starts from scratch). Each thread computes one element of `y[s, conv_dim]` =
+/// silu(bias[ch] + Σ_{k<kc} w[k,ch] * xbc_in[ti-(kc-1-k), ch]) where out-of-bounds
+/// reads are zero. No host round-trip.
+///
+/// - `xbc_in`: `[s * conv_dim]` flat row-major
+/// - `w`: `[kc * conv_dim]` reorganized (same layout as decode step: w[k, ch])
+/// - `bias`: `[conv_dim]`
+/// - returns `y [s * conv_dim]` with SiLU applied
+pub fn conv1d_causal_prefill(
+    dev: &dyn Device,
+    xbc_in: &Tensor,
+    w: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    conv_dim: usize,
+    kc: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("conv1d_causal_prefill", DType::F32)?;
+    let y = Tensor::empty(dev, vec![s * conv_dim], DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(xbc_in.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(bias.buffer.clone()),
+            Binding::Buffer(y.buffer.clone()),
+            u(conv_dim as u32),
+            u(kc as u32),
+        ],
+        Grid { grid: [(s * conv_dim) as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok(y)
+}
+
+/// Extract `[s, width]` columns from row-major `src [s, stride]` at column offset `col_off`.
+/// Returns `dst [s * width]` — a contiguous slab. Used to carve z, xbc, dt_raw out of
+/// the [s, in_proj_out] projection matrix on device (NEMOTRON_CONV_DEVICE path).
+pub fn strided_col_copy(
+    dev: &dyn Device,
+    src: &Tensor,
+    s: usize,
+    stride: usize,
+    col_off: usize,
+    width: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("strided_col_copy", DType::F32)?;
+    let dst = Tensor::empty(dev, vec![s * width], DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(src.buffer.clone()),
+            Binding::Buffer(dst.buffer.clone()),
+            u(stride as u32),
+            u(col_off as u32),
+            u(width as u32),
+        ],
+        Grid { grid: [(s * width) as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok(dst)
+}
+
+/// Batched softplus + tiled bias: `dst[ti*n + hi] = softplus(src[ti*n + hi] + bias[hi])`.
+/// Converts the raw `[s, m_nh]` dt_raw tensor + dt_bias to `dt_all [s, m_nh]` on device.
+/// (NEMOTRON_CONV_DEVICE path — replaces the CPU softplus loop.)
+pub fn softplus_add_rows(
+    dev: &dyn Device,
+    src: &Tensor,
+    bias: &Tensor,
+    s: usize,
+    n: usize,
+) -> Result<Tensor> {
+    let kernel = lookup("softplus_add_rows", DType::F32)?;
+    let dst = Tensor::empty(dev, vec![s * n], DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(src.buffer.clone()),
+            Binding::Buffer(bias.buffer.clone()),
+            Binding::Buffer(dst.buffer.clone()),
+            u(n as u32),
+        ],
+        Grid { grid: [(s * n) as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok(dst)
+}
+
 /// Batched MoE up+ReLU²: gather `top_k` experts (indices `idx`) from the
 /// contiguous `[n_exp*inter, hid]` Q4 weight into one `[top_k*inter]` GEMV.
 pub fn moe_gather_up_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, idx: &Tensor, top_k: usize, inter: usize, hid: usize) -> Result<Tensor> {
@@ -668,6 +760,193 @@ pub fn moe_gather_down(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tenso
     dev.dispatch(&k, &[Binding::Buffer(qs.buffer.clone()), Binding::Buffer(scales.buffer.clone()), Binding::Buffer(x.buffer.clone()), Binding::Buffer(idx.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(inter as u32), u(hid as u32), u(rpt)], Grid { grid: [(hid as u32).div_ceil(rpt), top_k as u32, 1], block: [32 * rpt, 1, 1] })?;
     Ok(out)
 }
+// ── Fused MoE FFN (NEMOTRON_MOE_FUSED=1) ─────────────────────────────────────
+// Raw CUDA C++ source for the cooperative-groups two-phase fused kernel.
+//
+// Grid design for cooperative launch feasibility on GB10 (148 SMs, 2048 threads/SM):
+//   total_warps = hid = 2688  (one warp per acc[h] output element in phase 2)
+//   block = 256 (8 warps), grid = ceil(hid/8) = 336 blocks
+//   336 blocks / 148 SMs ≈ 2.3 blocks/SM < 8 max → cooperative launch WORKS
+//
+// Phase 1: each warp serializes over its assigned slice of top_k*inter up-proj rows.
+//   rows_per_warp ≈ (top_k * inter) / hid ≈ 4.14 (integer: 4 or 5 rows per warp)
+//   → warp `w` computes scratch[row] for row in [w*n_up/hid .. (w+1)*n_up/hid)
+// Phase 2: after grid.sync(), warp `w` computes acc[w] (one output element) by
+//   reading ALL of scratch and the down Q4 weights (down-proj GEMV over inter).
+//
+// The 44KB scratch (6×1856×4B) lives in L2 (~2TB/s GB10) throughout, not HBM.
+const MOE_FUSED_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+// Q4 (signed 4-bit, nibble-packed) + f16 scale per 32 → f32 warp dot product.
+// lane 0 holds the result after return.
+__device__ __forceinline__ float q4f16_dot_warp(
+    const unsigned* __restrict__ qs,
+    const __half*   __restrict__ sc,
+    const float*    __restrict__ x,
+    int row, int k_in, int lane)
+{
+    int bpr = k_in >> 5;
+    int nw  = bpr * 4;
+    const unsigned* qrow = qs + (size_t)row * nw;
+    const __half*   drow = sc + (size_t)row * bpr;
+    float dot = 0.f;
+    for (int j = lane; j < nw; j += 32) {
+        int blk = j >> 2, sub = j & 3;
+        unsigned p = qrow[j];
+        float sc_f = __half2float(drow[blk]);
+        const float* xb = x + (blk << 5) + (sub << 3);
+        float a = 0.f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int nb = (p >> (i * 4)) & 0xf;
+            a += (float)(nb > 7 ? nb - 16 : nb) * xb[i];
+        }
+        dot += sc_f * a;
+    }
+    #pragma unroll
+    for (int o = 16; o; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
+    return dot;
+}
+
+__device__ __forceinline__ float relu2(float v) {
+    float r = v > 0.f ? v : 0.f;
+    return r * r;
+}
+
+extern "C" __global__ void moe_fused_ffn(
+    const unsigned* __restrict__ up_qs,   // [n_exp*inter, hid] Q4 up weights
+    const __half*   __restrict__ up_sc,   // [n_exp*inter, hid/32] f16 scales
+    const unsigned* __restrict__ dn_qs,   // [n_exp*hid, inter] Q4 down weights
+    const __half*   __restrict__ dn_sc,   // [n_exp*hid, inter/32] f16 scales
+    const float*    __restrict__ x,       // [hid] input activation
+    const unsigned* __restrict__ idx,     // [top_k] expert indices (u32)
+    const float*    __restrict__ wts,     // [top_k] router weights (f32)
+    float*          __restrict__ acc,     // [hid] output (pre-zeroed by caller)
+    float*          __restrict__ scratch, // [top_k * inter] temp (pre-allocated)
+    int hid, int inter, int top_k)
+{
+    cg::grid_group gg = cg::this_grid();
+
+    // Global warp id — one warp per acc[h] for phase 2.
+    int tid     = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int lane    = threadIdx.x & 31;
+    int warp_id = tid >> 5;
+    int n_warps = (int)gridDim.x * ((int)blockDim.x >> 5);
+
+    // ── Phase 1: each warp serializes over its slice of up-proj rows ──────
+    // Linearised row space: row_lin = k * inter + i  (k=expert index 0..top_k-1)
+    int n_up = top_k * inter;
+    // Use 64-bit division to avoid overflow; compiler optimises for small top_k.
+    int row_start = (int)((long long)warp_id * n_up / n_warps);
+    int row_end   = (int)((long long)(warp_id + 1) * n_up / n_warps);
+    for (int row_lin = row_start; row_lin < row_end; row_lin++) {
+        int k   = row_lin / inter;
+        int i   = row_lin % inter;
+        int exp = (int)idx[k];
+        int row = exp * inter + i;
+        float v = q4f16_dot_warp(up_qs, up_sc, x, row, hid, lane);
+        if (lane == 0) scratch[k * inter + i] = relu2(v);
+    }
+
+    // ── Global grid barrier: all up-proj results are in scratch ──────────
+    gg.sync();
+
+    // ── Phase 2: each warp computes one acc[h] via down-proj ─────────────
+    if (warp_id < hid) {
+        int h = warp_id;
+        float acc_h = 0.f;
+        for (int k = 0; k < top_k; k++) {
+            int exp = (int)idx[k];
+            int row = exp * hid + h;
+            int bpr = inter >> 5;
+            int nw  = bpr * 4;
+            const unsigned* qrow  = dn_qs + (size_t)row * nw;
+            const __half*   drow  = dn_sc + (size_t)row * bpr;
+            const float*    xb_base = scratch + k * inter;
+            float dot = 0.f;
+            for (int j = lane; j < nw; j += 32) {
+                int blk = j >> 2, sub = j & 3;
+                unsigned p = qrow[j];
+                float sc_f = __half2float(drow[blk]);
+                const float* xb = xb_base + (blk << 5) + (sub << 3);
+                float a = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int nb = (p >> (i * 4)) & 0xf;
+                    a += (float)(nb > 7 ? nb - 16 : nb) * xb[i];
+                }
+                dot += sc_f * a;
+            }
+            #pragma unroll
+            for (int o = 16; o; o >>= 1) dot += __shfl_down_sync(0xffffffff, dot, o);
+            if (lane == 0) acc_h += dot * wts[k];
+        }
+        if (lane == 0) acc[h] += acc_h;
+    }
+}
+"#;
+
+/// Fused MoE FFN: up-proj + relu² + down-proj + router-weighted accumulate,
+/// all in ONE cooperative-groups kernel. The `[top_k×inter]` intermediate lives
+/// in L2 cache instead of HBM (scratch pre-allocated once by caller).
+///
+/// Replaces `moe_gather_up_relu2` + `moe_gather_down` + `moe_weighted_sum` with
+/// a single launch. Enabled by `NEMOTRON_MOE_FUSED=1`.
+///
+/// `scratch` must be a device buffer of at least `top_k * inter * 4` bytes.
+/// `acc` must be zero-initialised by the caller before the first expert's
+/// contribution (matches `moe_gather_down_accum` contract).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_fused_ffn(
+    dev: &dyn Device,
+    up_qs: &Tensor, up_sc: &Tensor,
+    dn_qs: &Tensor, dn_sc: &Tensor,
+    x: &Tensor,
+    idx: &Tensor,
+    wts: &Tensor,
+    acc: &Tensor,
+    scratch: &Tensor,
+    hid: usize, inter: usize, top_k: usize,
+) -> Result<()> {
+    // n_warps = hid: one warp per acc[h] output element (phase 2).
+    // Phase 1 distributes top_k*inter up-proj rows across the same n_warps warps
+    // (each warp handles ≈4 rows = top_k*inter/hid ≈ 4.14 for NemotronH dims).
+    // Grid: ceil(hid/16) = 168 blocks. GB10: 48 SMs × 4 blocks/SM (at 512 threads)
+    // = 192 max cooperative blocks → 168 ≤ 192 ✓
+    let block = 512u32;  // 16 warps/block
+    let warps_per_block = block / 32;
+    let grid = ((hid as u32) + warps_per_block - 1) / warps_per_block;
+    let scalars: &[Vec<u8>] = &[
+        (hid   as i32).to_le_bytes().to_vec(),
+        (inter as i32).to_le_bytes().to_vec(),
+        (top_k as i32).to_le_bytes().to_vec(),
+    ];
+    dev.dispatch_raw_cuda(
+        MOE_FUSED_SRC,
+        "moe_fused_ffn.cu",
+        "moe_fused_ffn",
+        &[
+            (up_qs.buffer.as_ref(),   0),
+            (up_sc.buffer.as_ref(),   0),
+            (dn_qs.buffer.as_ref(),   0),
+            (dn_sc.buffer.as_ref(),   0),
+            (x.buffer.as_ref(),       0),
+            (idx.buffer.as_ref(),     0),
+            (wts.buffer.as_ref(),     0),
+            (acc.buffer.as_ref(),     0),
+            (scratch.buffer.as_ref(), 0),
+        ],
+        scalars,
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        true,  // cooperative = use cuLaunchCooperativeKernel for grid.sync()
+    )
+}
+
 /// Router-weighted sum of per-expert down outputs into `acc`: `acc[h] += Σ wts·downs[·,h]`.
 /// Fully ON-DEVICE MoE router (NemotronH sigmoid + e_score_correction_bias, top-k by
 /// biased score, weights from unbiased renormalized to sum-1, ×routed_scaling_factor).
@@ -733,7 +1012,15 @@ fn gemv_q4_dispatch(dev: &dyn Device, kernel: &str, qs: &Tensor, scales: &Tensor
         let rows_per_block = if two_row { 2 * rpt } else { rpt };
         Grid { grid: [(m_out as u32).div_ceil(rows_per_block), 1, 1], block: [32 * rpt, 1, 1] }
     } else {
-        Grid { grid: [m_out as u32, 1, 1], block: [32, 1, 1] }
+        // relu2 / accum: multi-warp capable (rows_per_tg warps/TG). The shared-
+        // expert matrices (3712×2688, 2688×3712) are small; rpt>1 gives no
+        // measured gain (these kernels are NOT latency-bound — the ~50% BW the
+        // sync-bracketed profiler showed is a measurement artifact, the kernel
+        // time is small). Default rpt=1 (bit-identical to the original single-
+        // warp form); MT_GEMV_SHARED_RPT overrides for experimentation.
+        let rpt: u32 = std::env::var("MT_GEMV_SHARED_RPT").ok().and_then(|v| v.parse().ok()).filter(|&r| r >= 1).unwrap_or(1);
+        b.push(u(rpt));
+        Grid { grid: [(m_out as u32).div_ceil(rpt), 1, 1], block: [32 * rpt, 1, 1] }
     };
     dev.dispatch(&k, &b, grid)?;
     Ok(out)
@@ -848,6 +1135,564 @@ pub fn matmul(dev: &dyn Device, weight: &Tensor, input: &Tensor) -> Result<Tenso
         grid,
     )?;
     Ok(out)
+}
+
+/// Tensor-core GEMM via cuBLAS (Path A escape hatch). Computes the row-major
+/// `out[m,n] = x[m,k] · w[n,k]ᵀ` — the projection `out[r,o] = Σ_k w[o,k]·x[r,k]`
+/// where `w` is the DENSE `[n,k]` weight (f16/bf16, NOT quantized) and `x` is
+/// `[m,k]`. Runs on the GB10 tensor cores (f32 accumulate). The caller dequants
+/// the Q4 weight to f16/bf16 once, then this hits real TFLOP/s (vs the
+/// coop_tile software emulation at ~0.1% of peak).
+pub fn gemm_cublas(
+    dev: &dyn Device,
+    x: &Tensor,
+    w: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    if x.dtype != w.dtype {
+        return Err(Error::Msg(format!("gemm_cublas: x/w dtype mismatch {:?} vs {:?}", x.dtype, w.dtype)));
+    }
+    let out = Tensor::empty(dev, vec![m, n], x.dtype)?;
+    dev.gemm_tc(x.buffer.as_ref(), w.buffer.as_ref(), out.buffer.as_ref(), m, n, k, x.dtype)?;
+    Ok(out)
+}
+
+/// Dense Q4 GEMM via cooperative-tensor MMA (`ffai_gemm_q4_mpp`). Weight
+/// `[out_dim, k_in]` is the bench's Q4 layout (qs u32 4-words/block, scales
+/// f16 amax/7); `x` is `[n_rows, k_in]` of dtype T; out is `[n_rows, out_dim]`
+/// of T. The tensor-core projection GEMM for prefill (replaces the f32 scalar
+/// `matmul` that sat at ~0.1% of peak). Reduction-mode, grid
+/// `[ceil(out/64), ceil(rows/64), 1]`, block 128. `k_in % 32 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_q4_mpp(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    n_rows: usize,
+    out_dim: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q4_mpp: k_in {k_in} must be a multiple of 32")));
+    }
+    let out = Tensor::empty(dev, vec![n_rows, out_dim], x.dtype)?;
+    let kern = cached_ir("ffai_gemm_q4_mpp", x.dtype, || {
+        let mut kk = metaltile_std::ffai::gemm_q4_mpp::ffai_gemm_q4_mpp::kernel_ir_for(x.dtype);
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(out_dim as u32).div_ceil(64), (n_rows as u32).div_ceil(64), 1],
+        block: [128, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(out_dim as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Routed-expert MoE Q4 grouped BGEMM via MMA (`ffai_moe_bgemm_q4_bm64`). The
+/// token rows of `x` `[m_total, k_in]` MUST be pre-sorted by expert, with
+/// `indices` `[m_total]` giving each row's expert id. Expert weights are the
+/// contiguous Q4 pool `[n_experts*n_out, k_in]` (qs u32 + scales f16). Output
+/// `[m_total, n_out]` (sorted order; host scatters back to token order). The
+/// batched-over-S replacement for the per-token MoE gather loop. Reduction-mode,
+/// grid `[n_out/64, ceil(m_total/64), 1]`, block 128. `n_out % 64 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_bgemm_q4_bm64(
+    dev: &dyn Device,
+    x: &Tensor,
+    qs: &Tensor,
+    scales: &Tensor,
+    indices: &Tensor,
+    m_total: usize,
+    n_out: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    if n_out % 64 != 0 {
+        return Err(Error::Msg(format!("moe_bgemm_q4_bm64: n_out {n_out} must be a multiple of 64")));
+    }
+    let out = Tensor::empty(dev, vec![m_total, n_out], x.dtype)?;
+    let kern = cached_ir("ffai_moe_bgemm_q4_bm64", x.dtype, || {
+        let mut kk = metaltile_std::ffai::moe_bgemm_q4_bm64::ffai_moe_bgemm_q4_bm64::kernel_ir_for(x.dtype);
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let grid = Grid {
+        grid: [(n_out as u32) / 64, (m_total as u32).div_ceil(64), 1],
+        block: [128, 1, 1],
+    };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(indices.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(m_total as u32),
+            u(n_out as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Q4 → dense `[m, k]` dequant. Expands a resident Q4 weight (the bench's
+/// `quantize_q4` layout: `qs [m·(k/32)·4]` u32, signed nibbles; `scales
+/// [m·(k/32)]` f32, amax/7) into a dense slab of `out_dtype` for the
+/// compute-bound prefill GEMM (dequant-once → tensor-core `ffai_gemm`).
+/// 1-D grid, one thread per output value.
+pub fn dequant_q4(
+    dev: &dyn Device,
+    qs: &Tensor,
+    scales: &Tensor,
+    m: usize,
+    k: usize,
+    out_dtype: DType,
+) -> Result<Tensor> {
+    dequant_q4_off(dev, qs, scales, m, k, out_dtype, 0)
+}
+
+/// Like [`dequant_q4`] but dequants the `[m,k]` slab starting at block offset
+/// `blk_off` (in 32-value Q4 blocks) inside the qs/scales pool — used to peel
+/// one MoE expert's rows out of the contiguous `[n_exp*out, k]` Q4 pool without
+/// a tensor view. `blk_off = expert * m * (k/32)`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_q4_off(
+    dev: &dyn Device,
+    qs: &Tensor,
+    scales: &Tensor,
+    m: usize,
+    k: usize,
+    out_dtype: DType,
+    blk_off: usize,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    let n = m * k;
+    let out = Tensor::empty(dev, vec![m, k], out_dtype)?;
+    let kern = cached_ir("ffai_dequant_q4", out_dtype, || {
+        let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(out_dtype);
+        kk.mode = KernelMode::Grid3D;
+        kk
+    });
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid::d1((n as u32).div_ceil(256), 256);
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(k as u32),
+            u(n as u32),
+            u(blk_off as u32),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Multi-query (prefill) SDPA — attends `n_query` query rows against a shared
+/// K/V cache in one dispatch. `causal=1` → query `r` attends `[0, base_kv+r+1)`
+/// (causal within the block, prefix fully visible); `causal=0` → bidirectional
+/// over `[0, base_kv+n_query)`. Q/out `[n_query, n_q_heads, head_dim]`, K/V
+/// `[n_kv_heads, kv_stride, head_dim]`. head_dim hard-128. This is the prefill
+/// flash-attn (`ffai_sdpa_multi`), Reduction-mode, grid `[n_q_heads*n_query]`,
+/// block 1024.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_multi(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_q_heads: u32,
+    base_kv: u32,
+    n_query: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    if head_dim != 128 {
+        return Err(Error::Msg(format!("sdpa_multi: head_dim must be 128, got {head_dim}")));
+    }
+    let out = Tensor::empty(dev, vec![n_query as usize, n_q_heads as usize, head_dim], q.dtype)?;
+    let kern = cached_ir("ffai_sdpa_multi", q.dtype, || {
+        let mut kk = metaltile_std::ffai::sdpa_multi::ffai_sdpa_multi::kernel_ir_for(q.dtype);
+        kk.mode = KernelMode::Reduction;
+        kk
+    });
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let f = |x: f32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid { grid: [n_q_heads * n_query, 1, 1], block: [1024, 1, 1] };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(q.buffer.clone()),
+            Binding::Buffer(k.buffer.clone()),
+            Binding::Buffer(v.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(head_dim as u32),
+            u(n_q_heads),
+            u(base_kv),
+            u(n_query),
+            u(kv_stride),
+            u(heads_per_group),
+            u(u32::from(causal)),
+            f(scale),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Raw CUDA source for the **chunked parallel SSD prefill scan** for the
+/// NemotronH-Nano-30B Mamba2 cell (Dh=64, Ds=128, H=64, G=8, n_per_t=4).
+///
+/// The existing `ssm_step_record_d64_128_64_8` runs a serial loop over T
+/// positions per (h, dh) cell — the serial chain of length T is the bottleneck.
+/// This kernel replaces it with a **two-pass parallel segment scan**:
+///
+/// **Pass 1 (parallel)**: `N_SEG` warp-segments each process `T/N_SEG` positions
+///   independently (assuming initial state = 0), computing a "partial state"
+///   contribution and the segment's decay product `alpha_seg`.
+///
+/// **Pass 2 (sequential, warp 0 only)**: Stitch the true initial state for each
+///   segment by walking the T/N_SEG chain: `s_in[k+1] = alpha_seg[k] * s_in[k] + partial[k]`.
+///
+/// **Pass 3 (parallel)**: Each segment re-computes its positions with the true
+///   `s_in[seg]` and emits the correct `y[t]` values.
+///
+/// **Complexity**: 2T work (passes 1+3) + T/N_SEG serial (pass 2). At N_SEG=32,
+/// depth drops from T=2048 to T/32=64. Speedup ≈ 32× for pure serial bottleneck.
+///
+/// **Memory**: Shared: `N_SEG × n_per_t × WARP` = 32×4×32 = 4096 f32 per block ≈ 16KB.
+/// Block size: `[WARP × N_SEG, 1, 1]`; Grid3D: `[1, Dh, H]` (same as sequential).
+///
+/// **Dimensions fixed for NemotronH**: Dh=64, Ds=128, H=64, G=8, n_per_t=4.
+/// The Ds/warp = 128/32 = 4 state values per lane (= n_per_t). G/H ratio = 8/64 = 1/8.
+const SSM_CHUNKED_SCAN_SRC: &str = r#"
+#include <cuda_fp16.h>
+// Note: math.h / cmath not needed for NVRTC device code.
+// expf, __shfl_xor_sync etc. are CUDA intrinsics, available without includes.
+
+// NemotronH-Nano Mamba2 cell constants (hardcoded for performance).
+#define DH      64u   // head_dim
+#define DS      128u  // state_dim
+#define NH      64u   // n_heads
+#define NG      8u    // n_groups (G = H/ratio, ratio = NH/NG = 8)
+#define NPT     4u    // n_per_t = DS / WARP (128/32 = 4 state slots per lane)
+#define WARP    32u
+
+// N_SEG segments per (h, dh) cell. Must divide T cleanly.
+// 32 segments → at T=2048 each segment handles 64 steps; T=512 → 16 steps.
+// Shared mem = N_SEG * NPT * WARP * 4 = 32*4*32*4 = 16KB + alpha (128B) + s_in (512B) per block.
+// Block size = WARP * N_SEG = 32*32 = 1024 (CUDA max threads/block limit).
+#define N_SEG   32u
+
+// Total threads per block: WARP * N_SEG = 32 * 32 = 1024.
+// Grid: [1, DH, NH] = [1, 64, 64] = 4096 blocks (same as sequential kernel).
+
+extern "C" __global__ __launch_bounds__(WARP * N_SEG)
+void ssm_chunked_prefill(
+    const float*  __restrict__ x,        // [T, NH, DH]
+    const float*  __restrict__ a_log,    // [NH]
+    const float*  __restrict__ b_mat,    // [T, NG, DS]
+    const float*  __restrict__ c_mat,    // [T, NG, DS]
+    const float*  __restrict__ d_skip,   // [NH]
+    const float*  __restrict__ dt,       // [T, NH]
+    const float*  __restrict__ state_in, // [NH, DH, DS]
+    float*        __restrict__ y,        // [T, NH, DH]
+    float*        __restrict__ state_out,// [NH, DH, DS]
+    unsigned int  t_total)
+{
+    // Each block owns one (d_idx, h_idx) cell.
+    const unsigned int d_idx  = blockIdx.y;           // ∈ [0, DH)
+    const unsigned int h_idx  = blockIdx.z;           // ∈ [0, NH)
+    const unsigned int g_idx  = h_idx / (NH / NG);   // group index ∈ [0, NG)
+    const unsigned int lane   = threadIdx.x & (WARP - 1u);  // ∈ [0, 32)
+    const unsigned int seg_id = threadIdx.x / WARP;         // ∈ [0, N_SEG)
+
+    // Shared memory: partial state contribution for each segment × state slots.
+    // Layout: [N_SEG, NPT] where NPT lanes × each 1 float = 128 floats/segment.
+    __shared__ float sh_partial[N_SEG * NPT * WARP];  // seg → [NPT, WARP] colmajor
+    __shared__ float sh_alpha[N_SEG];                  // seg decay product
+    __shared__ float sh_s_in[NPT * WARP];              // true initial state for each seg (broadcast)
+
+    // Chunk parameters.
+    const unsigned int T = t_total;
+    const unsigned int seg_len = (T + N_SEG - 1u) / N_SEG;  // positions per segment (~T/N_SEG)
+    const unsigned int t_start = seg_id * seg_len;
+    const unsigned int t_end   = (t_start + seg_len < T) ? (t_start + seg_len) : T;
+
+    // A = -exp(A_log[h]) (constant for this cell).
+    const float a_neg = -expf(a_log[h_idx]);
+
+    // State-slice offsets for this (h, d_idx) cell.
+    const unsigned int state_base = (h_idx * DH + d_idx) * DS;
+
+    // ── Pass 1: Compute partial state and alpha for this segment ─────────────
+    // Assume state_in = 0. Walk t_start..t_end updating local state in registers.
+    // Each lane owns NPT=4 consecutive Ds slots: lane*NPT .. lane*NPT+3.
+    float local_s[NPT] = {0.f, 0.f, 0.f, 0.f};  // partial state (assuming s_in=0)
+    float seg_alpha = 1.f;   // product of dA over [t_start, t_end)
+
+    for (unsigned int t = t_start; t < t_end; ++t) {
+        const unsigned int bt_h = t * NH + h_idx;
+        const unsigned int bt_g = t * NG + g_idx;
+        const float dt_v   = dt[bt_h];
+        const float d_a    = expf(a_neg * dt_v);
+        const float x_v    = x[bt_h * DH + d_idx];
+
+        seg_alpha *= d_a;
+
+        // Update local state and accumulate y later (will redo in pass 3).
+        for (unsigned int i = 0u; i < NPT; ++i) {
+            const unsigned int s_idx = lane * NPT + i;
+            const float b_v = b_mat[bt_g * DS + s_idx];
+            local_s[i] = d_a * local_s[i] + dt_v * b_v * x_v;
+        }
+    }
+
+    // Write partial state to shared memory: sh_partial[seg_id, lane, i].
+    for (unsigned int i = 0u; i < NPT; ++i) {
+        sh_partial[(seg_id * NPT + i) * WARP + lane] = local_s[i];
+    }
+    if (lane == 0u) sh_alpha[seg_id] = seg_alpha;
+
+    __syncthreads();
+
+    // ── Pass 2: Sequential stitch (only seg 0 of each block = warp 0) ─────
+    // Walk segments 0..N_SEG sequentially to compute true s_in for each segment.
+    // Seg 0's s_in is the model's real state_in (loaded from global memory).
+    if (seg_id == 0u) {
+        // Load true initial state into sh_s_in (seg 0's start = state_in).
+        for (unsigned int i = 0u; i < NPT; ++i) {
+            sh_s_in[i * WARP + lane] = state_in[state_base + (lane * NPT + i)];
+        }
+        // Seg 0: its partial result already assumed s_in=0; add the real s_in×alpha.
+        // (We store the TRUE s_in for seg k, then update to seg k+1's s_in.)
+        for (unsigned int seg = 0u; seg < N_SEG; ++seg) {
+            const float alpha_s = sh_alpha[seg];
+            // True s_in for next seg = alpha_s * true_s_in[seg] + partial[seg].
+            for (unsigned int i = 0u; i < NPT; ++i) {
+                float s_in_val = sh_s_in[i * WARP + lane];
+                float partial  = sh_partial[(seg * NPT + i) * WARP + lane];
+                // The corrected partial for this seg: partial + alpha_s * s_in_val
+                // We store the NEXT seg's s_in (= alpha_s * s_in_val + partial).
+                sh_s_in[i * WARP + lane] = alpha_s * s_in_val + partial;
+                // Overwrite partial with corrected carry for pass 3 to read.
+                sh_partial[(seg * NPT + i) * WARP + lane] = s_in_val;
+            }
+        }
+        // sh_s_in now holds the true final state after all T positions.
+    }
+
+    __syncthreads();
+
+    // ── Pass 3: Recompute with true s_in, emit y ────────────────────────
+    // sh_partial[seg_id * NPT + i, lane] now holds the TRUE s_in for this seg.
+    for (unsigned int i = 0u; i < NPT; ++i) {
+        local_s[i] = sh_partial[(seg_id * NPT + i) * WARP + lane];
+    }
+
+    for (unsigned int t = t_start; t < t_end; ++t) {
+        const unsigned int bt_h = t * NH + h_idx;
+        const unsigned int bt_g = t * NG + g_idx;
+        const float dt_v   = dt[bt_h];
+        const float d_a    = expf(a_neg * dt_v);
+        const float x_v    = x[bt_h * DH + d_idx];
+
+        float y_acc = 0.f;
+        for (unsigned int i = 0u; i < NPT; ++i) {
+            const unsigned int s_idx = lane * NPT + i;
+            const float b_v = b_mat[bt_g * DS + s_idx];
+            const float c_v = c_mat[bt_g * DS + s_idx];
+            local_s[i] = d_a * local_s[i] + dt_v * b_v * x_v;
+            y_acc += c_v * local_s[i];
+        }
+        // Warp-reduce y_acc across all 32 lanes.
+        for (unsigned int mask = WARP >> 1u; mask > 0u; mask >>= 1u)
+            y_acc += __shfl_xor_sync(0xffffffffu, y_acc, mask);
+
+        if (lane == 0u) {
+            const float d_v = d_skip[h_idx];
+            y[bt_h * DH + d_idx] = y_acc + x_v * d_v;
+        }
+    }
+
+    // ── Write state_out ───────────────────────────────────────────────────
+    // Only warp 0 (seg_id=0, lane=all) holds the FINAL state in sh_s_in.
+    if (seg_id == 0u) {
+        for (unsigned int i = 0u; i < NPT; ++i) {
+            state_out[state_base + (lane * NPT + i)] = sh_s_in[i * WARP + lane];
+        }
+    }
+}
+"#;
+
+/// Mamba2 SSD **chunked parallel prefill scan** for the NemotronH cell
+/// (Dh=64, Ds=128, H=64, G=8). Replaces the sequential-in-T `ssm_prefill_scan`
+/// with a two-pass parallel segment scan that drops the serial depth from T to
+/// T/N_SEG=T/64. Gated by `NEMOTRON_CHUNKED_SCAN=1`; correctness gate is the
+/// same `NEMOTRON_PREFILL_CHECK` comparison against sequential.
+///
+/// Grid3D: `[1, Dh=64, H=64]`, block `[WARP × N_SEG]` = `[32 × 32 = 1024]`.
+/// Shared mem per block: ~17KB (partial states + alpha + s_in scratch).
+///
+/// Returns `(state_out, y)` — same signature as `ssm_prefill_scan`.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_prefill_scan_chunked(
+    dev: &dyn Device,
+    x: &Tensor,
+    a_log: &Tensor,
+    b_mat: &Tensor,
+    c_mat: &Tensor,
+    d_skip: &Tensor,
+    dt: &Tensor,
+    state_in: &Tensor,
+    t_total: u32,
+    dh: u32,
+    ds: u32,
+    n_heads: u32,
+    n_groups: u32,
+) -> Result<(Tensor, Tensor)> {
+    if (dh, ds, n_heads, n_groups) != (64, 128, 64, 8) {
+        return Err(Error::Msg(format!(
+            "ssm_prefill_scan_chunked: only Nemotron cell (64,128,64,8) wired, got ({dh},{ds},{n_heads},{n_groups})"
+        )));
+    }
+    let t = t_total as usize;
+    let (nh, dhu, _dsu) = (n_heads as usize, dh as usize, ds as usize);
+    let y = Tensor::empty(dev, vec![t * nh * dhu], x.dtype)?;
+    let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
+    // N_SEG must divide t_total (or kernel pads). 64 divides 512,2048,8192.
+    // For t_total not divisible by 64, pass as-is — the kernel uses a guard.
+    let t_bytes = t_total.to_le_bytes().to_vec();
+    // Grid: [1, Dh, H]. Block: [WARP * N_SEG] = [32 * 64] = [2048].
+    let grid = [1u32, dh, n_heads];
+    let block = [32u32 * 32, 1, 1]; // WARP * N_SEG = 32*32 = 1024 (CUDA max threads/block)
+    // Shared mem: N_SEG * NPT * WARP * 4 + N_SEG * 4 + NPT * WARP * 4
+    //           = 32*4*32*4 + 32*4 + 4*32*4 = 16384 + 128 + 512 = 17024 bytes
+    let shared_bytes: u32 = 32 * 4 * 32 * 4 + 32 * 4 + 4 * 32 * 4;
+    // Cast inputs to f32 for the raw CUDA kernel (which reads f32).
+    // The existing sequential kernel also accumulates in f32.
+    // NOTE: if x/state are f16/bf16 we need casts. For now, only f32 is wired.
+    if x.dtype != DType::F32 {
+        return Err(Error::Msg("ssm_prefill_scan_chunked: only F32 input wired (cast first)".into()));
+    }
+    dev.dispatch_raw_cuda(
+        SSM_CHUNKED_SCAN_SRC,
+        "ssm_chunked_prefill.cu",
+        "ssm_chunked_prefill",
+        &[
+            (x.buffer.as_ref(), 0),
+            (a_log.buffer.as_ref(), 0),
+            (b_mat.buffer.as_ref(), 0),
+            (c_mat.buffer.as_ref(), 0),
+            (d_skip.buffer.as_ref(), 0),
+            (dt.buffer.as_ref(), 0),
+            (state_in.buffer.as_ref(), 0),
+            (y.buffer.as_ref(), 0),
+            (state_out.buffer.as_ref(), 0),
+        ],
+        &[t_bytes],
+        grid,
+        block,
+        shared_bytes,
+        false,
+    )?;
+    Ok((state_out, y))
+}
+
+/// Mamba2 SSD **batched-prefill scan** — runs the sequential SSD forward over
+/// all `t_total` prompt tokens in ONE dispatch, emitting every per-token
+/// `y[t]` plus the final recurrent `state_out` (for decode continuity).
+/// Dispatches `ssm_step_record_d64_128_64_8` (Nemotron cell: Dh=64, Ds=128,
+/// H=64, G=8). The `(da_log, dbx_log)` tapes are written but ignored here
+/// (they exist for the speculative-rollback replay path). Layouts:
+/// `x [t·H·Dh]`, `a_log/d [H]`, `dt [t·H]`, `b/c [t·G·Ds]`,
+/// `state_in/out [H·Dh·Ds]`, `y [t·H·Dh]`. Grid3D `[1, Dh, H]`, tg `[32,1,1]`.
+#[allow(clippy::too_many_arguments)]
+pub fn ssm_prefill_scan(
+    dev: &dyn Device,
+    x: &Tensor,
+    a_log: &Tensor,
+    b_mat: &Tensor,
+    c_mat: &Tensor,
+    d_skip: &Tensor,
+    dt: &Tensor,
+    state_in: &Tensor,
+    t_total: u32,
+    dh: u32,
+    ds: u32,
+    n_heads: u32,
+    n_groups: u32,
+) -> Result<(Tensor, Tensor)> {
+    use metaltile_core::ir::KernelMode;
+    if (dh, ds, n_heads, n_groups) != (64, 128, 64, 8) {
+        return Err(Error::Msg(format!(
+            "ssm_prefill_scan: only Nemotron cell (64,128,64,8) wired, got ({dh},{ds},{n_heads},{n_groups})"
+        )));
+    }
+    let t = t_total as usize;
+    let (nh, dhu, dsu) = (n_heads as usize, dh as usize, ds as usize);
+    let y = Tensor::empty(dev, vec![t * nh * dhu], x.dtype)?;
+    let state_out = Tensor::empty(dev, state_in.shape.clone(), x.dtype)?;
+    // Tape outputs — written by the kernel, unused by prefill.
+    let da_log = Tensor::empty(dev, vec![t * nh * dsu], x.dtype)?;
+    let dbx_log = Tensor::empty(dev, vec![t * nh * dhu * dsu], x.dtype)?;
+    // mask buffer: has_mask=0 → kernel ignores contents, but the binding must exist.
+    let mask = Tensor::new(dev.upload(&vec![0u8; t * 4]).unwrap(), vec![t], DType::U32);
+    let kern = cached_ir("ssm_step_record_d64_128_64_8", x.dtype, || {
+        let mut kk = metaltile_std::ffai::ssm_replay::ssm_step_record_d64_128_64_8::kernel_ir_for(x.dtype);
+        kk.mode = KernelMode::Grid3D;
+        kk
+    });
+    let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+    let grid = Grid { grid: [1, dh, n_heads], block: [32, 1, 1] };
+    dev.dispatch(
+        &kern,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(a_log.buffer.clone()),
+            Binding::Buffer(b_mat.buffer.clone()),
+            Binding::Buffer(c_mat.buffer.clone()),
+            Binding::Buffer(d_skip.buffer.clone()),
+            Binding::Buffer(dt.buffer.clone()),
+            Binding::Buffer(state_in.buffer.clone()),
+            Binding::Buffer(mask.buffer.clone()),
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(state_out.buffer.clone()),
+            Binding::Buffer(da_log.buffer.clone()),
+            Binding::Buffer(dbx_log.buffer.clone()),
+            u(t_total),
+            u(0), // has_mask
+        ],
+        grid,
+    )?;
+    Ok((state_out, y))
 }
 
 /// DeepSeek-V4 MLA decode attention: d512 SDPA with a per-head learnable
@@ -1147,6 +1992,124 @@ pub fn relu2(dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+/// Raw CUDA source for the **MoE scatter-add** kernel.
+///
+/// After the batched down-GEMM produces `dn_out [mt, hid]` (sorted by expert),
+/// this kernel scatters each row back to the corresponding token slot in the
+/// output accumulator, weighted by the router weight:
+///
+///   `acc[token_indices[r], h] += dn_out[r, h] * weights[r] * unscale`
+///
+/// Uses `atomicAdd(float*, float)` (available since CUDA 2.0/GPGPU) so multiple
+/// experts for the same token add correctly. Block: `[BLOCK_H, 1]`; Grid:
+/// `[mt, ceil(hid/BLOCK_H)]`. For NemotronH hid=2688, BLOCK_H=128: 21 col-blocks.
+const MOE_SCATTER_ADD_SRC: &str = r#"
+#include <cuda_fp16.h>
+#define BLOCK_H 128
+
+extern "C" __global__ void moe_scatter_add_f32(
+    const float*   __restrict__ dn,      // [mt, hid] sorted-row expert outputs
+    const unsigned* __restrict__ tidx,   // [mt] token index per row
+    const float*   __restrict__ wts,     // [mt] router weights
+    float*                      acc,     // [s, hid] output accumulator (pre-zeroed)
+    int mt, int hid, float unscale)
+{
+    int r = (int)blockIdx.x;  // sorted row ∈ [0, mt)
+    int h = (int)(blockIdx.y * BLOCK_H + threadIdx.x);  // hidden dim
+    if (r < mt && h < hid) {
+        float w = wts[r] * unscale;
+        atomicAdd(&acc[(int)tidx[r] * hid + h], dn[r * hid + h] * w);
+    }
+}
+"#;
+
+/// Device-side MoE scatter-add: write `dn_out[r, h] * weights[r] * unscale`
+/// into `acc[token_indices[r], h]` for each row `r` in the sorted batch.
+/// `acc` must be pre-zeroed (use `Tensor::zeros`). Returns nothing (in-place).
+///
+/// Replaces the host scatter loop in the prefill MoE path, enabling fully
+/// on-device processing when combined with device gather + batched bm64 GEMMs.
+pub fn moe_scatter_add(
+    dev: &dyn Device,
+    dn: &Tensor,   // [mt, hid] f32 down-GEMM output (sorted)
+    tidx: &Tensor, // [mt] u32 token indices
+    wts: &Tensor,  // [mt] f32 router weights
+    acc: &Tensor,  // [s, hid] f32 accumulator
+    mt: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    let mt_i = (mt as i32).to_le_bytes().to_vec();
+    let hid_i = (hid as i32).to_le_bytes().to_vec();
+    let uscale_f = unscale.to_le_bytes().to_vec();
+    const BLOCK_H: u32 = 128;
+    let grid = [mt as u32, (hid as u32).div_ceil(BLOCK_H), 1];
+    let block = [BLOCK_H, 1, 1];
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_SRC,
+        "moe_scatter_add.cu",
+        "moe_scatter_add_f32",
+        &[
+            (dn.buffer.as_ref(),   0),
+            (tidx.buffer.as_ref(), 0),
+            (wts.buffer.as_ref(),  0),
+            (acc.buffer.as_ref(),  0),
+        ],
+        &[mt_i, hid_i, uscale_f],
+        grid,
+        block,
+        0,
+        false,
+    )
+}
+
+/// Raw CUDA source for `relu2_scale_f16`: `out[i] = max(0, (float)in[i])^2 * scale`
+/// where `in` and `out` are __half (f16). Fuses the cast-to-f32, relu, square,
+/// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
+/// downloading to host, computing on CPU, and re-uploading. One kernel replaces
+/// the full host-round-trip between the up and down GEMMs.
+const RELU2_SCALE_F16_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void relu2_scale_f16(
+    const __half* __restrict__ inp,
+    __half*       __restrict__ out,
+    int n, float scale)
+{
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float v = __half2float(inp[i]);
+        if (v < 0.f) v = 0.f;
+        out[i] = __float2half(v * v * scale);
+    }
+}
+"#;
+
+/// Fused relu² + scalar scale for f16 tensors, all on device.
+/// Computes `out[i] = max(0, x[i])^2 * scale` (x and out are f16).
+/// Used to replace the host round-trip between the MoE expert up and down GEMMs:
+///   old: dl(a_f16) → relu2+scale on host → ul(a2_f16)  [forces GPU sync]
+///   new: relu2_scale_f16(a_f16, scale)                  [stays on device]
+pub fn relu2_scale_f16(dev: &dyn Device, x: &Tensor, scale: f32) -> Result<Tensor> {
+    let n = x.elem_count();
+    let out = Tensor::empty(dev, x.shape.clone(), DType::F16)?;
+    let scale_bytes = scale.to_le_bytes().to_vec();
+    let n_bytes = (n as i32).to_le_bytes().to_vec();
+    let block = 256u32;
+    let grid = (n as u32).div_ceil(block);
+    dev.dispatch_raw_cuda(
+        RELU2_SCALE_F16_SRC,
+        "relu2_scale_f16.cu",
+        "relu2_scale_f16",
+        &[(x.buffer.as_ref(), 0), (out.buffer.as_ref(), 0)],
+        &[n_bytes, scale_bytes],
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        false,
+    )?;
+    Ok(out)
+}
+
 /// Build an Elementwise `out[i] = act(a[i])` kernel for `dtype`. (`mt_gelu`
 /// is bench-only in the metaltile corpus — no registered correctness test — so
 /// we hand-build the IR the same way `binop_kernel` does for add/mul.)
@@ -1387,6 +2350,98 @@ pub fn rope_llama(
     Ok(out)
 }
 
+/// Batched Llama-style RoPE: apply position-dependent rotation to ALL T rows in
+/// ONE dispatch. Replaces the T-loop of per-token `rope_llama` calls in the
+/// prefill attention path, eliminating the dl(q_all)/dl(k_all)/dl(v_all) + S×dl
+/// overhead for the attention layers.
+///
+/// `qk`: [T, n_heads, head_dim] float  
+/// `positions`: [T] u32 positions (one per token row)  
+/// returns: [T, n_heads, head_dim] rotated (same dtype as qk)
+pub fn rope_llama_many(
+    dev: &dyn Device,
+    qk: &Tensor,
+    positions: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta_base: f32,
+    scale_factor: f32,
+    low_freq_factor: f32,
+    high_freq_factor: f32,
+    original_max_position: f32,
+) -> Result<Tensor> {
+    use metaltile_core::ir::KernelMode;
+    let t = qk.elem_count() / (n_heads * head_dim);
+    let half = head_dim / 2;
+    let k = cached_ir("ffai_rope_llama_many", qk.dtype, || {
+        let mut kk = metaltile_std::ffai::rope_llama_many::ffai_rope_llama_many::kernel_ir_for(qk.dtype);
+        kk.mode = KernelMode::Grid3D;
+        kk
+    });
+    let out = Tensor::empty(dev, qk.shape.clone(), qk.dtype)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
+    let row_stride = (n_heads * head_dim) as u32;
+    let grid = Grid { grid: [t as u32, n_heads as u32, half as u32], block: [1, 1, 1] };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(qk.buffer.clone()),
+            Binding::Buffer(positions.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(head_dim as u32),
+            u(half as u32),
+            u(row_stride),
+            f(theta_base),
+            f(scale_factor),
+            f(low_freq_factor),
+            f(high_freq_factor),
+            f(original_max_position),
+        ],
+        grid,
+    )?;
+    Ok(out)
+}
+
+/// Batched KV-cache append: write T tokens' K (or V) rows into the per-head
+/// cache in ONE dispatch. Replaces the T-loop of per-token `kv_append` calls.
+///
+/// `src`: [T, n_kv_heads, head_dim]  
+/// `positions`: [T] u32 positions  
+/// `cache`: [n_kv_heads, max_seq, head_dim] (pre-allocated)
+pub fn kv_append_many(
+    dev: &dyn Device,
+    src: &Tensor,
+    positions: &Tensor,
+    cache: &Tensor,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+) -> Result<()> {
+    use metaltile_core::ir::KernelMode;
+    let t = src.elem_count() / (n_kv_heads * head_dim);
+    let k = cached_ir("kv_cache_update_many", src.dtype, || {
+        let mut kk = metaltile_std::ffai::kv_cache_update_many::kv_cache_update_many::kernel_ir_for(src.dtype);
+        kk.mode = KernelMode::Grid3D;
+        kk
+    });
+    let total = t * n_kv_heads * head_dim;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(src.buffer.clone()),
+            Binding::Buffer(positions.buffer.clone()),
+            Binding::Buffer(cache.buffer.clone()),
+            u(head_dim as u32),
+            u(max_seq as u32),
+            u((n_kv_heads * head_dim) as u32),
+        ],
+        Grid { grid: [total as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::dsv4_mhc_sinkhorn_split;
@@ -1409,4 +2464,304 @@ mod tests {
         assert!(pre.iter().all(|&x| x > 0.0 && x < 1.01));
         assert!(post.iter().all(|&x| x > 0.0 && x < 2.0));
     }
+}
+
+// ── Fused Mamba projection split (Part-B: 3 strided_col_copy → 1 dispatch) ─
+//
+// Splits proj [s, in_proj_out] into z [s, di], xbc [s, conv_dim], dt_raw [s, m_nh]
+// in ONE device dispatch. Replaces the 3 sequential `strided_col_copy` launches
+// that were 20-37% of prefill time at S=512-2048 (138 dispatches/forward).
+pub fn mamba_split_proj(
+    dev: &dyn Device,
+    proj: &Tensor,
+    s: usize,
+    in_proj_out: usize,
+    di: usize,
+    conv_dim: usize,
+    m_nh: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let kernel = cached_ir("mamba_split_proj", DType::F32, || {
+        use metaltile_core::ir::KernelMode;
+        let mut k = metaltile_std::ffai::ssm::mamba_split_proj::kernel_ir_for();
+        k.mode = KernelMode::Grid3D;
+        k
+    });
+    let z_out  = Tensor::empty(dev, vec![s * di], DType::F32)?;
+    let xbc_out = Tensor::empty(dev, vec![s * conv_dim], DType::F32)?;
+    let dt_out  = Tensor::empty(dev, vec![s * m_nh], DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(proj.buffer.clone()),
+            Binding::Buffer(z_out.buffer.clone()),
+            Binding::Buffer(xbc_out.buffer.clone()),
+            Binding::Buffer(dt_out.buffer.clone()),
+            u(in_proj_out as u32),
+            u(di as u32),
+            u(conv_dim as u32),
+            u(m_nh as u32),
+        ],
+        Grid { grid: [(s * in_proj_out) as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok((z_out, xbc_out, dt_out))
+}
+
+// ── Fused Mamba conv-output split (Part-B: 3 strided_col_copy → 1 dispatch) ─
+//
+// Splits yc_silu [s, conv_dim] into x [s, di], b [s, ng*ds], c [s, ng*ds]
+// in ONE device dispatch.
+pub fn mamba_split_conv(
+    dev: &dyn Device,
+    yc_silu: &Tensor,
+    s: usize,
+    conv_dim: usize,
+    di: usize,
+    ng_ds: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let kernel = cached_ir("mamba_split_conv", DType::F32, || {
+        use metaltile_core::ir::KernelMode;
+        let mut k = metaltile_std::ffai::ssm::mamba_split_conv::kernel_ir_for();
+        k.mode = KernelMode::Grid3D;
+        k
+    });
+    let x_out  = Tensor::empty(dev, vec![s * di], DType::F32)?;
+    let b_out  = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+    let c_out  = Tensor::empty(dev, vec![s * ng_ds], DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(yc_silu.buffer.clone()),
+            Binding::Buffer(x_out.buffer.clone()),
+            Binding::Buffer(b_out.buffer.clone()),
+            Binding::Buffer(c_out.buffer.clone()),
+            u(conv_dim as u32),
+            u(di as u32),
+            u(ng_ds as u32),
+        ],
+        Grid { grid: [(s * conv_dim) as u32, 1, 1], block: [1, 1, 1] },
+    )?;
+    Ok((x_out, b_out, c_out))
+}
+
+// ── Batched gated group RMSNorm (Mamba2, prefill) ─────────────────────────
+//
+// Processes S tokens in one dispatch.  Each thread-group handles one (token,
+// norm-group) pair.  Replaces the host dl+compute+upload loop in the
+// CONV_DEVICE prefill path (TODO comment at line ~1543 of modeltests/lib.rs).
+pub fn gated_group_rmsnorm_batched(
+    dev: &dyn Device,
+    y: &Tensor,
+    z: &Tensor,
+    w: &Tensor,
+    eps: f32,
+    s: usize,
+    di: usize,
+    gs: usize,
+) -> Result<Tensor> {
+    let ng = di / gs;
+    let kernel = cached_ir("gated_group_rmsnorm_batched", DType::F32, || {
+        use metaltile_core::ir::KernelMode;
+        let mut k = metaltile_std::ffai::ssm::gated_group_rmsnorm_batched::kernel_ir_for();
+        k.mode = KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![s * di], DType::F32)?;
+    let eps_buf = Tensor::new(dev.upload(&eps.to_le_bytes()).map_err(|e| Error::Msg(format!("{e:?}")))?, vec![1], DType::F32);
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(
+        &kernel,
+        &[
+            Binding::Buffer(y.buffer.clone()),
+            Binding::Buffer(z.buffer.clone()),
+            Binding::Buffer(w.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Buffer(eps_buf.buffer.clone()),
+            u(gs as u32),
+            u(ng as u32),
+        ],
+        Grid { grid: [(s * ng) as u32, 1, 1], block: [(gs / 4) as u32, 1, 1] },
+    )?;
+    Ok(out)
+}
+
+const BATCHED_DEQUANT_Q4_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void moe_batched_dequant_q4(
+    const unsigned int* __restrict__ qs,
+    const __half*       __restrict__ sc,
+    const unsigned int* __restrict__ eid,
+    __half*             __restrict__ out,
+    int n_active, int n_out, int k_in, int bpr_in
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_active * n_out * k_in) return;
+    int slot   = i / (n_out * k_in);
+    int local  = i - slot * n_out * k_in;
+    int r      = local / k_in;
+    int c      = local - r * k_in;
+    int expert = (int)eid[slot];
+    int b      = c / 32;
+    int j      = c % 32;
+    int w_idx  = j / 8;
+    int nib_idx= j % 8;
+    int global_blk = expert * n_out * bpr_in + r * bpr_in + b;
+    unsigned int word = qs[global_blk * 4 + w_idx];
+    unsigned int nib  = (word >> (nib_idx * 4)) & 0xFu;
+    int q_signed  = (nib >= 8u) ? (int)nib - 16 : (int)nib;
+    float scale   = __half2float(sc[global_blk]);
+    __half val    = __float2half((float)q_signed * scale);
+    out[i] = val;
+}
+"#;
+
+/// Fused grouped-GEMM MoE expert pass (CUDA 13+, `NEMOTRON_GROUPED_GEMM=1`).
+///
+/// Per-expert dequant → GEMM pipelined (interleaved): dequant expert i into its slot
+/// in the pre-allocated scratch buffer, immediately GEMM expert i, continue. No host
+/// sync between experts. Device relu2_scale_f16 eliminates the host relu2 round-trip.
+///
+/// Uses the pre-allocated scratch buffers (passed via `up_scratch`/`dn_scratch`) to
+/// avoid per-expert `cuMemAlloc`. Each expert's weight slot in the scratch is
+/// `slot * n_out * k_in * 2` bytes. The scratch must be pre-allocated to hold
+/// `n_exp * n_out * k_in * 2` bytes (at least `n_active` slots needed).
+///
+/// Returns `[mt, hid]` f16 output (relu² applied, 1/256 scaled). Caller scatter-adds.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped_gemm(
+    dev: &dyn Device,
+    qs_up: &Tensor,
+    sc_up: &Tensor,
+    qs_dn: &Tensor,
+    sc_dn: &Tensor,
+    xs_f16: &Tensor,        // [mt, hid] f16 — rows sorted by expert id
+    g_starts: &[usize],     // length = n_active + 1
+    expert_ids: &[usize],   // expert id for each group
+    hid: usize,
+    inter: usize,
+    bpr_up: usize,          // hid / 32
+    bpr_dn: usize,          // inter / 32
+    up_scratch: Option<&Tensor>, // Pre-allocated [n_exp*inter, hid] f16
+    dn_scratch: Option<&Tensor>, // Pre-allocated [n_exp*hid, inter] f16
+) -> Result<Tensor> {
+    use ffai_core::DeviceBuffer;
+    let n_active = expert_ids.len();
+    let mt = g_starts.last().copied().unwrap_or(0);
+    if n_active == 0 || mt == 0 {
+        return Tensor::empty(dev, vec![mt.max(1), hid], DType::F16);
+    }
+
+    let eid_bytes: Vec<u8> = expert_ids.iter().flat_map(|&e| (e as u32).to_le_bytes()).collect();
+    let eid_dev = dev.upload(&eid_bytes)
+        .map_err(|e| Error::Msg(format!("moe_grouped_gemm: upload eid: {e:?}")))?;
+
+    // Allocate UP scratch (or use pre-allocated).
+    let up_w_owned: Option<Tensor>;
+    let up_w = if let Some(scratch) = up_scratch {
+        Tensor { buffer: scratch.buffer.clone(), offset: 0, shape: vec![n_active * inter, hid], dtype: DType::F16 }
+    } else {
+        up_w_owned = Some(Tensor::empty(dev, vec![n_active * inter, hid], DType::F16)?);
+        up_w_owned.as_ref().unwrap().clone()
+    };
+
+    // [mt, inter] f16 output for UP pass.
+    let up_out = Tensor::empty(dev, vec![mt, inter], DType::F16)?;
+
+    // ── UP pass: per-expert dequant (into scratch slot) → GEMM (immediately).
+    // All async on the same stream — the GPU pipelines dequant[i] with GEMM[i-1].
+    for (slot, &eid) in expert_ids.iter().enumerate() {
+        let rows = g_starts[slot+1] - g_starts[slot];
+        if rows == 0 { continue; }
+
+        // Dequant expert eid's UP weight into slot `slot` of the scratch buffer.
+        // Slot offset: slot * inter * hid * 2 bytes.
+        let slot_off = slot * inter * hid * 2;
+        let blk_off = eid * inter * bpr_up;
+        let n_elem = inter * hid;
+        let kern = cached_ir("ffai_dequant_q4", DType::F16, || {
+            use metaltile_core::ir::KernelMode;
+            let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(DType::F16);
+            kk.mode = KernelMode::Grid3D;
+            kk
+        });
+        let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+        dev.dispatch(
+            &kern,
+            &[
+                Binding::Buffer(qs_up.buffer.clone()),
+                Binding::Buffer(sc_up.buffer.clone()),
+                Binding::Buffer(up_w.buffer.clone()),
+                u(hid as u32),
+                u(n_elem as u32),
+                u(blk_off as u32),
+            ],
+            Grid::d1((n_elem as u32).div_ceil(256), 256),
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: dequant UP eid={eid}: {e:?}")))?;
+        // NOTE: ^^ dequant_q4_off writes to `out[0..n_elem]` but our scratch has offset `slot_off`.
+        // We use gemm_tc_off to read from the correct offset.
+
+        // GEMM UP: xs_f16[g_starts[slot]:g_starts[slot+1], :] × up_w[slot*inter:..] → up_out[...]
+        dev.gemm_tc_off(
+            xs_f16.buffer.as_ref(), g_starts[slot] * hid * 2,
+            up_w.buffer.as_ref(), slot_off,
+            up_out.buffer.as_ref(), g_starts[slot] * inter * 2,
+            rows, inter, hid, DType::F16,
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: UP gemm eid={eid}: {e:?}")))?;
+    }
+    if up_scratch.is_none() { let _ = up_w_owned; }
+
+    // Device relu² + scale 1/256.
+    let up_relu2 = relu2_scale_f16(dev, &up_out, 1.0f32 / 256.0)?;
+    drop(up_out);
+
+    // DN scratch.
+    let dn_w_owned: Option<Tensor>;
+    let dn_w = if let Some(scratch) = dn_scratch {
+        Tensor { buffer: scratch.buffer.clone(), offset: 0, shape: vec![n_active * hid, inter], dtype: DType::F16 }
+    } else {
+        dn_w_owned = Some(Tensor::empty(dev, vec![n_active * hid, inter], DType::F16)?);
+        dn_w_owned.as_ref().unwrap().clone()
+    };
+
+    let dn_out = Tensor::empty(dev, vec![mt, hid], DType::F16)?;
+
+    // ── DN pass: same pipelined dequant → GEMM pattern.
+    for (slot, &eid) in expert_ids.iter().enumerate() {
+        let rows = g_starts[slot+1] - g_starts[slot];
+        if rows == 0 { continue; }
+
+        let slot_off = slot * hid * inter * 2;
+        let blk_off = eid * hid * bpr_dn;
+        let n_elem = hid * inter;
+        let kern = cached_ir("ffai_dequant_q4", DType::F16, || {
+            use metaltile_core::ir::KernelMode;
+            let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(DType::F16);
+            kk.mode = KernelMode::Grid3D;
+            kk
+        });
+        let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
+        dev.dispatch(
+            &kern,
+            &[
+                Binding::Buffer(qs_dn.buffer.clone()),
+                Binding::Buffer(sc_dn.buffer.clone()),
+                Binding::Buffer(dn_w.buffer.clone()),
+                u(inter as u32),
+                u(n_elem as u32),
+                u(blk_off as u32),
+            ],
+            Grid::d1((n_elem as u32).div_ceil(256), 256),
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: dequant DN eid={eid}: {e:?}")))?;
+
+        dev.gemm_tc_off(
+            up_relu2.buffer.as_ref(), g_starts[slot] * inter * 2,
+            dn_w.buffer.as_ref(), slot_off,
+            dn_out.buffer.as_ref(), g_starts[slot] * hid * 2,
+            rows, hid, inter, DType::F16,
+        ).map_err(|e| Error::Msg(format!("moe_grouped_gemm: DN gemm eid={eid}: {e:?}")))?;
+    }
+    if dn_scratch.is_none() { let _ = dn_w_owned; }
+
+    Ok(dn_out)
 }

@@ -134,6 +134,128 @@ pub trait Device: Send + Sync {
         for _ in 0..n { self.graph_launch(exec)?; }
         Ok(())
     }
+
+    /// Escape hatch: compile raw CUDA C++ via NVRTC and launch a single
+    /// function with the provided device-buffer pointer list (as `u64`
+    /// CUdeviceptr values) plus a small scalar-bytes trailer.
+    ///
+    /// - `src`: full CUDA C++ source
+    /// - `prog_name`: source file name hint (e.g. `"fused_moe.cu"`)
+    /// - `fn_name`: `__global__` function to call
+    /// - `ptrs`: ordered list of (CUdeviceptr, byte-offset) pairs
+    /// - `scalars`: packed scalar bytes appended after ptrs in kernel arg order
+    /// - `grid`/`block`/`shared_bytes`: launch geometry
+    /// - `cooperative`: use `cuLaunchCooperativeKernel` for global grid-sync.
+    ///   Falls back to regular launch if a CUDA graph capture is in progress
+    ///   (cooperative launches are not capturable). Caller must handle the
+    ///   graph-mode fallback externally if correctness requires the barrier.
+    ///
+    /// Returns `Err(unsupported)` on backends that don't implement this.
+    fn dispatch_raw_cuda(
+        &self,
+        _src: &str,
+        _prog_name: &str,
+        _fn_name: &str,
+        _ptrs: &[(&dyn DeviceBuffer, usize)],  // (buf, byte_offset)
+        _scalars: &[Vec<u8>],
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_bytes: u32,
+        _cooperative: bool,
+    ) -> Result<()> {
+        Err(Error::Msg("dispatch_raw_cuda unsupported on this backend".into()))
+    }
+
+    /// Tensor-core GEMM escape hatch (Path A). Computes the ROW-MAJOR product
+    /// `out[m,n] = x[m,k] · w[n,k]ᵀ` (the projection `out[r,o]=Σ_k w[o,k]·x[r,k]`)
+    /// via the backend's hardware matmul (cuBLAS tensor cores on CUDA). Inputs +
+    /// output are device buffers of `dtype` (f16/bf16); accumulation is f32.
+    /// Default impl errors on backends without a tensor-core matmul.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_tc(
+        &self,
+        _x: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_tc (tensor-core GEMM) unsupported on this backend".into()))
+    }
+
+    /// Byte-offset variant of []: same semantics but each buffer
+    /// pointer is advanced by its byte offset before the GEMM call. Used to
+    /// write expert GEMM outputs into pre-allocated slabs without extra copies.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_tc_off(
+        &self,
+        _x: &dyn DeviceBuffer, _x_off: usize,
+        _w: &dyn DeviceBuffer, _w_off: usize,
+        _out: &dyn DeviceBuffer, _out_off: usize,
+        _m: usize, _n: usize, _k: usize, _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_tc_off unsupported on this backend".into()))
+    }
+
+    /// Strided-batched tensor-core GEMM: `batch_count` independent GEMMs in ONE cuBLAS call.
+    /// `C_i[m,n] = X_i[m,k] · W_i[n,k]^T`, each matrix at byte offsets `i*stride_{x,w,out}`.
+    /// x/w/out are device buffers of `dtype` (f16/bf16); strides in BYTES.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_strided_batched(
+        &self,
+        _x: &dyn DeviceBuffer, _stride_x: i64,
+        _w: &dyn DeviceBuffer, _stride_w: i64,
+        _out: &dyn DeviceBuffer, _stride_out: i64,
+        _m: usize, _n: usize, _k: usize,
+        _batch_count: usize,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_strided_batched unsupported on this backend".into()))
+    }
+
+    /// Like [gemm_strided_batched] but with explicit byte offsets into x/w/out.
+    /// Base pointers are advanced by the respective byte offset before the GEMM call.
+    /// Enables sliced-batch calls (e.g. broadcast K for GQA fan-out).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_strided_batched_off(
+        &self,
+        _x: &dyn DeviceBuffer, _x_off: usize, _stride_x: i64,
+        _w: &dyn DeviceBuffer, _w_off: usize, _stride_w: i64,
+        _out: &dyn DeviceBuffer, _out_off: usize, _stride_out: i64,
+        _m: usize, _n: usize, _k: usize,
+        _batch_count: usize,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_strided_batched_off unsupported on this backend".into()))
+    }
+
+    /// Grouped-batched GEMM (CUDA 13+ only): `group_count` independent GEMMs
+    /// where group `i` computes `C_i[m_i, n] = X_i[m_i, k] · W_i[n, k]^T`.
+    /// All inputs/outputs are f16; accumulate f32.
+    ///
+    /// `x_ptrs[i]`, `w_ptrs[i]`, `out_ptrs[i]` are raw device-pointer offsets
+    /// into the backing allocation (bytes from the start of `x_buf` / `w_buf` /
+    /// `out_buf` respectively). This avoids sub-allocating separate `DeviceBuffer`
+    /// handles for every expert — the caller passes one large contiguous buffer
+    /// for X and one for W, with per-expert byte offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_grouped(
+        &self,
+        _x_buf: &dyn DeviceBuffer,
+        _x_offsets: &[usize],   // byte offset per group into x_buf
+        _w_buf: &dyn DeviceBuffer,
+        _w_offsets: &[usize],   // byte offset per group into w_buf
+        _out_buf: &dyn DeviceBuffer,
+        _out_offsets: &[usize], // byte offset per group into out_buf
+        _m_per_group: &[i32],
+        _n: usize,
+        _k: usize,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_grouped unsupported on this backend".into()))
+    }
 }
 
 /// A handle to a region of device memory + shape + dtype. Backend-neutral:
