@@ -1974,8 +1974,113 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // two_pass uses gemm_cublas; dev_relu2 uses relu2_scale_f16
                             // (CUDA-only). On Metal force the interleaved host-relu2 path.
                             let two_pass = is_cuda && std::env::var("NEMOTRON_TWO_PASS").is_ok();
-                            let dev_relu2 = is_cuda && !two_pass && std::env::var("NEMOTRON_DEV_RELU2").is_ok();
-                            if two_pass {
+                            // NEMOTRON_FEWER_SYNCS=1: keep the per-expert cuBLAS UP/DOWN
+                            // GEMMs (near-best), but fuse relu² ON DEVICE (relu2_scale_f16)
+                            // and accumulate each expert group into a DEVICE acc via
+                            // moe_scatter_add — so NOTHING is downloaded per expert. One
+                            // dl(acc_dev) at the end of the layer replaces the ~2×128
+                            // per-expert dl()/cuStreamSynchronize pairs. Implies dev relu².
+                            let fewer_syncs = is_cuda && !two_pass && std::env::var("NEMOTRON_FEWER_SYNCS").is_ok();
+                            let dev_relu2 = is_cuda && !two_pass && (fewer_syncs || std::env::var("NEMOTRON_DEV_RELU2").is_ok());
+                            if fewer_syncs {
+                                // ── Batched per-expert path (NEMOTRON_FEWER_SYNCS=1) ──────────
+                                // Keep the per-expert cuBLAS UP/DOWN GEMMs (near-best), but
+                                // collapse the ~2×128 per-expert dl()/cuStreamSynchronize pairs
+                                // into work that stays on the ordered stream, ending in ONE
+                                // dl(acc_dev) per E-layer:
+                                //   1. All UP GEMMs (async) write into one [mt, inter] f16 buffer
+                                //      (gemm_tc_off) → on-device relu²+scale (relu2_scale_f16).
+                                //   2. All DOWN GEMMs (async, reading the same buffer) write into
+                                //      one [mt, hid] f16 buffer → on-device moe_scatter_add into
+                                //      acc_dev → ONE dl(acc_dev).
+                                // Matches the already-shipped GROUPED_GEMM/BGEMM device-MoE math
+                                // (same relu2_scale_f16 + atomic scatter) and the same correctness
+                                // envelope: argmax is bit-stable across most runs but can flip on a
+                                // near-tie, because cuBLAS tensor-core GEMM (gemm_tc_off, shared by
+                                // GROUPED_GEMM) is itself run-to-run nondeterministic (split-K
+                                // accumulation). This is NOT a race introduced here — proven by the
+                                // host-relu²/host-scatter variant below jittering identically, and by
+                                // GROUPED_GEMM landing on the same alt-tokens. The per-expert host
+                                // dl()-per-expert path (default, no flag) stays bit-deterministic.
+                                // NEMOTRON_FEWER_SYNCS_HOST swaps relu²+scatter to host f32 (same
+                                // 2-buffer batching: 2 dl/layer instead of ~256) for A/B.
+                                // CRITICAL: every async-GEMM input (xg/wup/wdn) and the shared
+                                // up_all/a2_all/dn_all buffers must stay alive until the dl()
+                                // drains the stream (else a freed buffer is read mid-GEMM → race).
+                                let host_path = std::env::var("NEMOTRON_FEWER_SYNCS_HOST").is_ok();
+                                let up_all = Tensor::new(d.alloc(mt * inter * 2).unwrap(), vec![mt, inter], DType::F16);
+                                // ── Phase 1: all UP GEMMs → up_all ──
+                                let mut keep_up: Vec<Tensor> = Vec::new();
+                                let mut g0 = 0usize;
+                                while g0 < mt {
+                                    let e = triples[g0].0 as usize;
+                                    let mut g1 = g0 + 1;
+                                    while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
+                                    let rows = g1 - g0;
+                                    let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    pf!(11, 2.0*rows as f64*inter as f64*hid as f64,
+                                        d.gemm_tc_off(
+                                            xg.buffer.as_ref(), 0,
+                                            wup.buffer.as_ref(), 0,
+                                            up_all.buffer.as_ref(), g0 * inter * 2,
+                                            rows, inter, hid, DType::F16).unwrap());
+                                    keep_up.push(xg); keep_up.push(wup);
+                                    g0 = g1;
+                                }
+                                // relu²+scale: on device (default, fast) or host f32 (deterministic).
+                                let a2_all = if host_path {
+                                    let up_h = dl(&cast_f16_f32(d, &up_all).unwrap(), mt * inter);
+                                    drop(std::mem::take(&mut keep_up)); // dl drained stream
+                                    let a2_h: Vec<f32> = up_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                                    cast_f32_f16(d, &upm(&a2_h, vec![mt, inter])).unwrap()
+                                } else {
+                                    pf!(3, 0.0, relu2_scale_f16(d, &up_all, inv).unwrap())
+                                };
+                                // ── Phase 2: all DOWN GEMMs → dn_all ──
+                                let dn_all = Tensor::new(d.alloc(mt * hid * 2).unwrap(), vec![mt, hid], DType::F16);
+                                let mut keep_dn: Vec<Tensor> = vec![a2_all.clone()];
+                                keep_dn.append(&mut keep_up); // keep UP inputs alive on device path
+                                let mut g0 = 0usize;
+                                while g0 < mt {
+                                    let e = triples[g0].0 as usize;
+                                    let mut g1 = g0 + 1;
+                                    while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
+                                    let rows = g1 - g0;
+                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, false);
+                                    pf!(11, 2.0*rows as f64*hid as f64*inter as f64,
+                                        d.gemm_tc_off(
+                                            a2_all.buffer.as_ref(), g0 * inter * 2,
+                                            wdn.buffer.as_ref(), 0,
+                                            dn_all.buffer.as_ref(), g0 * hid * 2,
+                                            rows, hid, inter, DType::F16).unwrap());
+                                    keep_dn.push(wdn);
+                                    g0 = g1;
+                                }
+                                if host_path {
+                                    // ONE dl of all DOWN outputs → deterministic host scatter
+                                    // (same accumulation order as the validated per-expert path).
+                                    let dn_h = dl(&cast_f16_f32(d, &dn_all).unwrap(), mt * hid);
+                                    drop(keep_dn); let _ = (&up_all, &dn_all);
+                                    for (r,(_e2, t, w)) in triples.iter().enumerate() {
+                                        let dr = &dn_h[r*hid..(r+1)*hid];
+                                        let ah = &mut acc_h[(*t)*hid..(*t+1)*hid];
+                                        for i in 0..hid { ah[i] += w * dr[i] * 256.0; }
+                                    }
+                                } else {
+                                    // On-device cast + scatter-add → ONE dl(acc_dev). unscale=256
+                                    // → net router weight w (matches host-path ×256).
+                                    let wts_h: Vec<f32> = triples.iter().map(|(_,_,w)| *w).collect();
+                                    let tidx_h: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
+                                    let wts_dev = upm(&wts_h, vec![mt]);
+                                    let tidx_dev = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
+                                    let acc_dev = upm(&acc_h, vec![s, hid]); // acc_h all-zero here
+                                    let dn_f32 = cast_f16_f32(d, &dn_all).unwrap();
+                                    moe_scatter_add(d, &dn_f32, &tidx_dev, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                    acc_h = dl(&acc_dev, s * hid);
+                                    drop(keep_dn); let _ = (&up_all, &dn_all, &dn_f32);
+                                }
+                            } else if two_pass {
                                 // ── Pass 1: All UP GEMMs (async, no sync between experts) ────
                                 // IMPORTANT: keep xg and wup tensors ALIVE until all GEMMs complete
                                 // (GPU reads these async; dropping them before the stream sync would
