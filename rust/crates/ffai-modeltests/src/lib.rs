@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_weighted_sum, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -903,14 +903,29 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 // Experts stored CONTIGUOUS ([n_exp*inter, hid] up, [n_exp*hid, inter] down)
                 // so the batched gather kernel runs them as one big efficient GEMV.
                 // Cache the combined expert packs under "{p}.moe_up_all" / ".moe_down_all".
+                // When NEMOTRON_W4A16_MARLIN=1, the weights are permuted into Marlin
+                // tile-major layout before GPU upload (cache stores standard layout).
                 let moe_up_name = format!("{p}.moe_up_all");
                 let moe_down_name = format!("{p}.moe_down_all");
+                let use_marlin_layout = std::env::var("NEMOTRON_W4A16_MARLIN").is_ok();
+                // Helper: optionally permute qs to Marlin layout before GPU upload.
+                let maybe_marlin_up = |qs: &[u32]| -> Vec<u32> {
+                    if use_marlin_layout { permute_q4_to_marlin(qs, n_exp, inter, hid) } else { qs.to_vec() }
+                };
+                let maybe_marlin_dn = |qs: &[u32]| -> Vec<u32> {
+                    if use_marlin_layout { permute_q4_to_marlin(qs, n_exp, hid, inter) } else { qs.to_vec() }
+                };
                 let (mup_hit, mdown_hit) = (cache_read(&moe_up_name), cache_read(&moe_down_name));
                 if let (Some((uqb, usb, cm, ck, _)), Some((dqb, dsb, dm, dk, _))) = (mup_hit, mdown_hit) {
                     if cm == n_exp * inter && ck == hid && dm == n_exp * hid && dk == inter {
-                        let ut = Tensor::new(d.upload(&uqb).unwrap(), vec![uqb.len() / 4], DType::U32);
+                        // Reconstruct qs vecs from cached bytes for optional Marlin permutation.
+                        let uqs_std: Vec<u32> = uqb.chunks_exact(4).map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
+                        let dqs_std: Vec<u32> = dqb.chunks_exact(4).map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
+                        let uqs_final = maybe_marlin_up(&uqs_std);
+                        let dqs_final = maybe_marlin_dn(&dqs_std);
+                        let ut = Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32);
                         let ust = Tensor::new(d.upload(&usb).unwrap(), vec![usb.len() / 2], DType::F16);
-                        let dt2 = Tensor::new(d.upload(&dqb).unwrap(), vec![dqb.len() / 4], DType::U32);
+                        let dt2 = Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32);
                         let dst2 = Tensor::new(d.upload(&dsb).unwrap(), vec![dsb.len() / 2], DType::F16);
                         qw.insert(moe_up_name, (ut, ust, n_exp * inter, hid));
                         qw.insert(moe_down_name, (dt2, dst2, n_exp * hid, inter));
@@ -925,8 +940,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         }
                         cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
                         cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
-                        qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
-                        qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                        let uqs_final = maybe_marlin_up(&uqs);
+                        let dqs_final = maybe_marlin_dn(&dqs);
+                        qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                        qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                     }
                 } else {
                     // Cache miss: build + cache.
@@ -939,8 +956,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     }
                     cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
                     cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
-                    qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
-                    qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                    let uqs_final = maybe_marlin_up(&uqs);
+                    let dqs_final = maybe_marlin_dn(&dqs);
+                    qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                    qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
                 }
                 // NVFP4 recipe: shared-expert up/down → Q8.
                 if use_nvfp4_recipe {
@@ -1483,7 +1502,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // Pre-alloc grouped-gemm scratch for GROUPED_GEMM and W4A16 (which falls back
             // to grouped_gemm at large S — needs scratch to avoid per-layer cuMemAlloc).
             let needs_grouped_scratch = (std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !std::env::var("NEMOTRON_BGEMM").is_ok())
-                || std::env::var("NEMOTRON_W4A16").is_ok();
+                || std::env::var("NEMOTRON_W4A16").is_ok()
+                || std::env::var("NEMOTRON_W4A16_MARLIN").is_ok();
             let grouped_up_scratch: Option<Tensor> = if needs_grouped_scratch {
                 Some(Tensor::new(d.alloc(n_exp * inter * hid * 2).unwrap(), vec![n_exp * inter, hid], DType::F16))
             } else { None };
@@ -1645,10 +1665,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let mt = triples.len();
                         // Expert GEMM mode flags (read early so they're in scope for gather).
                         let use_bgemm = std::env::var("NEMOTRON_BGEMM").is_ok();
-                        // NEMOTRON_W4A16=1: W4A16 Marlin-style WMMA grouped GEMM (inline
-                        //   Q4 dequant, no f16 weight scratch). Same gather/scatter as BGEMM.
-                        //   Supersedes NEMOTRON_BGEMM when both are set.
-                        let use_w4a16 = std::env::var("NEMOTRON_W4A16").is_ok();
+                        // NEMOTRON_W4A16=1: W4A16 WMMA grouped GEMM (inline Q4 dequant,
+                        //   scattered nibble reads). Supersedes NEMOTRON_BGEMM when both set.
+                        // NEMOTRON_W4A16_MARLIN=1: same as W4A16 but with Marlin coalesced
+                        //   tile-major layout — requires weights pre-permuted at load time.
+                        //   Supersedes both NEMOTRON_W4A16 and NEMOTRON_BGEMM.
+                        let use_w4a16_marlin = std::env::var("NEMOTRON_W4A16_MARLIN").is_ok();
+                        let use_w4a16 = std::env::var("NEMOTRON_W4A16").is_ok() || use_w4a16_marlin;
                         let use_bgemm = use_bgemm && !use_w4a16;
                         // NEMOTRON_GROUPED_GEMM=1: async two-pass all-expert GEMM — all UP
                         //   GEMMs enqueued (no inter-expert sync), on-device relu2_scale_f16,
@@ -1713,14 +1736,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // use_bgemm already defined above (before gather block).
                         let mut acc_h = vec![0.0f32; s * hid];
                         if use_w4a16 {
-                            // ── W4A16 WMMA path (NEMOTRON_W4A16=1) ───────────────────────
-                            // Small S (mt ≤ W4A16_THRESH): inline Q4 dequant + WMMA — wins
-                            //   because inline dequant saves 50% weight BW vs dequant-then-cuBLAS.
-                            // Large S (mt > W4A16_THRESH): fall back to grouped_gemm (dequant-
-                            //   once + cuBLAS) — wins because cuBLAS tiles are much larger and
-                            //   the amortized dequant cost is lower at high arithmetic intensity.
-                            // Threshold ~S=2048 → mt=S*top_k*n_active/n_exp≈96 per expert;
-                            //   total mt = S*top_k ≈ 12288 at S=2048. Use total mt threshold.
+                            // ── W4A16 WMMA path (NEMOTRON_W4A16=1 or NEMOTRON_W4A16_MARLIN=1) ──
+                            // Small S (mt ≤ W4A16_THRESH, standard path only): inline Q4 dequant
+                            //   + WMMA — wins because inline dequant saves 50% weight BW.
+                            // Large S (mt > W4A16_THRESH, standard path only): fall back to
+                            //   grouped_gemm (dequant-once + cuBLAS) — cuBLAS tiles are much larger.
+                            // Marlin path (use_w4a16_marlin=true): always use moe_w4a16_marlin for
+                            //   all S (no grouped_gemm fallback — grouped_gemm expects standard
+                            //   layout, but Marlin-layout weights would produce wrong results).
                             let w4a16_thresh: usize = std::env::var("NEMOTRON_W4A16_THRESH")
                                 .ok().and_then(|v| v.parse().ok()).unwrap_or(12288);
                             let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
@@ -1729,19 +1752,32 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let wts_dev = upm(&wts_h, vec![mt]);
                             let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
                             let acc_dev = upm(&acc_h, vec![s, hid]);
-                            if mt <= w4a16_thresh {
-                                // Small S: W4A16 WMMA inline dequant
+                            if use_w4a16_marlin || mt <= w4a16_thresh {
+                                // Marlin path: always inline WMMA (handles all mt, Marlin layout).
+                                // Standard W4A16 path: inline WMMA for small mt ≤ threshold.
                                 let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
                                 let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
-                                let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                    moe_w4a16(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
-                                let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
-                                let dn_out_f16 = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                    moe_w4a16(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap());
+                                let dn_out_f16 = if use_w4a16_marlin {
+                                    // Marlin coalesced path (NEMOTRON_W4A16_MARLIN=1):
+                                    // weights are in Marlin tile-major layout (pre-permuted at load).
+                                    let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                        moe_w4a16_marlin(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                                    let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                    pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                        moe_w4a16_marlin(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap())
+                                } else {
+                                    // Standard scattered-nibble W4A16 path (NEMOTRON_W4A16=1)
+                                    let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                        moe_w4a16(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                                    let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
+                                    pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                        moe_w4a16(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap())
+                                };
                                 let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
                                 moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
                             } else {
-                                // Large S: grouped_gemm (dequant-once + cuBLAS)
+                                // Large S (standard W4A16 only): grouped_gemm (dequant-once + cuBLAS).
+                                // NOTE: never reached when use_w4a16_marlin=true (weights in Marlin layout).
                                 let mut g_starts_l: Vec<usize> = vec![0];
                                 let mut expert_ids_l: Vec<usize> = Vec::new();
                                 let mut gi = 0usize;

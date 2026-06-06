@@ -2444,7 +2444,46 @@ pub fn kv_append_many(
 
 #[cfg(test)]
 mod tests {
-    use super::dsv4_mhc_sinkhorn_split;
+    use super::{dsv4_mhc_sinkhorn_split, permute_q4_from_marlin, permute_q4_to_marlin, quantize_q4};
+
+    /// Verify `permute_q4_to_marlin` + `permute_q4_from_marlin` is a lossless round-trip.
+    #[test]
+    fn marlin_permute_roundtrip() {
+        let (n_exp, n_out, k_in) = (4, 128, 64); // n_out and k_in are multiples of 64/32
+        let bpr = k_in / 32;
+        let total_rows = n_exp * n_out;
+        // Use a deterministic weight pattern to expose nibble-mapping bugs.
+        let wv: Vec<f32> = (0..total_rows * k_in)
+            .map(|i| (i as f32 * 0.019 - 0.5).sin() * 7.0)
+            .collect();
+        let (qs_std, _scales) = quantize_q4(&wv, total_rows, k_in);
+
+        // Round-trip: std → Marlin → std
+        let qs_mar = permute_q4_to_marlin(&qs_std, n_exp, n_out, k_in);
+        let qs_back = permute_q4_from_marlin(&qs_mar, n_exp, n_out, k_in);
+
+        assert_eq!(qs_std.len(), qs_mar.len(), "Marlin layout must have same u32 count");
+        assert_eq!(qs_std, qs_back, "round-trip must be lossless");
+
+        // Also verify individual nibble values are preserved at a few spot checks.
+        // Standard layout: qs_std[exp*n_out*bpr*4 + row*bpr*4 + blk*4 + word]
+        // nibble at k=5: blk=0, word=0, nib_in_word=5
+        for e in 0..n_exp {
+            for row in 0..n_out {
+                for k in [0usize, 7, 15, 16, 31] {
+                    let blk = k / 32;
+                    let word = (k % 32) / 8;
+                    let nib_in = (k % 32) % 8;
+                    let src_word = qs_std[e * n_out * bpr * 4 + row * bpr * 4 + blk * 4 + word];
+                    let nib_std = (src_word >> (nib_in * 4)) & 0xf;
+                    let dst_word = qs_back[e * n_out * bpr * 4 + row * bpr * 4 + blk * 4 + word];
+                    let nib_back = (dst_word >> (nib_in * 4)) & 0xf;
+                    assert_eq!(nib_std, nib_back,
+                        "nibble mismatch at e={e} row={row} k={k}: std={nib_std} back={nib_back}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn sinkhorn_comb_is_doubly_stochastic() {
@@ -2798,6 +2837,387 @@ extern "C" __global__ void moe_w4a16(
     } // end per-expert sub-run loop
 }
 "#;
+
+// ── Marlin-permuted Q4 layout ─────────────────────────────────────────────
+//
+// `permute_q4_to_marlin` converts the standard row-major Q4 layout produced
+// by `quantize_q4` into a tile-major "Marlin" layout that enables fully
+// coalesced 128-bit global loads in `moe_w4a16_marlin`.
+//
+// Standard layout (per expert, row r = output neuron):
+//   qs[expert * n_out * bpr * 4  +  r * bpr * 4  +  b * 4  +  word]
+//   where bpr = k_in/32, each u32 holds 8 nibbles for k-positions word*8..word*8+8
+//   of block b (k-range b*32..(b+1)*32).
+//
+// Marlin tile layout (what `moe_w4a16_marlin` expects):
+//   For each expert e, each 64-row n-tile nt (n_tile_base = nt*64), each k-tile
+//   kt (k_tile_base = kt*32 = the kb value):
+//     tile_base = e*(n_tiles*k_tiles*256) + nt*(k_tiles*256) + kt*256
+//     u32 at tile_base + j  (j ∈ 0..256):
+//       k_local   = j % 32          (position within BK=32 tile)
+//       row_group = j / 32          (0..7, each group = 8 consecutive rows)
+//       nibble i  → output row (row_group*8 + i), k = k_tile_base + k_local
+//
+// This layout makes thread `t` load tile_base+t and tile_base+t+128 — two
+// consecutive addresses — covering the full 64×32 tile with 4 cache lines
+// per warp per load, vs ~64 scattered cache lines in the standard layout.
+//
+// `n_exp`  = total experts in the weight pool (all experts, packed contiguously)
+// `n_out`  = output features per expert (must be multiple of 64)
+// `k_in`   = input features (must be multiple of 32)
+// `qs_std` = standard `quantize_q4` output: `[n_exp * n_out * bpr * 4]` u32
+// Returns: `[n_exp * (n_out/64) * (k_in/32) * 256]` u32 (same total byte count)
+pub fn permute_q4_to_marlin(
+    qs_std: &[u32],
+    n_exp: usize,
+    n_out: usize,
+    k_in: usize,
+) -> Vec<u32> {
+    assert_eq!(n_out % 64, 0, "permute_q4_to_marlin: n_out must be multiple of 64");
+    assert_eq!(k_in  % 32, 0, "permute_q4_to_marlin: k_in must be multiple of 32");
+    let bpr     = k_in  / 32; // Q4 blocks per weight row
+    let n_tiles = n_out / 64; // number of 64-row n-tiles per expert
+    let k_tiles = k_in  / 32; // = bpr
+
+    // Total u32s is identical to input: n_exp * n_out * bpr * 4 = n_exp * n_tiles * k_tiles * 256
+    // Verify: n_tiles * 256 = (n_out/64) * 256 = n_out * 4; k_tiles = bpr → same total ✓
+    let total = n_exp * n_tiles * k_tiles * 256;
+    assert_eq!(qs_std.len(), n_exp * n_out * bpr * 4);
+    let mut out = vec![0u32; total];
+
+    for e in 0..n_exp {
+        let exp_std_base = e * n_out * bpr * 4;
+        let exp_mar_base = e * n_tiles * k_tiles * 256;
+        for nt in 0..n_tiles {
+            for kt in 0..k_tiles {
+                let tile_mar_base = exp_mar_base + nt * k_tiles * 256 + kt * 256;
+                // Tile covers output rows [nt*64 .. (nt+1)*64) and
+                // k-positions [kt*32 .. (kt+1)*32).
+                // Fill 256 u32s: u32 at j → k_local=j%32, row_group=j/32.
+                for j in 0..256usize {
+                    let k_local   = j % 32;
+                    let row_group = j / 32; // 0..7
+                    // Pack 8 nibbles for consecutive rows row_group*8..row_group*8+8
+                    // at k-position k_tile_base + k_local.
+                    let k_abs = kt * 32 + k_local;   // absolute k-position
+                    let k_blk = k_abs / 32;           // = kt (k_abs is already kt*32+k_local)
+                    debug_assert_eq!(k_blk, kt);
+                    let k_in_blk = k_abs % 32;        // = k_local (position within block)
+                    let word_in_blk = k_in_blk / 8;  // which of the 4 u32s in the block
+                    let nib_in_word = k_in_blk % 8;  // which nibble in that u32
+
+                    let mut packed = 0u32;
+                    for i in 0..8usize {
+                        let row = nt * 64 + row_group * 8 + i; // absolute output row
+                        // Standard layout address for this (row, k_abs):
+                        // qs_std[exp_std_base + row * bpr * 4 + k_blk * 4 + word_in_blk]
+                        let src_word = qs_std[exp_std_base + row * bpr * 4 + k_blk * 4 + word_in_blk];
+                        let nib = (src_word >> (nib_in_word * 4)) & 0xf;
+                        packed |= nib << (i * 4);
+                    }
+                    out[tile_mar_base + j] = packed;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── Inverse: Marlin → standard layout (for validation) ─────────────────────
+pub fn permute_q4_from_marlin(
+    qs_mar: &[u32],
+    n_exp: usize,
+    n_out: usize,
+    k_in: usize,
+) -> Vec<u32> {
+    assert_eq!(n_out % 64, 0);
+    assert_eq!(k_in  % 32, 0);
+    let bpr     = k_in  / 32;
+    let n_tiles = n_out / 64;
+    let k_tiles = bpr;
+    let mut out = vec![0u32; n_exp * n_out * bpr * 4];
+
+    for e in 0..n_exp {
+        let exp_std_base = e * n_out * bpr * 4;
+        let exp_mar_base = e * n_tiles * k_tiles * 256;
+        for nt in 0..n_tiles {
+            for kt in 0..k_tiles {
+                let tile_mar_base = exp_mar_base + nt * k_tiles * 256 + kt * 256;
+                for j in 0..256usize {
+                    let k_local   = j % 32;
+                    let row_group = j / 32;
+                    let k_abs    = kt * 32 + k_local;
+                    let k_blk    = kt;
+                    let k_in_blk = k_local;
+                    let word_in_blk = k_in_blk / 8;
+                    let nib_in_word = k_in_blk % 8;
+                    let src_word = qs_mar[tile_mar_base + j];
+                    for i in 0..8usize {
+                        let row = nt * 64 + row_group * 8 + i;
+                        let nib = (src_word >> (i * 4)) & 0xf;
+                        let dst_idx = exp_std_base + row * bpr * 4 + k_blk * 4 + word_in_blk;
+                        // Clear the nibble slot and set it.
+                        out[dst_idx] &= !(0xf << (nib_in_word * 4));
+                        out[dst_idx] |=  nib  << (nib_in_word * 4);
+                    }
+                    let _ = k_abs; // used only for assertion above
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── Marlin-layout W4A16 WMMA kernel ───────────────────────────────────────
+//
+// Same contract as `moe_w4a16` but expects `qs` in Marlin tile-major layout
+// (as produced by `permute_q4_to_marlin`). Replaces the per-nibble scattered
+// read loop with two coalesced u32 loads per thread covering the full 64×32
+// tile, cutting Q4 global reads from ~64 scattered cache lines to 4 cache
+// lines per warp per K-step.
+//
+// Tiling: 64(M) × 64(N) × 32(K) per block, 4 warps (128 threads), 2×2 warp
+// layout, double-buffer not used (smem fits in one phase: X=4KB, WT=4KB, C=16KB).
+// Grid: [n_out/64, ceil(m_total/64)].
+const MOE_W4A16_MARLIN_SRC: &str = r#"
+#include <cuda_fp16.h>
+#include <mma.h>
+using namespace nvcuda;
+
+// ── Kernel: moe_w4a16_marlin ───────────────────────────────────────────────
+// qs layout: Marlin tile-major. For expert e, n-tile nt, k-tile kt (= kb/32):
+//   tile_base = e*(n_tiles*k_tiles*256) + nt*(k_tiles*256) + kt*256
+//   u32 at tile_base+j (j in 0..256):
+//     k_local = j%32, row_group = j/32
+//     nibble i → output row row_group*8+i at k-position kt*32+k_local
+//
+// Thread t loads tile_base+t and tile_base+t+128 → perfectly coalesced.
+extern "C" __global__ void moe_w4a16_marlin(
+    const unsigned int* __restrict__ qs,      // Marlin Q4: n_exp*(n_out/64)*(k_in/32)*256
+    const __half*       __restrict__ scales,  // standard: n_exp*n_out*(k_in/32) f16
+    const __half*       __restrict__ x,       // [m_total, k_in] f16, sorted by expert
+    const unsigned int* __restrict__ indices, // [m_total] expert ids
+    __half*             __restrict__ out,     // [m_total, n_out] f16
+    int m_total, int n_out, int k_in)
+{
+    // ── Tile / warp coordinates ────────────────────────────────────────────
+    const int n_tile_base = blockIdx.x * 64;
+    const int m_tile_base = blockIdx.y * 64;
+    const int warp_id     = threadIdx.x >> 5;
+    const int lane        = threadIdx.x & 31;
+    // 2×2 warp layout: warp 0→(m=0,n=0), 1→(m=0,n=32), 2→(m=32,n=0), 3→(m=32,n=32)
+    const int warp_m_base = (warp_id >> 1) * 32;
+    const int warp_n_base = (warp_id  & 1) * 32;
+    const int t           = threadIdx.x;  // 0..127
+
+    // ── Shared memory layout ───────────────────────────────────────────────
+    // smem_X  [64×32] f16  = 4096 bytes  — row-major [m_local, k_local]
+    // smem_WT [32×64] f16  = 4096 bytes  — row-major [k_local, n_local] (W^T)
+    // smem_C  [64×64] f32  = 16384 bytes — output accumulation tile
+    __shared__ __half smem_X [64 * 32];
+    __shared__ __half smem_WT[32 * 64];
+    __shared__ float  smem_C [64 * 64];
+
+    const int bpr             = k_in / 32;   // Q4 blocks per weight row (= k_tiles)
+    const int n_tiles         = n_out / 64;
+    const int nblk_per_expert = n_out * bpr; // for scale indexing (unchanged layout)
+    const int nt              = n_tile_base / 64; // n-tile index for this block
+
+    // ── WMMA accumulators ─────────────────────────────────────────────────
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[2][2];
+
+    // ── Per-expert sub-run loop ────────────────────────────────────────────
+    int sub_offset = 0;
+    for (int _sub = 0; _sub < 64; _sub++) {
+        int cur_row = m_tile_base + sub_offset;
+        if (sub_offset >= 64 || cur_row >= m_total) break;
+        unsigned cur_exp = indices[cur_row];
+
+        // Find sub-run end.
+        int sub_end = sub_offset;
+        for (int ii = sub_offset; ii < 64; ii++) {
+            int r = m_tile_base + ii;
+            if (r >= m_total || indices[r] != cur_exp) break;
+            sub_end = ii + 1;
+        }
+
+        // Reset accumulators.
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+                wmma::fill_fragment(c_frag[mi][ni], 0.0f);
+
+        // Base of this expert's Marlin-packed Q4 in qs[]:
+        // expert e owns n_tiles * bpr * 256 u32s.
+        const unsigned int* qs_exp = qs + (size_t)cur_exp * n_tiles * bpr * 256;
+
+        // ── K-loop: BK=32 per step ─────────────────────────────────────────
+        for (int kb = 0; kb < k_in; kb += 32) {
+            const int kt = kb / 32; // k-tile index
+
+            // ── Stage X: 128 threads load 64×32 = 2048 halves ────────────
+            // Thread t: row = t/2, k_half = (t&1)*16, loads 16 halves.
+            {
+                int local_row  = t >> 1;
+                int k_half     = (t & 1) << 4;
+                int global_row = m_tile_base + local_row;
+                bool in_run    = (local_row >= sub_offset) & (local_row < sub_end) & (global_row < m_total);
+                int safe_row   = in_run ? global_row : 0;
+                const __half* xsrc = x + (size_t)safe_row * k_in + kb + k_half;
+                __half*       xdst = smem_X + local_row * 32 + k_half;
+                __half zero = __float2half(0.f);
+                #pragma unroll
+                for (int i = 0; i < 16; i++)
+                    xdst[i] = in_run ? xsrc[i] : zero;
+            }
+
+            // ── Stage WT: coalesced Marlin tile load + dequant ────────────
+            // Tile base in qs_exp: nt * bpr * 256 + kt * 256
+            // Thread t loads u32s at positions t and t+128 in the 256-u32 tile.
+            // Each u32 encodes 8 nibbles: nibble i → output row row_group*8+i
+            // at k_local within this k-tile, where row_group = j/32, k_local = j%32.
+            {
+                const unsigned int* tile = qs_exp + (size_t)nt * bpr * 256 + (size_t)kt * 256;
+
+                // Load 0: j = t  (covers row_groups 0..3 for t in 0..127)
+                {
+                    unsigned word = tile[t];
+                    int k_local   = t % 32;
+                    int row_group = t / 32;
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        int n_local = row_group * 8 + i;  // output row within tile
+                        unsigned nib = (word >> (i * 4)) & 0xf;
+                        int q_s = (int)(nib >= 8u ? nib - 16u : nib);
+                        int blk = (n_tile_base + n_local) * bpr + kt;  // scale block
+                        float sc = __half2float(scales[(size_t)cur_exp * nblk_per_expert + blk]);
+                        smem_WT[k_local * 64 + n_local] = __float2half((float)q_s * sc);
+                    }
+                }
+
+                // Load 1: j = t + 128
+                {
+                    unsigned word = tile[t + 128];
+                    int j2        = t + 128;
+                    int k_local   = j2 % 32;
+                    int row_group = j2 / 32;  // 4..7 for t in 0..127
+                    #pragma unroll
+                    for (int i = 0; i < 8; i++) {
+                        int n_local = row_group * 8 + i;
+                        unsigned nib = (word >> (i * 4)) & 0xf;
+                        int q_s = (int)(nib >= 8u ? nib - 16u : nib);
+                        int blk = (n_tile_base + n_local) * bpr + kt;
+                        float sc = __half2float(scales[(size_t)cur_exp * nblk_per_expert + blk]);
+                        smem_WT[k_local * 64 + n_local] = __float2half((float)q_s * sc);
+                    }
+                }
+            }
+            __syncthreads();
+
+            // ── WMMA: 2 k-steps × 2 m-tiles × 2 n-tiles per warp ─────────
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
+            #pragma unroll
+            for (int ki = 0; ki < 2; ki++) {
+                int k_off = ki * 16;
+                #pragma unroll
+                for (int mi = 0; mi < 2; mi++) {
+                    wmma::load_matrix_sync(a_frag,
+                        smem_X + (warp_m_base + mi * 16) * 32 + k_off, 32);
+                    #pragma unroll
+                    for (int ni = 0; ni < 2; ni++) {
+                        wmma::load_matrix_sync(b_frag,
+                            smem_WT + k_off * 64 + (warp_n_base + ni * 16), 64);
+                        wmma::mma_sync(c_frag[mi][ni], a_frag, b_frag, c_frag[mi][ni]);
+                    }
+                }
+            }
+            __syncthreads();
+        } // end K-loop
+
+        // ── Store C frags → smem_C ─────────────────────────────────────────
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+            #pragma unroll
+            for (int ni = 0; ni < 2; ni++)
+                wmma::store_matrix_sync(
+                    smem_C + (warp_m_base + mi * 16) * 64 + (warp_n_base + ni * 16),
+                    c_frag[mi][ni], 64, wmma::mem_row_major);
+        __syncthreads();
+
+        // ── Write smem_C → global out ──────────────────────────────────────
+        #pragma unroll
+        for (int e = 0; e < 32; e++) {
+            int flat      = t * 32 + e;
+            int local_row = flat >> 6;
+            int local_col = flat & 63;
+            int global_m  = m_tile_base + local_row;
+            int global_n  = n_tile_base + local_col;
+            bool valid    = (local_row >= sub_offset) & (local_row < sub_end)
+                          & (global_m < m_total) & (global_n < n_out);
+            if (valid)
+                out[(size_t)global_m * n_out + global_n] =
+                    __float2half(smem_C[local_row * 64 + local_col]);
+        }
+        __syncthreads();
+
+        sub_offset = sub_end;
+    } // end per-expert sub-run loop
+    (void)lane;
+}
+"#;
+
+/// W4A16 MoE grouped GEMM — Marlin coalesced layout.
+///
+/// Drop-in replacement for `moe_w4a16` but requires `qs` to be in Marlin
+/// tile-major layout (from `permute_q4_to_marlin`). Achieves coalesced
+/// 128-bit global reads for Q4 weights: 4 cache lines per warp per K-step
+/// vs ~64 in the standard nibble-scattered layout.
+///
+/// `n_out % 64 == 0` required.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_w4a16_marlin(
+    dev: &dyn Device,
+    x: &Tensor,       // [m_total, k_in] f16, sorted by expert
+    qs: &Tensor,      // Marlin Q4 weights (permute_q4_to_marlin output)
+    scales: &Tensor,  // f16 scales (unchanged from quantize_q4)
+    indices: &Tensor, // [m_total] u32 expert ids
+    m_total: usize,
+    n_out: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    if n_out % 64 != 0 {
+        return Err(Error::Msg(format!("moe_w4a16_marlin: n_out {n_out} must be multiple of 64")));
+    }
+    let out = Tensor::empty(dev, vec![m_total, n_out], DType::F16)?;
+    let m_total_i = m_total as i32;
+    let n_out_i   = n_out   as i32;
+    let k_in_i    = k_in    as i32;
+    dev.dispatch_raw_cuda(
+        MOE_W4A16_MARLIN_SRC,
+        "moe_w4a16_marlin.cu",
+        "moe_w4a16_marlin",
+        &[
+            (qs.buffer.as_ref(),      qs.offset),
+            (scales.buffer.as_ref(),  scales.offset),
+            (x.buffer.as_ref(),       x.offset),
+            (indices.buffer.as_ref(), indices.offset),
+            (out.buffer.as_ref(),     0),
+        ],
+        &[
+            m_total_i.to_le_bytes().to_vec(),
+            n_out_i.to_le_bytes().to_vec(),
+            k_in_i.to_le_bytes().to_vec(),
+        ],
+        [(n_out as u32) / 64, (m_total as u32).div_ceil(64), 1],
+        [128, 1, 1],
+        // smem: X(4096) + WT(4096) + C(16384) = 24576 bytes
+        24576,
+        false,
+    )?;
+    Ok(out)
+}
 
 /// W4A16 MoE grouped GEMM (Marlin-style, WMMA tensor cores, inline Q4 dequant).
 ///
