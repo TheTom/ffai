@@ -1506,6 +1506,19 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // NEMOTRON_PREFILL_F32GEMM=1 = f32 scalar matmul (A/B).
             let use_f32_gemm = std::env::var("NEMOTRON_PREFILL_F32GEMM").is_ok();
             let use_mpp_gemm = std::env::var("NEMOTRON_PREFILL_MPPGEMM").is_ok();
+            // ── Metal per-expert MoE GEMM compute dtype (Apple/Metal only) ──
+            // The per-forward Q4→dtype dequant of the routed experts × 23 MoE layers is a
+            // top prefill cost at small S. On Metal we dequant→f16 and run the per-expert
+            // matmul in f16 (vs the old f32 dequant + f32 matmul): the f16 dequant writes
+            // 2 B/elem (vs 4 B) and the f16 matmul reads 2 B weights, so it beats the f32
+            // baseline (M5 Max: S=512 +26.6%, S=2048 98.8→113.5 tok/s) at EXACT-MATCH
+            // numerics (argmax unchanged vs the f32 sequential ref, 2× repeat identical).
+            // f16-compute is the Metal DEFAULT; set NEMOTRON_METAL_F32_EXPERTS=1 to fall
+            // back to the f32 path for A/B. No resident f16 weight cache: caching the f16
+            // experts resident was measured a NET LOSS on Metal (bandwidth/residency bound
+            // — re-dequanting the compact Q4 each forward streams better than a fat f16
+            // working set). CUDA path is unaffected (gated on `is_cuda` below).
+            let metal_f16_experts = !is_cuda && !std::env::var("NEMOTRON_METAL_F32_EXPERTS").is_ok();
             // Cached Q4→f16 dequant. On miss, dequant the [m,k] slab (optionally at
             // a block offset for one MoE expert) and store under `key`. Returns a
             // cheap Tensor clone (Arc buffer). `cache=false` (or NEMOTRON_NO_W16CACHE)
@@ -2147,8 +2160,25 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let mut g1 = g0 + 1;
                                     while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
                                     let rows = g1 - g0;
-                                    let dn_h = if !is_cuda {
-                                        // ── Portable Metal per-expert GEMM ──────────────────────
+                                    let dn_h = if metal_f16_experts {
+                                        // ── Metal per-expert GEMM, f16 compute (default) ────────
+                                        // dequant_q4_off → f16 expert weight slab (block offset into
+                                        // the shared up/down qs/sc), cast activation → f16, run the
+                                        // matmul in f16 (ffai_gemm[F16]). relu2 in host f32 (squares
+                                        // can exceed f16 max → overflow). EXACT MATCH vs the f32 path
+                                        // (argmax unchanged). No resident cache — re-dequant each
+                                        // forward (the f16 cache is a bandwidth loss on Metal).
+                                        let xg = pf!(15, 0.0, cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap()); // f16
+                                        let wup = pf!(3, (inter*hid) as f64, dequant_q4_off(d, uqs, usc, inter, hid, DType::F16, e*inter*up_bpr).unwrap());
+                                        let a = pf!(11, 2.0*rows as f64*inter as f64*hid as f64, matmul(d, &wup, &xg).unwrap()); // [rows, inter] f16
+                                        let a_h = dl(&pf!(15, 0.0, cast_f16_f32(d, &a).unwrap()), rows*inter);
+                                        let a2_h: Vec<f32> = a_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                                        let a2 = pf!(15, 0.0, cast_f32_f16(d, &upm(&a2_h, vec![rows, inter])).unwrap()); // f16
+                                        let wdn = pf!(3, (hid*inter) as f64, dequant_q4_off(d, dqs, dsc, hid, inter, DType::F16, e*hid*down_bpr).unwrap());
+                                        let dn = pf!(11, 2.0*rows as f64*hid as f64*inter as f64, matmul(d, &wdn, &a2).unwrap()); // [rows, hid] f16
+                                        dl(&pf!(15, 0.0, cast_f16_f32(d, &dn).unwrap()), rows*hid)
+                                    } else if !is_cuda {
+                                        // ── Portable Metal per-expert GEMM, f32 (NEMOTRON_METAL_F32_EXPERTS=1) ──
                                         // dequant_q4_off → f32 expert weight slab (block offset into
                                         // the shared up/down qs/sc), then portable f32 `matmul`.
                                         // relu2 in host f32 (matches the CUDA host-relu2 default).
@@ -2555,13 +2585,22 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             let sum_t: f64 = pf_t.iter().map(|c| c.get()).sum();
             let mut rows: Vec<(usize,f64,u64,f64)> = (0..NPF).map(|i| (i, pf_t[i].get(), pf_n[i].get(), pf_flop[i].get())).filter(|r| r.2 > 0).collect();
             rows.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+            let is_cuda = d.backend() == Backend::Cuda;
             let mut md = String::new();
             md.push_str(&format!("# Nemotron-Nano-30B BATCHED PREFILL — per-op profiling map\n\n"));
-            md.push_str(&format!("- Device: {plat} (GB10 Blackwell)\n- S (prompt tokens): {s}\n"));
+            if is_cuda {
+                md.push_str(&format!("- Device: {plat} (GB10 Blackwell)\n- S (prompt tokens): {s}\n"));
+            } else {
+                md.push_str(&format!("- Device: {plat} (Apple/Metal)\n- S (prompt tokens): {s}\n"));
+            }
             md.push_str(&format!("- Clean batched throughput: **{:.1} tok/s** ({:.2} ms/tok)\n", s as f64 / pf_s, pf_s * 1000.0 / s as f64));
             md.push_str(&format!("- Profiled pass wall (sync-bracketed, inflated): {prof_wall:.3}s; summed op time: {sum_t:.3}s\n"));
-            md.push_str(&format!("- vLLM-on-GB10 reference: pp2048@d0=6395, @d8192=4993, @d32768=2734 tok/s\n"));
-            md.push_str(&format!("- Tensor-core peak assumed: {PEAK_TFLOPS:.0} TFLOP/s (bf16 dense)\n\n"));
+            if is_cuda {
+                md.push_str(&format!("- vLLM-on-GB10 reference: pp2048@d0=6395, @d8192=4993, @d32768=2734 tok/s\n"));
+                md.push_str(&format!("- Tensor-core peak assumed: {PEAK_TFLOPS:.0} TFLOP/s (bf16 dense)\n\n"));
+            } else {
+                md.push_str("\n");
+            }
             md.push_str("| op | ms | % | calls | TFLOP/s | %peak |\n|---|---:|---:|---:|---:|---:|\n");
             for (i,t,n,fl) in &rows {
                 let ms = t * 1000.0;
@@ -2572,13 +2611,21 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let pps = if tflops > 0.0 { format!("{peakpct:.2}%") } else { "—".into() };
                 md.push_str(&format!("| {} | {ms:.2} | {pct:.1}% | {n} | {tfs} | {pps} |\n", names[*i]));
             }
-            md.push_str("\n## Gap analysis (Path A — cuBLAS tensor cores LANDED)\n");
-            md.push_str("- **The GEMMs now hit the tensor cores via the cuBLAS escape hatch (`gemm_cublas`/`cublasGemmEx`, f16×f16→f32 accumulate).** proj_gemm jumped ~1→90 TFLOP/s (0.1%→9% of peak), moe_shared ~1→74, moe_experts ~0.8→28 — a 35-82× per-GEMM speedup vs the software-emulated coop_tile MMA. End-to-end prefill went from ~80 to 178-259 tok/s (peak at S=512).\n");
-            md.push_str("- **New #1 bottleneck: `ssm_scan` (~41%)** — the sequential-in-T Mamba `ssm_step_record`. With the GEMMs fast, this is now the critical path → the deferred chunked/parallel SSD scan is the next target.\n");
-            md.push_str("- **`dequant_q4` ~26% (5500 calls):** Q4 weights are re-dequanted to f16 EVERY forward (per layer + per routed expert). This is pure redundant work → cache the f16-dequanted weights resident once at load (trades VRAM for ~26% of prefill time).\n");
-            md.push_str("- `sdpa_prefill`: software-MMA coop_tile by default; set NEMOTRON_PREFILL_TCATTN=1 for the cuBLAS tensor-core FlashAttention path (`sdpa_multi_tc`). At deep context (zero-KV synthetic) the TC path cuts this stage ~9.5× @d8192 (1754→185ms, 54.7%→11.3%), ~14× @d16384 (4616→328ms), ~13.7× @d32768 (8958→652ms), lifting end-to-end prefill from 104→165 tok/s @d32768.\n");
-            md.push_str("- `moe_experts` ~12%: the GEMM is fast (28 TFLOP/s) but the per-expert cuBLAS loop + host relu2/scatter round-trips remain serial → fuse on-device or use cublasGemmStridedBatched.\n");
-            md.push_str("- Throughput peaks at S=512 then declines (S=2048→178, S=8192→117): the per-expert host round-trips + dequant grow with S/expert-count. Removing dequant-per-forward + the host MoE bridges should restore monotonic scaling toward the vLLM band.\n");
+            if is_cuda {
+                md.push_str("\n## Gap analysis (Path A — cuBLAS tensor cores LANDED)\n");
+                md.push_str("- **The GEMMs now hit the tensor cores via the cuBLAS escape hatch (`gemm_cublas`/`cublasGemmEx`, f16×f16→f32 accumulate).** proj_gemm jumped ~1→90 TFLOP/s (0.1%→9% of peak), moe_shared ~1→74, moe_experts ~0.8→28 — a 35-82× per-GEMM speedup vs the software-emulated coop_tile MMA. End-to-end prefill went from ~80 to 178-259 tok/s (peak at S=512).\n");
+                md.push_str("- **New #1 bottleneck: `ssm_scan` (~41%)** — the sequential-in-T Mamba `ssm_step_record`. With the GEMMs fast, this is now the critical path → the deferred chunked/parallel SSD scan is the next target.\n");
+                md.push_str("- **`dequant_q4` ~26% (5500 calls):** Q4 weights are re-dequanted to f16 EVERY forward (per layer + per routed expert). This is pure redundant work → cache the f16-dequanted weights resident once at load (trades VRAM for ~26% of prefill time).\n");
+                md.push_str("- `sdpa_prefill`: software-MMA coop_tile by default; set NEMOTRON_PREFILL_TCATTN=1 for the cuBLAS tensor-core FlashAttention path (`sdpa_multi_tc`). At deep context (zero-KV synthetic) the TC path cuts this stage ~9.5× @d8192 (1754→185ms, 54.7%→11.3%), ~14× @d16384 (4616→328ms), ~13.7× @d32768 (8958→652ms), lifting end-to-end prefill from 104→165 tok/s @d32768.\n");
+                md.push_str("- `moe_experts` ~12%: the GEMM is fast (28 TFLOP/s) but the per-expert cuBLAS loop + host relu2/scatter round-trips remain serial → fuse on-device or use cublasGemmStridedBatched.\n");
+                md.push_str("- Throughput peaks at S=512 then declines (S=2048→178, S=8192→117): the per-expert host round-trips + dequant grow with S/expert-count. Removing dequant-per-forward + the host MoE bridges should restore monotonic scaling toward the vLLM band.\n");
+            } else {
+                md.push_str("\n## Notes (Apple/Metal path)\n");
+                md.push_str("- GEMMs run on Apple GPU hardware MMA: dense projections via `gemm_q4_mpp` (Q4-native cooperative-tensor MMA), per-expert/shared MoE via dequant_q4_off + `matmul`. No cuBLAS/tensor-core escape hatches (those are CUDA-only).\n");
+                md.push_str("- Per-expert MoE GEMM runs in **f16 by default** (dequant→f16 + f16 matmul); set NEMOTRON_METAL_F32_EXPERTS=1 for the f32 fallback. The f16-compute path is the measured Metal prefill win (M5 Max: S=512 +26.6%, S=2048 98.8→113.5 tok/s) at EXACT-MATCH numerics.\n");
+                md.push_str("- A resident f16 expert cache was tried and is a NET LOSS on Metal (bandwidth/residency bound): re-dequanting the compact Q4 each forward streams better than a fat f16 working set — so weights are re-dequanted per forward, not cached.\n");
+                md.push_str("- The %peak column above is computed against the GB10 tensor-core peak and is not meaningful on Metal; read the ms / % columns instead.\n");
+            }
             let out_path = std::env::var("NEMOTRON_PROFILE_OUT").unwrap_or_else(|_| "/tmp/PROFILING_PREFILL.md".into());
             let _ = std::fs::write(&out_path, &md);
             eprintln!("\n{md}\n(written to {out_path})");
