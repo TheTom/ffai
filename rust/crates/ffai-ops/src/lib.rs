@@ -671,7 +671,12 @@ pub fn conv1d_causal_prefill(
             u(conv_dim as u32),
             u(kc as u32),
         ],
-        Grid { grid: [(s * conv_dim) as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: pack 256 threads/block (was block:[1,1,1] = 1 thread/block = 1/32
+        // warp occupancy). The kernel uses gid_x = blockIdx*blockDim+threadIdx as a
+        // global linear element id, so block size is transparent as long as the grid
+        // covers exactly s*conv_dim threads. conv_dim (6144) is a multiple of 256, so
+        // s*conv_dim is always divisible by 256 → no over-launch / OOB.
+        { let n = (s * conv_dim) as u32; let b = 256u32; Grid { grid: [n / b, 1, 1], block: [b, 1, 1] } },
     )?;
     Ok(y)
 }
@@ -699,7 +704,9 @@ pub fn strided_col_copy(
             u(col_off as u32),
             u(width as u32),
         ],
-        Grid { grid: [(s * width) as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: 64 threads/block (was 1). `width` is one of {di=4096, ng*ds=1024,
+        // m_nh=64} — all multiples of 64, so s*width is divisible by 64 → exact grid.
+        { let n = (s * width) as u32; let b = 64u32; Grid { grid: [n / b, 1, 1], block: [b, 1, 1] } },
     )?;
     Ok(dst)
 }
@@ -725,7 +732,14 @@ pub fn softplus_add_rows(
             Binding::Buffer(dst.buffer.clone()),
             u(n as u32),
         ],
-        Grid { grid: [(s * n) as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: pack threads/block (was 1). Kernel uses a global linear element id,
+        // so any block size works provided the grid covers exactly s*n threads.
+        // Pick the largest of {64,32,1} that divides s*n to avoid OOB over-launch.
+        {
+            let nt = (s * n) as u32;
+            let b = if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
+            Grid { grid: [nt / b, 1, 1], block: [b, 1, 1] }
+        },
     )?;
     Ok(dst)
 }
@@ -2792,7 +2806,12 @@ pub fn kv_append_many(
             u(max_seq as u32),
             u((n_kv_heads * head_dim) as u32),
         ],
-        Grid { grid: [total as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: pack threads/block (was 1). Global linear element id; total =
+        // t*n_kv_heads*head_dim. Pick largest of {256,64,1} dividing total exactly.
+        {
+            let b = if total % 256 == 0 { 256u32 } else if total % 64 == 0 { 64u32 } else { 1u32 };
+            Grid { grid: [(total as u32) / b, 1, 1], block: [b, 1, 1] }
+        },
     )?;
     Ok(())
 }
@@ -2896,7 +2915,16 @@ pub fn mamba_split_proj(
             u(conv_dim as u32),
             u(m_nh as u32),
         ],
-        Grid { grid: [(s * in_proj_out) as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: pack threads/block (was block:[1,1,1] = 1 thread/block, 1/32 of a
+        // warp — this split was ~its full cost in launch overhead, not memory). The
+        // kernel uses a global linear element id (gid_x), so block size is transparent
+        // as long as the grid covers exactly s*in_proj_out threads. in_proj_out (10304
+        // = 64*161) is a multiple of 64 → s*in_proj_out always divisible by 64.
+        {
+            let nt = (s * in_proj_out) as u32;
+            let b = if nt % 64 == 0 { 64u32 } else if nt % 32 == 0 { 32u32 } else { 1u32 };
+            Grid { grid: [nt / b, 1, 1], block: [b, 1, 1] }
+        },
     )?;
     Ok((z_out, xbc_out, dt_out))
 }
@@ -2934,7 +2962,9 @@ pub fn mamba_split_conv(
             u(di as u32),
             u(ng_ds as u32),
         ],
-        Grid { grid: [(s * conv_dim) as u32, 1, 1], block: [1, 1, 1] },
+        // PERF: 256 threads/block (was 1). Global linear element id; conv_dim (6144)
+        // is a multiple of 256 → s*conv_dim divisible by 256, exact grid, no OOB.
+        { let n = (s * conv_dim) as u32; let b = 256u32; Grid { grid: [n / b, 1, 1], block: [b, 1, 1] } },
     )?;
     Ok((x_out, b_out, c_out))
 }
