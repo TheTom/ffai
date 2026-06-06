@@ -2104,11 +2104,20 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         kv_append_many(d, &kr, &positions_dev, kcache, nkv, hd, cap).unwrap();
                         kv_append_many(d, &v_all.reshaped(vec![s, nkv, hd]), &positions_dev, vcache, nkv, hd, cap).unwrap();
                         // sdpa_multi: Q [n_query, n_q_heads, hd], K/V [n_kv, cap, hd], causal, base_kv=base.
-                        // NEMOTRON_PREFILL_TCATTN=1 → tensor-core cuBLAS flash-attn (sdpa_multi_tc),
-                        // the fast prefill attention path; default = software-MMA sdpa_multi.
+                        // Attention path auto-select: the tensor-core cuBLAS flash-attn
+                        // (sdpa_multi_tc) wins big once KV is deep (9.5-14× stage @ d8192+),
+                        // but its prep/transpose overhead regresses shallow KV (d0). So
+                        // auto-enable it once total KV (base+s) crosses ~4096; below that use
+                        // the software-MMA sdpa_multi. Override: NEMOTRON_PREFILL_TCATTN=1 force
+                        // on, =0 force off.
                         let avg_kv = base as f64 + s as f64 / 2.0;
                         let attn_flops = 4.0 * nq as f64 * hd as f64 * avg_kv * s as f64;
-                        let attn = if std::env::var("NEMOTRON_PREFILL_TCATTN").is_ok() {
+                        let use_tc_attn = match std::env::var("NEMOTRON_PREFILL_TCATTN").ok().as_deref() {
+                            Some("0") => false,
+                            Some(_) => true,
+                            None => (base + s) >= 4096,
+                        };
+                        let attn = if use_tc_attn {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                         } else {
                             pf!(7, attn_flops, sdpa_multi(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
