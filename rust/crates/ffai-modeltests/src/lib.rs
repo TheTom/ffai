@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, conv_roll, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1599,7 +1599,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
                             let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
                             let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
-                            let (so, y_dev) = if use_chunked {
+                            let use_ssd = std::env::var("NEMOTRON_SSD_MATMUL").is_ok();
+                            let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+                            let (so, y_dev) = if use_ssd {
+                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
+                            } else if use_chunked {
                                 pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                             } else {
                                 pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
@@ -1669,7 +1673,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // Drops serial depth from T to T/64, exploiting 64× more GPU parallelism.
                         // Default: sequential step-record (validated, correctness-first).
                         let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
-                        let (so, y_dev) = if use_chunked {
+                        let use_ssd = std::env::var("NEMOTRON_SSD_MATMUL").is_ok();
+                        let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+                        let (so, y_dev) = if use_ssd {
+                            pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
+                        } else if use_chunked {
                             pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                         } else {
                             pf!(5, ssm_flops, ssm_prefill_scan(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
@@ -2093,9 +2101,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         kv_append_many(d, &kr, &positions_dev, kcache, nkv, hd, cap).unwrap();
                         kv_append_many(d, &v_all.reshaped(vec![s, nkv, hd]), &positions_dev, vcache, nkv, hd, cap).unwrap();
                         // sdpa_multi: Q [n_query, n_q_heads, hd], K/V [n_kv, cap, hd], causal, base_kv=base.
+                        // NEMOTRON_PREFILL_TCATTN=1 → tensor-core cuBLAS flash-attn (sdpa_multi_tc),
+                        // the fast prefill attention path; default = software-MMA sdpa_multi.
                         let avg_kv = base as f64 + s as f64 / 2.0;
                         let attn_flops = 4.0 * nq as f64 * hd as f64 * avg_kv * s as f64;
-                        let attn = pf!(7, attn_flops, sdpa_multi(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap());
+                        let attn = if std::env::var("NEMOTRON_PREFILL_TCATTN").is_ok() {
+                            pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                        } else {
+                            pf!(7, attn_flops, sdpa_multi(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                        };
                         // attn [s, nq, hd] = [s, qdim]; o_proj batched.
                         let o = qmm(&attn.reshaped(vec![s, qdim]), &format!("{p}.mixer.o_proj.weight"));
                         xt = add(d, &xt, &o).unwrap();
@@ -2191,6 +2205,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // sequential token's logit. If they differ but the gap is < a few %,
             // it's a precision near-tie (Q4-GEMV vs dequant→f32-GEMM), not a bug.
             let blog = if !run0_logits.is_empty() { run0_logits.clone() } else { LAST_BATCHED_LOGITS.with(|c| c.borrow().clone()) };
+            // A/B hook: dump batched logits to a file for cross-run comparison
+            // (e.g. SSD-on vs SSD-off). NEMOTRON_DUMP_BLOGITS=<path>.
+            if let Ok(path) = std::env::var("NEMOTRON_DUMP_BLOGITS") {
+                let bytes: Vec<u8> = blog.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::write(&path, &bytes);
+                eprintln!("  [dumped {} batched logits to {path}]", blog.len());
+            }
             let (rank, seq_logit, top_logit) = if !blog.is_empty() && seq_argmax < blog.len() {
                 let sv = blog[seq_argmax];
                 let top = blog[bat_argmax];
@@ -2363,7 +2384,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             md.push_str("- **The GEMMs now hit the tensor cores via the cuBLAS escape hatch (`gemm_cublas`/`cublasGemmEx`, f16×f16→f32 accumulate).** proj_gemm jumped ~1→90 TFLOP/s (0.1%→9% of peak), moe_shared ~1→74, moe_experts ~0.8→28 — a 35-82× per-GEMM speedup vs the software-emulated coop_tile MMA. End-to-end prefill went from ~80 to 178-259 tok/s (peak at S=512).\n");
             md.push_str("- **New #1 bottleneck: `ssm_scan` (~41%)** — the sequential-in-T Mamba `ssm_step_record`. With the GEMMs fast, this is now the critical path → the deferred chunked/parallel SSD scan is the next target.\n");
             md.push_str("- **`dequant_q4` ~26% (5500 calls):** Q4 weights are re-dequanted to f16 EVERY forward (per layer + per routed expert). This is pure redundant work → cache the f16-dequanted weights resident once at load (trades VRAM for ~26% of prefill time).\n");
-            md.push_str("- `sdpa_prefill` ~12% (the prefill flash-attn is still software-MMA coop_tile — a cuBLAS/cuDNN attention or fp16 flash kernel would cut this).\n");
+            md.push_str("- `sdpa_prefill`: software-MMA coop_tile by default; set NEMOTRON_PREFILL_TCATTN=1 for the cuBLAS tensor-core FlashAttention path (`sdpa_multi_tc`). At deep context (zero-KV synthetic) the TC path cuts this stage ~9.5× @d8192 (1754→185ms, 54.7%→11.3%), ~14× @d16384 (4616→328ms), ~13.7× @d32768 (8958→652ms), lifting end-to-end prefill from 104→165 tok/s @d32768.\n");
             md.push_str("- `moe_experts` ~12%: the GEMM is fast (28 TFLOP/s) but the per-expert cuBLAS loop + host relu2/scatter round-trips remain serial → fuse on-device or use cublasGemmStridedBatched.\n");
             md.push_str("- Throughput peaks at S=512 then declines (S=2048→178, S=8192→117): the per-expert host round-trips + dequant grow with S/expert-count. Removing dequant-per-forward + the host MoE bridges should restore monotonic scaling toward the vLLM band.\n");
             let out_path = std::env::var("NEMOTRON_PROFILE_OUT").unwrap_or_else(|_| "/tmp/PROFILING_PREFILL.md".into());

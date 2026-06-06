@@ -24,6 +24,9 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
+mod ssd_scan;
+pub use ssd_scan::ssm_prefill_scan_ssd;
+
 /// Cache of resolved kernel IR keyed by (name, dtype). Resolving walks the
 /// whole test registry building setups, which is expensive — a forward pass
 /// dispatches the same handful of kernels hundreds of times, so cache them.
@@ -1364,6 +1367,358 @@ pub fn sdpa_multi(
         ],
         grid,
     )?;
+    Ok(out)
+}
+
+// ─── Tensor-core prefill SDPA (`sdpa_multi_tc`) ──────────────────────────────
+//
+// Drop-in replacement for [`sdpa_multi`] that runs the two big matmuls (QKᵀ and
+// P·V) on the GB10 **tensor cores via cuBLAS** instead of the software-MMA
+// `ffai_sdpa_multi` kernel (which sits at ~0.1% of peak and dominated the
+// long-context prefill). It is a FlashAttention-style online-softmax loop tiled
+// over KV blocks so the score matrix is never materialised in full:
+//
+//   for each KV block:
+//     S_blk = Qh · Khᵀ            (cublasGemmStridedBatchedEx, fp16→fp32→fp16)
+//     P_blk = exp(S_blk - m_blk)  + causal mask  (custom kernel; emits m_blk,l_blk)
+//     O_blk = P_blk · Vt          (cublasGemmStridedBatchedEx)
+//     merge O_blk into running O with per-row rescale; update m_run, l_run
+//   O = O_run / l_run, transpose head-major → row-major, cast back to caller dtype
+//
+// GQA fan-out (16 query heads : 1 KV head) is handled by issuing the batched
+// GEMM **once per KV group** with the K/V stride set to 0 (the 16 query heads in
+// a group all read the same KV slab — no duplicated KV is materialised).
+//
+// Q is pre-scaled by `scale` in the transpose kernel, so the GEMM/softmax run on
+// already-scaled logits (matches `ffai_sdpa_multi`, which folds `scale` into Q).
+
+/// Transpose+cast+scale Q `[n_query, n_q_heads, hd]` (caller dtype) into the
+/// head-major fp16 `[n_q_heads, n_query, hd]` layout the batched GEMM wants, with
+/// `scale` folded in. `IN_F32` selects f32 vs f16 input.
+const SDPA_TC_QPREP_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_qprep(
+    const void* __restrict__ q_in,   // [Sq, nq, hd], dtype = f32 (in_f32=1) or f16
+    __half*     __restrict__ q_out,  // [nq, Sq, hd] f16, scaled
+    int sq, int nq, int hd, float scale, int in_f32)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)sq * nq * hd;
+    if (i >= total) return;
+    int d  = (int)(i % hd);
+    long t = i / hd;
+    int h  = (int)(t % nq);
+    int r  = (int)(t / nq);          // query row
+    float val;
+    if (in_f32) val = ((const float*)q_in)[i];
+    else        val = __half2float(((const __half*)q_in)[i]);
+    long o = ((long)h * sq + r) * hd + d;
+    q_out[o] = __float2half(val * scale);
+}
+"#;
+
+/// Cast K `[nkv, kv_stride, hd]` → fp16 `[nkv, n_kv, hd]` (drops cache padding).
+const SDPA_TC_KPREP_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_kprep(
+    const void* __restrict__ k_in,   // [nkv, kv_stride, hd]
+    __half*     __restrict__ k_out,  // [nkv, n_kv, hd] f16
+    int nkv, int kv_stride, int n_kv, int hd, int in_f32)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)nkv * n_kv * hd;
+    if (i >= total) return;
+    int d  = (int)(i % hd);
+    long t = i / hd;
+    int p  = (int)(t % n_kv);        // kv position
+    int kh = (int)(t / n_kv);        // kv head
+    long si = ((long)kh * kv_stride + p) * hd + d;
+    float val = in_f32 ? ((const float*)k_in)[si]
+                       : __half2float(((const __half*)k_in)[si]);
+    k_out[i] = __float2half(val);
+}
+"#;
+
+/// Cast+transpose ONE KV block of V `[nkv, kv_stride, hd]` → fp16
+/// `[nkv, hd, blk]` (V^Tᵀ per head, block-contiguous so the P·V GEMM's leading
+/// dim equals `blk = k`). Reads source rows `[kb0, kb0+blk)`.
+const SDPA_TC_VPREP_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_vprep(
+    const void* __restrict__ v_in,   // [nkv, kv_stride, hd]
+    __half*     __restrict__ v_out,  // [nkv, hd, blk] f16
+    int nkv, int kv_stride, int hd, int kb0, int blk, int in_f32)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)nkv * blk * hd;
+    if (i >= total) return;
+    int d  = (int)(i % hd);
+    long t = i / hd;
+    int j  = (int)(t % blk);          // position within block
+    int kh = (int)(t / blk);          // kv head
+    long si = ((long)kh * kv_stride + (kb0 + j)) * hd + d;
+    float val = in_f32 ? ((const float*)v_in)[si]
+                       : __half2float(((const __half*)v_in)[si]);
+    long oi = ((long)kh * hd + d) * blk + j;   // [kh][d][j], leading dim = blk
+    v_out[oi] = __float2half(val);
+}
+"#;
+
+/// Online-softmax exp + causal mask for one KV block. Reads the (already
+/// `scale`-folded) logits `S_blk[nq, Sq, blk]`, writes the unnormalised weights
+/// `P_blk[nq, Sq, blk]` (fp16) plus the per-(head,row) block max `bm[nq,Sq]` and
+/// block sum-exp `bl[nq,Sq]`. Causal: query row `r` (absolute pos `base_kv+r`)
+/// attends absolute KV pos `kb0 + j` iff `kb0 + j <= base_kv + r`.
+/// One thread block per (head,row); blockDim.x threads stride over `blk`.
+const SDPA_TC_SOFTMAX_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_softmax(
+    const __half* __restrict__ s_blk,  // [nq, Sq, blk] logits (scaled)
+    __half*       __restrict__ p_blk,  // [nq, Sq, blk] weights out
+    float*        __restrict__ bm,     // [nq, Sq] block max
+    float*        __restrict__ bl,     // [nq, Sq] block sum-exp
+    int nq, int sq, int blk, int kb0, int base_kv)
+{
+    long row = (long)blockIdx.x;       // global (head*Sq + r)
+    if (row >= (long)nq * sq) return;
+    int r = (int)(row % sq);
+    int max_kv = base_kv + r;          // inclusive absolute KV position
+    const __half* s = s_blk + row * blk;
+    __half* p = p_blk + row * blk;
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    // pass 1: row max over valid columns
+    float lm = -3.4e38f;
+    for (int j = tid; j < blk; j += nt) {
+        int abspos = kb0 + j;
+        float v = (abspos <= max_kv) ? __half2float(s[j]) : -3.4e38f;
+        if (v > lm) lm = v;
+    }
+    __shared__ float red[256];
+    red[tid] = lm; __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) { float o = red[tid+off]; if (o > red[tid]) red[tid] = o; }
+        __syncthreads();
+    }
+    float m = red[0];
+    __syncthreads();
+    // pass 2: exp + sum
+    float ls = 0.0f;
+    for (int j = tid; j < blk; j += nt) {
+        int abspos = kb0 + j;
+        float w;
+        if (abspos <= max_kv && m > -3.0e38f) { w = __expf(__half2float(s[j]) - m); }
+        else { w = 0.0f; }
+        p[j] = __float2half(w);
+        ls += w;
+    }
+    red[tid] = ls; __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid+off];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        bm[row] = (m > -3.0e38f) ? m : -3.4e38f;
+        bl[row] = red[0];
+    }
+}
+"#;
+
+/// Merge one block's partial output into the running FlashAttention state.
+/// `o_blk[nq,Sq,hd]` = P_blk·V_blk (unnormalised). Updates running max `m_run`,
+/// running sum `l_run`, and running (unnormalised) output `o_run` with the
+/// standard online-softmax rescale. One block per (head,row); threads over hd.
+const SDPA_TC_MERGE_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_merge(
+    const __half* __restrict__ o_blk,  // [nq, Sq, hd] this block's P·V
+    const float*  __restrict__ bm,     // [nq, Sq] block max
+    const float*  __restrict__ bl,     // [nq, Sq] block sum
+    float*        __restrict__ o_run,  // [nq, Sq, hd] running output (f32)
+    float*        __restrict__ m_run,  // [nq, Sq]
+    float*        __restrict__ l_run,  // [nq, Sq]
+    int nq, int sq, int hd)
+{
+    long row = (long)blockIdx.x;
+    if (row >= (long)nq * sq) return;
+    float m_old = m_run[row];
+    float l_old = l_run[row];
+    float m_b   = bm[row];
+    float l_b   = bl[row];
+    if (l_b <= 0.0f) return;           // block fully masked → nothing to add
+    float m_new = (m_b > m_old) ? m_b : m_old;
+    float a = (m_old > -3.0e38f) ? __expf(m_old - m_new) : 0.0f; // rescale old
+    float b = __expf(m_b   - m_new);                              // scale block
+    const __half* ob = o_blk + row * hd;
+    float* orun = o_run + row * hd;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        orun[d] = orun[d] * a + __half2float(ob[d]) * b;
+    }
+    if (threadIdx.x == 0) {
+        m_run[row] = m_new;
+        l_run[row] = l_old * a + l_b * b;
+    }
+}
+"#;
+
+/// Finalise: normalise the running output by `l_run` and write it back in the
+/// caller's `[n_query, n_q_heads, hd]` row-major layout (transpose from the
+/// head-major `[nq, Sq, hd]` accumulator). `OUT_F32` selects output dtype.
+const SDPA_TC_FINALIZE_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_finalize(
+    const float* __restrict__ o_run,  // [nq, Sq, hd]
+    const float* __restrict__ l_run,  // [nq, Sq]
+    void*        __restrict__ out,    // [Sq, nq, hd] caller dtype
+    int nq, int sq, int hd, int out_f32)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)nq * sq * hd;
+    if (i >= total) return;
+    int d  = (int)(i % hd);
+    long t = i / hd;
+    int r  = (int)(t % sq);
+    int h  = (int)(t / sq);
+    long row = (long)h * sq + r;
+    float l = l_run[row];
+    float val = (l > 0.0f) ? (o_run[i] / l) : 0.0f;
+    long oi = ((long)r * nq + h) * hd + d;   // [r][h][d] row-major
+    if (out_f32) ((float*)out)[oi] = val;
+    else         ((__half*)out)[oi] = __float2half(val);
+}
+"#;
+
+/// Tensor-core prefill SDPA — drop-in faster replacement for [`sdpa_multi`].
+/// Same signature/semantics (causal/full, GQA, head_dim=128, Q pre-scaled by
+/// `scale`), but runs QKᵀ and P·V on the cuBLAS tensor cores with a
+/// FlashAttention online-softmax loop tiled over KV. Q/K/V may be F32 or F16;
+/// output matches `q.dtype`. CUDA-only (falls back via the GEMM/dispatch FFI).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_multi_tc(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    n_q_heads: u32,
+    base_kv: u32,
+    n_query: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    let hd = head_dim;
+    let nq = n_q_heads as usize;
+    let sq = n_query as usize;
+    let hpg = heads_per_group as usize;
+    let nkv = nq / hpg;
+    let base = base_kv as usize;
+    // Total KV positions the deepest query row attends.
+    let n_kv = if causal { base + sq } else { base + sq };
+    if n_kv > kv_stride as usize {
+        return Err(Error::Msg(format!(
+            "sdpa_multi_tc: n_kv {n_kv} exceeds kv_stride {kv_stride}")));
+    }
+    let in_f32 = match q.dtype { DType::F32 => 1i32, DType::F16 => 0,
+        other => return Err(Error::Msg(format!("sdpa_multi_tc: unsupported dtype {other:?}"))) };
+
+    // ── prep buffers (all f16) ──────────────────────────────────────────────
+    let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;          // [nq,Sq,hd] scaled
+    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;       // [nkv,n_kv,hd]
+
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let blk256 = |n: usize| -> [u32; 3] { [((n as u32).div_ceil(256)).max(1), 1, 1] };
+
+    dev.dispatch_raw_cuda(SDPA_TC_QPREP_SRC, "sdpa_tc_qprep.cu", "sdpa_tc_qprep",
+        &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
+        &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
+        blk256(nq*sq*hd), [256,1,1], 0, false)?;
+    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
+        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
+
+    // ── running FlashAttention state (init via upload: o=0, l=0, m=-inf) ─────
+    let o_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*hd*4])?, vec![nq, sq, hd], DType::F32);
+    let l_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*4])?, vec![nq, sq], DType::F32);
+    let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
+    let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
+
+    // KV block size: bound scores buffer ≈ nq*Sq*BK*2 bytes. 2048 keeps it ≤ ~512MB
+    // at Sq≤4096; smaller Sq could go larger but 2048 is a safe universal default.
+    let bk = 2048usize.min(n_kv);
+    let scores = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
+    let p_blk  = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
+    let bm     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
+    let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
+    let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
+    let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;     // per-block V^T
+
+    let el = 2i64; // f16 bytes
+    let mut kb0 = 0usize;
+    while kb0 < n_kv {
+        let blk = bk.min(n_kv - kb0);
+
+        // ── QKᵀ: per KV group (16 q-heads share one KV head) ────────────────
+        // C[Sq, blk] = Qh[Sq,hd] · Kh_blk[blk,hd]ᵀ ; batch over the hpg q-heads.
+        for g in 0..nkv {
+            let q_off = g * hpg * sq * hd * 2;             // bytes into qh
+            let k_off = (g * n_kv + kb0) * hd * 2;         // bytes into kh (this block)
+            let s_off = g * hpg * sq * blk * 2;            // bytes into scores
+            dev.gemm_strided_batched_off(
+                qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,   // X stride = one q-head
+                kh.buffer.as_ref(),     k_off, 0,                     // W stride = 0 (broadcast KV)
+                scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,  // out stride
+                sq, blk, hd, hpg, DType::F16)?;
+        }
+
+        // ── softmax + causal mask for this block ────────────────────────────
+        // scores/p_blk are PACKED at pitch `blk` (head stride sq*blk, row pitch
+        // blk) — only the first nq*sq*blk f16 of the bk-sized allocation are used.
+        // This keeps the GEMM's lda == k == blk valid for the final partial block.
+        dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_SRC, "sdpa_tc_softmax.cu", "sdpa_tc_softmax",
+            &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
+              (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0)],
+            &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
+            [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
+
+        // ── transpose this block of V → vt[nkv, hd, blk] (lda = blk = k) ────
+        dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
+            &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
+            &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
+            blk256(nkv*blk*hd), [256,1,1], 0, false)?;
+
+        // ── P·V: O_blk[Sq,hd] = P[Sq,blk] · Vt[hd,blk]ᵀ ; batch over q-heads ─
+        for g in 0..nkv {
+            let p_off = g * hpg * sq * blk * 2;            // bytes into p_blk (pitch blk)
+            let v_off = g * hd * blk * 2;                  // bytes into vt (this group's slab)
+            let o_off = g * hpg * sq * hd * 2;             // bytes into o_blk
+            dev.gemm_strided_batched_off(
+                p_blk.buffer.as_ref(), p_off, (sq*blk) as i64 * el,
+                vt.buffer.as_ref(),    v_off, 0,                       // Vt stride = 0 (broadcast)
+                o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
+                sq, hd, blk, hpg, DType::F16)?;
+        }
+
+        // ── merge into running state ────────────────────────────────────────
+        dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
+            &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+              (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
+            &[i(nq as i32), i(sq as i32), i(hd as i32)],
+            [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
+
+        kb0 += blk;
+    }
+
+    // ── finalise: normalise + transpose head-major → row-major ──────────────
+    let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
+    let out_f32 = if q.dtype == DType::F32 { 1i32 } else { 0 };
+    dev.dispatch_raw_cuda(SDPA_TC_FINALIZE_SRC, "sdpa_tc_finalize.cu", "sdpa_tc_finalize",
+        &[(o_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0), (out.buffer.as_ref(), 0)],
+        &[i(nq as i32), i(sq as i32), i(hd as i32), i(out_f32)],
+        blk256(nq*sq*hd), [256,1,1], 0, false)?;
     Ok(out)
 }
 
