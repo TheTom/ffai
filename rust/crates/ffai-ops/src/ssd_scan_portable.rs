@@ -79,12 +79,15 @@ pub fn ssm_prefill_scan_ssd_portable(
     let state_out = Tensor::empty(dev, state_in.shape.clone(), DType::F32)?;
 
     // ── Scratch buffers (all f32). ────────────────────────────────────────
+    // NOTE: b_g/c_g ([nc*H, L, ds]) and cb ([nc*H, L, L]) are GONE — the G1
+    // (CB→M) and G4 (CS) GEMMs now read B/C straight from [T, G, ds] with the
+    // 8× per-head broadcast folded into the tile load (ssd_g1_cb / ssd_g4_cs),
+    // and G1 applies the decay-mask in its epilogue (ssd_mmask fused away).
+    // That kills the 8× redundant gather_bc write+read AND the [L,L] CB
+    // round-trip per chunk.
     let lcs = Tensor::empty(dev, vec![bhc * l], DType::F32)?; // [nc*H, L]
-    let b_g = Tensor::empty(dev, vec![bhc * l * dsu], DType::F32)?; // [nc*H, L, ds]
-    let c_g = Tensor::empty(dev, vec![bhc * l * dsu], DType::F32)?; // [nc*H, L, ds]
     let xt = Tensor::empty(dev, vec![bhc * dhu * l], DType::F32)?; // [nc*H, dh, L]
-    let cb = Tensor::empty(dev, vec![bhc * l * l], DType::F32)?; // [nc*H, L, L]
-    let mmask = Tensor::empty(dev, vec![bhc * l * l], DType::F32)?; // [nc*H, L, L]
+    let mmask = Tensor::empty(dev, vec![bhc * l * l], DType::F32)?; // [nc*H, L, L] (M from G1)
     let y_intra = Tensor::empty(dev, vec![bhc * l * dhu], DType::F32)?; // [nc*H, L, dh]
     let bdt = Tensor::empty(dev, vec![bhc * dsu * l], DType::F32)?; // [nc*H, ds, L]
     let s_chunk = Tensor::empty(dev, vec![bhc * dsu * dhu], DType::F32)?; // [nc*H, ds, dh]
@@ -161,11 +164,30 @@ pub fn ssm_prefill_scan_ssd_portable(
         dev.dispatch(&kern, &bindings, grid)
     };
 
+    // Fused gather-GEMM dispatch (ssd_g1_cb / ssd_g4_cs). Reduction-mode,
+    // grid [(out_dim/32),(n_rows/32), bhc]; bindings vary per kernel (broadcast
+    // index math is baked in-kernel), so the caller passes the binding list.
+    let gemm_fused = |name: &str, bindings: Vec<Binding>, n: usize, m: usize| -> Result<()> {
+        let kern = cached_ir(name, DType::F32, || {
+            let mut k = build_ssd_ir(name);
+            k.mode = KernelMode::Reduction;
+            k
+        });
+        let grid = Grid {
+            grid: [(n as u32).div_ceil(32), (m as u32).div_ceil(32), bhc as u32],
+            block: [1024, 1, 1],
+        };
+        dev.dispatch(&kern, &bindings, grid)
+    };
+
     // Optional per-phase profiler (env SSD_PHASE_PROF=1): synchronize + time
     // each phase, bucketed into elementwise / intra-GEMM / inter-recur /
     // state-GEMM. Zero cost when the env var is unset (default).
     let phase_prof = std::env::var("SSD_PHASE_PROF").is_ok();
     let t_pre = std::cell::Cell::new(0.0f64); // prologue elementwise (lcs/gather/xt)
+    let t_lcs = std::cell::Cell::new(0.0f64); // sub: lcs cumsum
+    let t_gbc = std::cell::Cell::new(0.0f64); // sub: gather_bc
+    let t_xt = std::cell::Cell::new(0.0f64); // sub: xt transpose
     let t_g1 = std::cell::Cell::new(0.0f64); // CB = C·Bᵀ  (intra)
     let t_mmask = std::cell::Cell::new(0.0f64); // M = CB⊙mask (elementwise)
     let t_g2 = std::cell::Cell::new(0.0f64); // y_intra = M·x (intra)
@@ -190,37 +212,38 @@ pub fn ssm_prefill_scan_ssd_portable(
     }
 
     // 1. Lcs cumsum: one thread per (chunk, head).
-    phase!(t_pre, elem(
+    phase!(t_lcs, elem(
         "ssd_lcs",
         &[dt, a_log, &lcs],
         &[u(tt), u(hh), u(ll), u(ncn)],
         bhc,
     )?);
-    // 2. Gather B/C (broadcast per head).
-    phase!(t_pre, elem(
-        "ssd_gather_bc",
-        &[b_mat, c_mat, &b_g, &c_g],
-        &[u(tt), u(hh), u(gg), u(hpgn), u(ll), u(dsd), u(ncn)],
-        bhc * l * dsu,
-    )?);
+    // 2. (gather_bc REMOVED — fused into G1/G4 as broadcast tile-loads.)
     // 3. Transpose x → xt [nc*H, dh, L].
-    phase!(t_pre, elem(
+    phase!(t_xt, elem(
         "ssd_xt",
         &[x, &xt],
         &[u(tt), u(hh), u(dhd), u(ll), u(ncn)],
         bhc * dhu * l,
     )?);
 
-    // ── G1: CB = C · Bᵀ  [L,L] = C[L,ds]·B[L,ds]ᵀ. ────────────────────────
-    // out[i,j] = Σ_s c_g[i,s]·b_g[j,s] → weight=b_g, input=c_g, k=ds.
-    phase!(t_g1, gemm_b(&b_g, &c_g, &cb, l, l, dsu, l * dsu, l * dsu, l * l)?);
-
-    // 4. M = CB ⊙ Lmask ⊙ dt[j], causal.
-    phase!(t_mmask, elem(
-        "ssd_mmask",
-        &[&cb, &lcs, dt, &mmask],
-        &[u(tt), u(hh), u(ll), u(ncn)],
-        bhc * l * l,
+    // ── G1+mmask FUSED: M = (C·Bᵀ) ⊙ decay-mask  [L,L]. ──────────────────
+    // ssd_g1_cb reads B/C straight from [T,G,ds] (8× head broadcast folded
+    // into the tile load → no b_g/c_g), computes CB[i,j]=Σ_s C[t_i,g,s]·
+    // B[t_j,g,s], and applies the causal decay·dt mask in the epilogue,
+    // writing M directly (no CB scratch, no separate mmask round-trip).
+    phase!(t_g1, gemm_fused(
+        "ssd_g1_cb",
+        vec![
+            Binding::Buffer(b_mat.buffer.clone()),
+            Binding::Buffer(c_mat.buffer.clone()),
+            Binding::Buffer(lcs.buffer.clone()),
+            Binding::Buffer(dt.buffer.clone()),
+            Binding::Buffer(mmask.buffer.clone()),
+            u(tt), u(hh), u(gg), u(hpgn), u(ll), u(dsd),
+        ],
+        l, // out_dim = L
+        l, // n_rows  = L
     )?);
 
     // ── G2: y_intra = M · x  [L,dh]. out[i,p]=Σ_j mmask[i,j]·xt[p,j],
@@ -247,9 +270,20 @@ pub fn ssm_prefill_scan_ssd_portable(
         h * dsu * dhu,
     )?);
 
-    // ── G4: CS = C · S_in  [L,dh]. out[i,p]=Σ_s c_g[i,s]·sin_t[p,s],
-    //        weight=sin_t[dh,ds], input=c_g[L,ds], k=ds. ───────────────────
-    phase!(t_g4, gemm_b(&sin_t, &c_g, &cs, l, dhu, dsu, dhu * dsu, l * dsu, l * dhu)?);
+    // ── G4 FUSED: CS = C · S_in  [L,dh]. out[i,p]=Σ_s C[t_i,g,s]·sin_t[p,s].
+    // ssd_g4_cs reads C straight from [T,G,ds] (broadcast tile-load → no c_g);
+    // sin_t is already per-batch [nc*H,dh,ds]. weight=sin_t, input=C, k=ds.
+    phase!(t_g4, gemm_fused(
+        "ssd_g4_cs",
+        vec![
+            Binding::Buffer(sin_t.buffer.clone()),
+            Binding::Buffer(c_mat.buffer.clone()),
+            Binding::Buffer(cs.buffer.clone()),
+            u(tt), u(hh), u(gg), u(hpgn), u(ll), u(dsd), u(dhd),
+        ],
+        dhu, // out_dim = dh
+        l,   // n_rows  = L
+    )?);
 
     // 7. Combine → y [T,H,dh] f32.
     phase!(t_comb, elem(
@@ -260,6 +294,8 @@ pub fn ssm_prefill_scan_ssd_portable(
     )?);
 
     if phase_prof {
+        eprintln!("    [SSD pre-sub L={l}] lcs={:.1} gather_bc={:.1}(fused) xt={:.1}", t_lcs.get(), t_gbc.get(), t_xt.get());
+        t_pre.set(t_lcs.get() + t_gbc.get() + t_xt.get());
         let intra = t_g1.get() + t_g2.get();
         let state = t_g3.get() + t_g4.get();
         let elemw = t_pre.get() + t_mmask.get() + t_bdt.get() + t_comb.get();
@@ -288,6 +324,8 @@ fn build_ssd_ir(name: &str) -> ffai_core::Kernel {
         "ssd_bdt" => ssm::ssd_bdt::kernel_ir_for(),
         "ssd_recur" => ssm::ssd_recur::kernel_ir_for(),
         "ssd_combine" => ssm::ssd_combine::kernel_ir_for(),
+        "ssd_g1_cb" => ssm::ssd_g1_cb::kernel_ir_for(),
+        "ssd_g4_cs" => ssm::ssd_g4_cs::kernel_ir_for(),
         other => panic!("build_ssd_ir: unknown ssd kernel {other}"),
     }
 }
