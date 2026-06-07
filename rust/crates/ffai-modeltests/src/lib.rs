@@ -1120,6 +1120,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // the most recent `step()` call so the prefill gate can compute logit-level
     // metrics (cosine, top-5 overlap, max-abs err) vs the batched path. REVERT.
     thread_local! { static LAST_STEP_LOGITS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    thread_local! { static ROUTER_HOST_T: std::cell::Cell<f64> = const { std::cell::Cell::new(0f64) }; }
     thread_local! { static STEP_LAYER_TRACE: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
     thread_local! { static BATCHED_LAYER_TRACE: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
     thread_local! { static STEP0_FROZEN: std::cell::RefCell<Vec<Vec<f32>>> = const { std::cell::RefCell::new(Vec::new()) }; }
@@ -1604,8 +1605,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // proj stays on device; strided_col_copy carves z/xbc/dt_raw on GPU;
                         // conv1d_causal_prefill + softplus_add_rows run the conv+silu+softplus
                         // without any dl/up. Saves ~42 MB of PCIe per Mamba layer per forward.
-                        // Gate: NEMOTRON_CONV_DEVICE=1. Default: host ring-conv (validated path).
-                        let use_conv_device = std::env::var("NEMOTRON_CONV_DEVICE").is_ok();
+                        // DEFAULT-ON for CUDA (the on-device-MoE prefill win requires it;
+                        // argmax-exact, ~2.5× over host ring-conv at S=2048 d0). Metal keeps
+                        // the host ring-conv (its validated path). Escapes:
+                        // NEMOTRON_CONV_DEVICE=1 forces on (Metal opt-in / explicit);
+                        // NEMOTRON_CONV_DEVICE_OFF=1 forces the host ring-conv on CUDA.
+                        let use_conv_device = std::env::var("NEMOTRON_CONV_DEVICE").is_ok()
+                            || (is_cuda && std::env::var("NEMOTRON_CONV_DEVICE_OFF").is_err());
                         if use_conv_device {
                             let proj_t = pf!(2, 2.0 * s as f64 * in_proj_out as f64 * hid as f64,
                                 qmm(&xn, &format!("{p}.mixer.in_proj.weight"))); // [s, in_proj_out] on device
@@ -1758,6 +1764,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let rl_all = dl(&pf!(10, 2.0 * s as f64 * n_exp as f64 * hid as f64, matmul(d, gate_w, &xn).unwrap()), s * n_exp);
                         // Per token: sigmoid+bias top-k → (expert, weight). Expand to
                         // S*top_k triples, then SORT by expert for the bm64 BGEMM.
+                        let _t_router = std::time::Instant::now();
                         let mut triples: Vec<(u32, usize, f32)> = Vec::with_capacity(s * top_k); // (expert, token, weight)
                         for ti in 0..s {
                             let rl = &rl_all[ti*n_exp..(ti+1)*n_exp];
@@ -1771,6 +1778,9 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // Stable sort by expert id → contiguous same-expert groups.
                         triples.sort_by_key(|t| t.0);
                         let mt = triples.len();
+                        if std::env::var("NEMOTRON_ROUTER_TIME").is_ok() {
+                            ROUTER_HOST_T.with(|c| c.set(c.get() + _t_router.elapsed().as_secs_f64()));
+                        }
                         // Expert GEMM mode flags (read early so they're in scope for gather).
                         let use_bgemm = std::env::var("NEMOTRON_BGEMM").is_ok();
                         // NEMOTRON_W4A16=1: W4A16 WMMA grouped GEMM (inline Q4 dequant,
@@ -1814,19 +1824,23 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         //   eliminates the 22MB dl(&xn) + 132MB host scatter per E-layer.
                         // Default: host download + gather (validated path).
                         let dev_gather = std::env::var("NEMOTRON_DEVICE_GATHER").is_ok();
-                        // NEMOTRON_ONDEVICE_MOE=1 (CUDA): keep the validated fewer_syncs
-                        // per-expert cuBLAS GEMM + on-device relu²/scatter, but ALSO gather
-                        // the sorted expert activation ON DEVICE (ffai_gather over xn rows →
-                        // [mt,hid] f16) instead of the dl(&xn)+host-scatter+per-expert
-                        // re-upload. Kills the ~22MB D2H × 23 host gather + the host scatter
-                        // loop — the remaining host wall in the conv-device prefill path.
-                        // Default OFF (host gather is the validated path).
+                        // ON-DEVICE MoE gather/scatter (DEFAULT-ON for CUDA): keep the
+                        // validated fewer_syncs per-expert cuBLAS GEMM + on-device
+                        // relu²/scatter, but ALSO gather the sorted expert activation ON
+                        // DEVICE (ffai_gather over xn rows → [mt,hid] f16) instead of the
+                        // dl(&xn)+host-scatter+per-expert re-upload, and keep the routed
+                        // accumulator on device through the shared-expert + residual merge.
+                        // Kills the ~22MB D2H × 23 host gather + host scatter + the
+                        // dl(acc)/upm(acc) round-trip — the dominant remaining host wall in
+                        // the conv-device prefill path. argmax-exact (1104/1120/1763),
+                        // bit-deterministic, +~70% e2e. Escape: NEMOTRON_ONDEVICE_MOE_OFF=1
+                        // reverts to the host-gather path.
                         // Only the default fewer_syncs per-expert path consumes the device
                         // gather; the BGEMM/W4A16/grouped/two_pass paths have their own xs
                         // handling, so don't hijack their gather when those are selected.
                         let two_pass_sel = is_cuda && std::env::var("NEMOTRON_TWO_PASS").is_ok();
                         let fewer_syncs_off = std::env::var("NEMOTRON_FEWER_SYNCS_OFF").is_ok();
-                        let ondevice_moe = is_cuda && std::env::var("NEMOTRON_ONDEVICE_MOE").is_ok()
+                        let ondevice_moe = is_cuda && std::env::var("NEMOTRON_ONDEVICE_MOE_OFF").is_err()
                             && !use_bgemm && !use_w4a16 && !use_grouped_gemm && !use_metal_grouped
                             && !two_pass_sel && !fewer_syncs_off;
                         // xs_dev_f16 is the device version (for DEV_GATHER or BGEMM paths).
@@ -1884,6 +1898,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let inv = 1.0f32 / 256.0;
                         // use_bgemm already defined above (before gather block).
                         let mut acc_h = vec![0.0f32; s * hid];
+                        // ONDEVICE_MOE: when the fewer_syncs scatter leaves the routed
+                        // accumulator on device, keep it here so the shared expert +
+                        // residual add stay on-device (no dl(acc)+upm(acc) round-trip).
+                        let mut acc_dev_keep: Option<Tensor> = None;
                         if use_w4a16 {
                             // ── W4A16 WMMA path (NEMOTRON_W4A16=1 or NEMOTRON_W4A16_MARLIN=1) ──
                             // Small S (mt ≤ W4A16_THRESH, standard path only): inline Q4 dequant
@@ -2195,7 +2213,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                         let _ = &tidx_dev;
                                         moe_scatter_add_det(d, &dn_f32, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
                                     }
-                                    acc_h = dl(&acc_dev, s * hid);
+                                    if ondevice_moe {
+                                        // Keep the routed accumulator on device — the shared
+                                        // expert + residual merge below consume it on-device.
+                                        acc_dev_keep = Some(acc_dev);
+                                    } else {
+                                        acc_h = dl(&acc_dev, s * hid);
+                                    }
                                     drop(keep_dn); let _ = (&up_all, &dn_all, &dn_f32);
                                 }
                             } else if two_pass {
@@ -2374,8 +2398,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let sd_h = dl(&cast_f16_f32(d, &sd).unwrap(), s * hid);
                             sd_h.iter().map(|&v| v * 256.0).collect()
                         };
-                        for i in 0..s*hid { acc_h[i] += sd_h[i]; }
-                        xt = add(d, &xt, &upm(&acc_h, vec![s, hid])).unwrap();
+                        if let Some(acc_dev) = acc_dev_keep.take() {
+                            // ONDEVICE_MOE: routed acc is already on device. Merge the
+                            // shared-expert output (host f32, overflow-safe) + residual
+                            // on device — no dl(acc)+host-add+upm(acc) round-trip.
+                            let sd_dev = upm(&sd_h, vec![s, hid]);
+                            let merged = add(d, &acc_dev, &sd_dev).unwrap();
+                            xt = add(d, &xt, &merged).unwrap();
+                        } else {
+                            for i in 0..s*hid { acc_h[i] += sd_h[i]; }
+                            xt = add(d, &xt, &upm(&acc_h, vec![s, hid])).unwrap();
+                        }
                     }
                     '*' => {
                         // Cast xn→f16 ONCE, reuse for q/k/v (NEMOTRON_FUSE_QKV) — else per-proj cast.
@@ -2647,16 +2680,23 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         { let mut cd = conv_dev.borrow_mut(); for c in cd.iter_mut() { *c = None; } }
         for s2 in ssm_state.iter_mut() { *s2 = None; }
         for kv in kvcache.iter_mut() { *kv = None; }
+        ROUTER_HOST_T.with(|c| c.set(0.0));
         let t_pf = Instant::now();
         let next = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
         d.synchronize().ok();
         let pf_s = t_pf.elapsed().as_secs_f64();
         let tps_batched = s as f64 / pf_s;
-        let conv_dev_on = std::env::var("NEMOTRON_CONV_DEVICE").is_ok();
+        let conv_dev_on = std::env::var("NEMOTRON_CONV_DEVICE").is_ok()
+            || (d.backend() == Backend::Cuda && std::env::var("NEMOTRON_CONV_DEVICE_OFF").is_err());
         let conv_dev_label = if conv_dev_on { "CONV_DEVICE=1" } else { "CONV_DEVICE=0(host)" };
+        let ondevice_moe_on = d.backend() == Backend::Cuda && std::env::var("NEMOTRON_ONDEVICE_MOE_OFF").is_err();
         eprintln!("──────── NemotronH-Nano BATCHED PREFILL on {plat} ────────");
-        eprintln!("  prefill  {s} tok in {pf_s:.3}s = {tps_batched:.2} tok/s ({:.2} ms/tok) [batched forward, {conv_dev_label}]", pf_s * 1000.0 / s as f64);
+        eprintln!("  prefill  {s} tok in {pf_s:.3}s = {tps_batched:.2} tok/s ({:.2} ms/tok) [batched forward, {conv_dev_label}, ONDEVICE_MOE={}]", pf_s * 1000.0 / s as f64, if ondevice_moe_on { "1" } else { "0" });
         eprintln!("  last-token argmax = {next}");
+        if std::env::var("NEMOTRON_ROUTER_TIME").is_ok() {
+            eprintln!("  host router loop (sigmoid+topk+sort, all E-layers) = {:.1} ms ({:.1}% of wall)",
+                ROUTER_HOST_T.with(|c| c.get()) * 1000.0, ROUTER_HOST_T.with(|c| c.get()) / pf_s * 100.0);
+        }
         eprintln!("──────────────────────────────────────────────────────────────");
         // Append to ~/prefill_overnight.log.
         {
