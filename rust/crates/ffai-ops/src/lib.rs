@@ -2032,6 +2032,9 @@ pub fn sdpa_multi_tc_varlen(
     k: &Tensor,
     v: &Tensor,
     seg_lo: &Tensor,        // [n_query] i32: abs KV start of each query's segment
+    seg_len: u32,           // packed segment length; if == KV-block size, enables
+                            // the per-block query-range SKIP (O((NL)^2)→O(NL^2)).
+                            // 0 (or != block size) → full-range (correct, no skip).
     head_dim: usize,
     n_q_heads: u32,
     base_kv: u32,
@@ -2092,15 +2095,21 @@ pub fn sdpa_multi_tc_varlen(
     let mut kb0 = 0usize;
     while kb0 < n_kv {
         let blk = bk.min(n_kv - kb0);
+        // Segment-skip: when each KV-block is exactly one packed segment
+        // (seg_len == bk), only that segment's query rows [kb0, kb0+blk) attend
+        // to this block — every other row masks to p=0. Restrict the expensive
+        // QKᵀ/PV tensor-core GEMMs to that range (O((NL)²)→O(NL²)); the cheap
+        // full-range softmax/merge correctly no-op the off-segment rows.
+        let (q_lo, q_cnt) = if seg_len != 0 && seg_len as usize == bk { (kb0, blk) } else { (0, sq) };
         for g in 0..nkv {
-            let q_off = g * hpg * sq * hd * 2;
+            let q_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
             let k_off = (g * n_kv + kb0) * hd * 2;
-            let s_off = g * hpg * sq * blk * 2;
+            let s_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
             dev.gemm_strided_batched_off(
                 qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
                 kh.buffer.as_ref(),     k_off, 0,
                 scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
-                sq, blk, hd, hpg, DType::F16)?;
+                q_cnt, blk, hd, hpg, DType::F16)?;
         }
         // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
         dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
@@ -2114,14 +2123,14 @@ pub fn sdpa_multi_tc_varlen(
             &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
             blk256(nkv*blk*hd), [256,1,1], 0, false)?;
         for g in 0..nkv {
-            let p_off = g * hpg * sq * blk * 2;
+            let p_off = g * hpg * sq * blk * 2 + q_lo * blk * 2;
             let v_off = g * hd * blk * 2;
-            let o_off = g * hpg * sq * hd * 2;
+            let o_off = g * hpg * sq * hd * 2 + q_lo * hd * 2;
             dev.gemm_strided_batched_off(
                 p_blk.buffer.as_ref(), p_off, (sq*blk) as i64 * el,
                 vt.buffer.as_ref(),    v_off, 0,
                 o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
-                sq, hd, blk, hpg, DType::F16)?;
+                q_cnt, hd, blk, hpg, DType::F16)?;
         }
         dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
             &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),

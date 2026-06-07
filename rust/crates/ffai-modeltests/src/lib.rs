@@ -1542,6 +1542,8 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     vec![nc], DType::U32);
                 (Some(seg_lo), Some(seg_reset))
             } else { (None, None) };
+            // Per-segment length (KV-block size) → enables the attention segment-skip.
+            let pk_seg_len: u32 = if packed { (s / n_seg) as u32 } else { 0 };
             // pf!(idx, flops, expr): sync-bracket + accumulate when profiling.
             macro_rules! pf { ($idx:expr, $flops:expr, $e:expr) => {{
                 if pf_on { d.synchronize().ok(); let _t0 = Instant::now(); let _r = $e; d.synchronize().ok();
@@ -2572,7 +2574,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let attn = if use_tc_attn {
                             if let Some(seg_lo) = seg_lo_dev.as_ref() {
                                 // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
-                                pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                                pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, pk_seg_len, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             } else {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                             }
