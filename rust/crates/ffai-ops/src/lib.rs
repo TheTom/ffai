@@ -596,6 +596,20 @@ pub fn kv_append(dev: &dyn Device, src: &Tensor, dst: &Tensor, posbuf: &Tensor, 
 /// Device slice `out[i] = src[off + i]` for `len` elements (no host round-trip).
 pub fn slice(dev: &dyn Device, src: &Tensor, off: usize, len: usize) -> Result<Tensor> {
     let k = cached_ir("ffai_slice", src.dtype, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_slice::kernel_ir_for(src.dtype); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    // Defensive bounds check. The kernel reads `src[off + i]` for i in [0, len),
+    // addressing a sub-slab purely via `off` against the RAW bound buffer (the
+    // tensor.offset is ignored by design). A caller binding a buffer that does
+    // not hold `off + len` elements triggers an out-of-bounds READ — silent
+    // garbage on Metal, a deterministic MMU-fault on CUDA. Fail loudly, naming
+    // the shapes, so the mis-sized caller is obvious on every backend.
+    let need = off + len; // max element read is src[off + len - 1]
+    let have = src.buffer.len() / src.dtype.size_bytes();
+    if need > have {
+        return Err(Error::Msg(format!(
+            "slice OOB: off={off} len={len} needs {need} {:?} elems but bound buffer holds {have}",
+            src.dtype
+        )));
+    }
     let out = Tensor::empty(dev, vec![len], src.dtype)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(off as u32), u(len as u32)], Grid { grid: [(len as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
@@ -712,6 +726,22 @@ pub fn strided_col_copy(
     width: usize,
 ) -> Result<Tensor> {
     let kernel = lookup("strided_col_copy", DType::F32)?;
+    // Defensive bounds check. The kernel reads `src[ti*stride + col_off + ci]`
+    // for ti in [0, s), ci in [0, width) — a sub-slab addressed purely via the
+    // host stride/col_off against the RAW bound buffer (tensor.offset ignored by
+    // design). A caller binding a row-stride/offset/width that overruns the
+    // bound buffer triggers an out-of-bounds READ — silent garbage on Metal, a
+    // deterministic MMU-fault on CUDA. Fail loudly, naming the shapes.
+    if s != 0 && width != 0 {
+        let need = (s - 1) * stride + col_off + width; // max read is src[need - 1]
+        let have = src.buffer.len() / DType::F32.size_bytes();
+        if need > have {
+            return Err(Error::Msg(format!(
+                "strided_col_copy OOB: s={s} stride={stride} col_off={col_off} width={width} \
+                 needs {need} f32 elems but bound buffer holds {have}"
+            )));
+        }
+    }
     let dst = Tensor::empty(dev, vec![s * width], DType::F32)?;
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     dev.dispatch(
@@ -4135,6 +4165,35 @@ pub fn moe_grouped_gemm(
     // Per-slot weight sizes (f16 elements).
     let up_slot = inter * hid;
     let dn_slot = hid * inter;
+
+    // Defensive bounds check on caller-supplied scratch pools. The chunked
+    // batched-dequant writes f16 expert weights to slot `c0..c1` of the scratch
+    // at byte offset `c0*{up,dn}_slot*2`, and the per-expert GEMM reads/writes
+    // `slot*{up,dn}_slot*2` — so the scratch MUST hold `n_active` full slots
+    // (`n_active*{up,dn}_slot` f16 elems). A caller binding an under-sized pool
+    // (e.g. sized for fewer active experts than this token batch routed to)
+    // triggers an out-of-bounds WRITE — silent corruption on Metal, a
+    // deterministic MMU-fault on CUDA. Fail loudly here, naming the shapes.
+    if let Some(scratch) = up_scratch {
+        let need = n_active * up_slot;
+        let have = scratch.buffer.len() / DType::F16.size_bytes();
+        if need > have {
+            return Err(Error::Msg(format!(
+                "moe_grouped_gemm OOB: up_scratch needs {need} f16 elems \
+                 (n_active={n_active} * inter={inter} * hid={hid}) but pool holds {have}"
+            )));
+        }
+    }
+    if let Some(scratch) = dn_scratch {
+        let need = n_active * dn_slot;
+        let have = scratch.buffer.len() / DType::F16.size_bytes();
+        if need > have {
+            return Err(Error::Msg(format!(
+                "moe_grouped_gemm OOB: dn_scratch needs {need} f16 elems \
+                 (n_active={n_active} * hid={hid} * inter={inter}) but pool holds {have}"
+            )));
+        }
+    }
 
     // NOTE: A grouped-batched cuBLAS variant (one cublasGemmGroupedBatchedEx per
     // pass instead of the per-expert gemm_tc_off loop) was measured on GB10 @
