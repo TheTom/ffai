@@ -2884,6 +2884,30 @@ extern "C" __global__ void moe_scatter_add_det_f32(
         acc[t * hid + h] = sum;
     }
 }
+
+// f16-input variant: reads the down-GEMM output directly as __half (no separate
+// cast_f16_f32 + [mt,hid] f32 materialization). Same deterministic CSR order.
+extern "C" __global__ void moe_scatter_add_det_f16(
+    const __half*   __restrict__ dn,
+    const int*      __restrict__ tok_starts,
+    const int*      __restrict__ tok_rows,
+    const float*    __restrict__ wts,
+    float*                       acc,
+    int s, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;
+    int h = (int)(blockIdx.y * BLOCK_H + threadIdx.x);
+    if (t < s && h < hid) {
+        float sum = 0.f;
+        int r0 = tok_starts[t];
+        int r1 = tok_starts[t + 1];
+        for (int j = r0; j < r1; ++j) {
+            int r = tok_rows[j];
+            sum += __half2float(dn[r * hid + h]) * (wts[r] * unscale);
+        }
+        acc[t * hid + h] = sum;
+    }
+}
 "#;
 
 /// Deterministic MoE scatter-add (drop-in for [`moe_scatter_add`] on the prefill
@@ -2903,6 +2927,7 @@ pub fn moe_scatter_add_det(
     mt: usize,
     hid: usize,
     unscale: f32,
+    in_f16: bool,       // true → `dn` is f16 (read directly, no cast_f16_f32)
 ) -> Result<()> {
     // Build CSR (tok_starts[s+1], tok_rows[mt]) grouping rows by token. Rows are
     // appended in ascending row order → fixed, deterministic accumulation order.
@@ -2931,7 +2956,7 @@ pub fn moe_scatter_add_det(
     dev.dispatch_raw_cuda(
         MOE_SCATTER_ADD_DET_SRC,
         "moe_scatter_add_det.cu",
-        "moe_scatter_add_det_f32",
+        if in_f16 { "moe_scatter_add_det_f16" } else { "moe_scatter_add_det_f32" },
         &[
             (dn.buffer.as_ref(), 0),
             (ts_dev.as_ref(),    0),

@@ -2073,7 +2073,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
                             } else {
                                 let _ = &tidx_dev2;
-                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, false).unwrap();
                             }
                             // Download accumulated output for residual add.
                             acc_h = dl(&acc_dev, s * hid);
@@ -2120,7 +2120,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
                             } else {
                                 let _ = &tidx_dev2;
-                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, false).unwrap();
                             }
                             acc_h = dl(&acc_dev, s * hid);
                         } else if use_metal_grouped {
@@ -2284,14 +2284,17 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let wts_dev = upm(&wts_h, vec![mt]);
                                     let tidx_dev = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
                                     let acc_dev = upm(&acc_h, vec![s, hid]); // acc_h all-zero here
-                                    let dn_f32 = cast_f16_f32(d, &dn_all).unwrap();
                                     // Deterministic scatter by default (atomicAdd is run-to-run
                                     // nondeterministic). NEMOTRON_ATOMIC_SCATTER=1 → old kernel.
+                                    // Default det path reads dn_all (f16) DIRECTLY — skips the
+                                    // per-layer cast_f16_f32 + [mt,hid] f32 materialization (~66MB
+                                    // write/layer). Atomic fallback still needs f32, cast lazily.
                                     if std::env::var("NEMOTRON_ATOMIC_SCATTER").is_ok() {
+                                        let dn_f32 = cast_f16_f32(d, &dn_all).unwrap();
                                         moe_scatter_add(d, &dn_f32, &tidx_dev, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
                                     } else {
                                         let _ = &tidx_dev;
-                                        moe_scatter_add_det(d, &dn_f32, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                                        moe_scatter_add_det(d, &dn_all, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32, true).unwrap();
                                     }
                                     if ondevice_moe {
                                         // Keep the routed accumulator on device — the shared
@@ -2300,7 +2303,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     } else {
                                         acc_h = dl(&acc_dev, s * hid);
                                     }
-                                    drop(keep_dn); let _ = (&up_all, &dn_all, &dn_f32);
+                                    drop(keep_dn); let _ = (&up_all, &dn_all);
                                 }
                             } else if two_pass {
                                 // ── Pass 1: All UP GEMMs (async, no sync between experts) ────
