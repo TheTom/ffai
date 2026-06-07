@@ -321,6 +321,22 @@ impl Device for CudaDevice {
         self.dev.gemm_cublas(xb.ptr, wb.ptr, ob.ptr, m, n, k, dtype).map_err(dispatch_err)
     }
 
+    fn gemm_tc_out_f32(
+        &self,
+        x: &dyn DeviceBuffer,
+        w: &dyn DeviceBuffer,
+        out: &dyn DeviceBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        ab_dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_out_f32: x not CudaBuffer".into()))?;
+        let wb = w.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_out_f32: w not CudaBuffer".into()))?;
+        let ob = out.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_tc_out_f32: out not CudaBuffer".into()))?;
+        self.dev.gemm_cublas_f32out(xb.ptr, wb.ptr, ob.ptr, m, n, k, ab_dtype).map_err(dispatch_err)
+    }
+
     fn gemm_tc_off(
         &self,
         x: &dyn DeviceBuffer, x_off: usize,

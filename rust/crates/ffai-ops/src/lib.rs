@@ -785,6 +785,28 @@ pub fn cast_f16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+/// Cast f32 → bf16. BF16 keeps f32's exponent range, so the residual stream
+/// (NEMOTRON_BF16_STREAM) doesn't overflow on NemotronH massive-activation
+/// channels the way f16 (max 65504) does.
+pub fn cast_f32_bf16(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
+    let k = cached_ir("ffai_cast_f32_bf16", DType::BF16, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_cast_f32_bf16::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let n = src.elem_count();
+    let out = Tensor::empty(dev, src.shape.clone(), DType::BF16)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
+/// Cast bf16 → f32 (widen the residual back for ops that need f32 input).
+pub fn cast_bf16_f32(dev: &dyn Device, src: &Tensor) -> Result<Tensor> {
+    let k = cached_ir("ffai_cast_bf16_f32", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_cast_bf16_f32::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
+    let n = src.elem_count();
+    let out = Tensor::empty(dev, src.shape.clone(), DType::F32)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    dev.dispatch(&k, &[Binding::Buffer(src.buffer.clone()), Binding::Buffer(out.buffer.clone()), u(n as u32)], Grid { grid: [(n as u32).div_ceil(256), 1, 1], block: [256, 1, 1] })?;
+    Ok(out)
+}
+
 /// Device Mamba dt: `softplus(dt_raw + dt_bias)` — no host round-trip.
 pub fn softplus_add(dev: &dyn Device, a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let k = cached_ir("ffai_softplus_add", DType::F32, || { let mut k = metaltile_std::ffai::gemv_q8::ffai_softplus_add::kernel_ir(); k.mode = metaltile_core::ir::KernelMode::Grid3D; k });
@@ -1369,6 +1391,35 @@ pub fn gemm_cublas(
     }
     let out = Tensor::empty(dev, vec![m, n], x.dtype)?;
     dev.gemm_tc(x.buffer.as_ref(), w.buffer.as_ref(), out.buffer.as_ref(), m, n, k, x.dtype)?;
+    Ok(out)
+}
+
+/// Same as [], but writes an **f32** output, fusing the post-GEMM
+/// `cast_f16_f32` into the matmul. `x`/`w` are f16/bf16; cuBLAS already
+/// accumulates in f32, so the only change is the D-layout type → no extra
+/// kernel, no MFU loss. Lets the model keep the residual stream f32 (required
+/// — f16/bf16 residual overflows/loses argmax) without a separate cast pass.
+/// CUDA-only; other backends error (model gates this on `is_cuda`).
+pub fn gemm_cublas_f32out(
+    dev: &dyn Device,
+    x: &Tensor,
+    w: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Tensor> {
+    if x.dtype != w.dtype {
+        return Err(Error::Msg(format!("gemm_cublas_f32out: x/w dtype mismatch {:?} vs {:?}", x.dtype, w.dtype)));
+    }
+    // A/B lever: FFAI_F32OUT_FALLBACK=1 reverts to the unfused path (f16-out GEMM
+    // + a separate `cast_f16_f32` kernel) so the fused vs unfused cast can be timed
+    // back-to-back under the same clock. Default = fused (no extra kernel).
+    if std::env::var("FFAI_F32OUT_FALLBACK").is_ok() {
+        let oh = gemm_cublas(dev, x, w, m, n, k)?;
+        return cast_f16_f32(dev, &oh);
+    }
+    let out = Tensor::empty(dev, vec![m, n], DType::F32)?;
+    dev.gemm_tc_out_f32(x.buffer.as_ref(), w.buffer.as_ref(), out.buffer.as_ref(), m, n, k, x.dtype)?;
     Ok(out)
 }
 

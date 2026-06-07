@@ -185,6 +185,24 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("gemm_tc (tensor-core GEMM) unsupported on this backend".into()))
     }
 
+    /// f16/bf16 inputs, **f32 output** — fuses the post-GEMM `cast_f16_f32` into
+    /// the matmul (cuBLAS writes the f32 result directly, accumulate is already
+    /// f32). `out` must be an f32 buffer of `[m,n]`. Default errors; CUDA
+    /// implements it via cublasLt with an f32 D layout.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_tc_out_f32(
+        &self,
+        _x: &dyn DeviceBuffer,
+        _w: &dyn DeviceBuffer,
+        _out: &dyn DeviceBuffer,
+        _m: usize,
+        _n: usize,
+        _k: usize,
+        _ab_dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_tc_out_f32 unsupported on this backend".into()))
+    }
+
     /// Byte-offset variant of []: same semantics but each buffer
     /// pointer is advanced by its byte offset before the GEMM call. Used to
     /// write expert GEMM outputs into pre-allocated slabs without extra copies.
