@@ -14,6 +14,9 @@ metaltile-runtime = { workspace = true, optional = true }
 [dev-dependencies]
 ffai-core.workspace = true
 metaltile-core.workspace = true
+ffai-models.workspace = true
+ffai-loader.workspace = true
+ffai-runtime.workspace = true
 
 [features]
 # Off by default so macOS / non-Vulkan hosts build the crate as a stub.
@@ -22,4 +25,12 @@ vulkan = ["dep:metaltile-core", "dep:metaltile-runtime", "metaltile-runtime/vulk
 
 [[test]]
 name = "vulkan_smoke"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_gguf_vulkan"
+required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_first_logit_diag"
 required-features = ["vulkan"]
