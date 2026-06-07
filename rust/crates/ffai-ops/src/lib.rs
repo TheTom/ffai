@@ -1315,7 +1315,11 @@ pub fn dequant_q4_off(
         kk
     });
     let u = |x: u32| Binding::Scalar(x.to_le_bytes().to_vec());
-    let grid = Grid::d1((n as u32).div_ceil(256), 256);
+    // 1 thread per u32 word → 8 outputs. Grid is over words (n/8), not values:
+    // amortises the qs/scale global traffic 8×. n is always a multiple of 8
+    // (k is a multiple of 32 → 4 words/block, 8 values/word).
+    let n_words = (n / 8) as u32;
+    let grid = Grid::d1(n_words.div_ceil(256), 256);
     dev.dispatch(
         &kern,
         &[
@@ -1323,7 +1327,7 @@ pub fn dequant_q4_off(
             Binding::Buffer(scales.buffer.clone()),
             Binding::Buffer(out.buffer.clone()),
             u(k as u32),
-            u(n as u32),
+            u(n_words),
             u(blk_off as u32),
         ],
         grid,
