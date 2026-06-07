@@ -161,75 +161,117 @@ pub fn ssm_prefill_scan_ssd_portable(
         dev.dispatch(&kern, &bindings, grid)
     };
 
+    // Optional per-phase profiler (env SSD_PHASE_PROF=1): synchronize + time
+    // each phase, bucketed into elementwise / intra-GEMM / inter-recur /
+    // state-GEMM. Zero cost when the env var is unset (default).
+    let phase_prof = std::env::var("SSD_PHASE_PROF").is_ok();
+    let t_pre = std::cell::Cell::new(0.0f64); // prologue elementwise (lcs/gather/xt)
+    let t_g1 = std::cell::Cell::new(0.0f64); // CB = C·Bᵀ  (intra)
+    let t_mmask = std::cell::Cell::new(0.0f64); // M = CB⊙mask (elementwise)
+    let t_g2 = std::cell::Cell::new(0.0f64); // y_intra = M·x (intra)
+    let t_bdt = std::cell::Cell::new(0.0f64); // BdT (elementwise)
+    let t_g3 = std::cell::Cell::new(0.0f64); // S_chunk = BdT·x (state)
+    let t_recur = std::cell::Cell::new(0.0f64); // serial inter-chunk recurrence
+    let t_g4 = std::cell::Cell::new(0.0f64); // CS = C·S_in (state)
+    let t_comb = std::cell::Cell::new(0.0f64); // combine (elementwise)
+    macro_rules! phase {
+        ($cell:expr, $body:expr) => {{
+            if phase_prof {
+                dev.synchronize()?;
+                let t0 = std::time::Instant::now();
+                let r = $body;
+                dev.synchronize()?;
+                $cell.set($cell.get() + t0.elapsed().as_secs_f64() * 1e6);
+                r
+            } else {
+                $body
+            }
+        }};
+    }
+
     // 1. Lcs cumsum: one thread per (chunk, head).
-    elem(
+    phase!(t_pre, elem(
         "ssd_lcs",
         &[dt, a_log, &lcs],
         &[u(tt), u(hh), u(ll), u(ncn)],
         bhc,
-    )?;
+    )?);
     // 2. Gather B/C (broadcast per head).
-    elem(
+    phase!(t_pre, elem(
         "ssd_gather_bc",
         &[b_mat, c_mat, &b_g, &c_g],
         &[u(tt), u(hh), u(gg), u(hpgn), u(ll), u(dsd), u(ncn)],
         bhc * l * dsu,
-    )?;
+    )?);
     // 3. Transpose x → xt [nc*H, dh, L].
-    elem(
+    phase!(t_pre, elem(
         "ssd_xt",
         &[x, &xt],
         &[u(tt), u(hh), u(dhd), u(ll), u(ncn)],
         bhc * dhu * l,
-    )?;
+    )?);
 
     // ── G1: CB = C · Bᵀ  [L,L] = C[L,ds]·B[L,ds]ᵀ. ────────────────────────
     // out[i,j] = Σ_s c_g[i,s]·b_g[j,s] → weight=b_g, input=c_g, k=ds.
-    gemm_b(&b_g, &c_g, &cb, l, l, dsu, l * dsu, l * dsu, l * l)?;
+    phase!(t_g1, gemm_b(&b_g, &c_g, &cb, l, l, dsu, l * dsu, l * dsu, l * l)?);
 
     // 4. M = CB ⊙ Lmask ⊙ dt[j], causal.
-    elem(
+    phase!(t_mmask, elem(
         "ssd_mmask",
         &[&cb, &lcs, dt, &mmask],
         &[u(tt), u(hh), u(ll), u(ncn)],
         bhc * l * l,
-    )?;
+    )?);
 
     // ── G2: y_intra = M · x  [L,dh]. out[i,p]=Σ_j mmask[i,j]·xt[p,j],
     //        weight=xt[dh,L], input=mmask[L,L], k=L. ─────────────────────────
-    gemm_b(&xt, &mmask, &y_intra, l, dhu, l, dhu * l, l * l, l * dhu)?;
+    phase!(t_g2, gemm_b(&xt, &mmask, &y_intra, l, dhu, l, dhu * l, l * l, l * dhu)?);
 
     // 5. BdT[s,j] = decay·dt·B  [ds,L].
-    elem(
+    phase!(t_bdt, elem(
         "ssd_bdt",
         &[b_mat, &lcs, dt, &bdt],
         &[u(tt), u(hh), u(gg), u(hpgn), u(ll), u(dsd), u(ncn)],
         bhc * dsu * l,
-    )?;
+    )?);
 
     // ── G3: S_chunk = BdT · xt-form  [ds,dh]. out[s,p]=Σ_j bdt[s,j]·xt[p,j],
     //        weight=xt[dh,L], input=bdt[ds,L], k=L. ─────────────────────────
-    gemm_b(&xt, &bdt, &s_chunk, dsu, dhu, l, dhu * l, dsu * l, dsu * dhu)?;
+    phase!(t_g3, gemm_b(&xt, &bdt, &s_chunk, dsu, dhu, l, dhu * l, dsu * l, dsu * dhu)?);
 
     // 6. Serial inter-chunk recurrence → SinT [nc*H, dh, ds] + state_out.
-    elem(
+    phase!(t_recur, elem(
         "ssd_recur",
         &[&s_chunk, &lcs, state_in, &sin_t, &state_out],
         &[u(hh), u(dhd), u(dsd), u(ll), u(ncn)],
         h * dsu * dhu,
-    )?;
+    )?);
 
     // ── G4: CS = C · S_in  [L,dh]. out[i,p]=Σ_s c_g[i,s]·sin_t[p,s],
     //        weight=sin_t[dh,ds], input=c_g[L,ds], k=ds. ───────────────────
-    gemm_b(&sin_t, &c_g, &cs, l, dhu, dsu, dhu * dsu, l * dsu, l * dhu)?;
+    phase!(t_g4, gemm_b(&sin_t, &c_g, &cs, l, dhu, dsu, dhu * dsu, l * dsu, l * dhu)?);
 
     // 7. Combine → y [T,H,dh] f32.
-    elem(
+    phase!(t_comb, elem(
         "ssd_combine",
         &[&y_intra, &cs, &lcs, x, d_skip, &y],
         &[u(tt), u(hh), u(dhd), u(ll), u(ncn)],
         bhc * l * dhu,
-    )?;
+    )?);
+
+    if phase_prof {
+        let intra = t_g1.get() + t_g2.get();
+        let state = t_g3.get() + t_g4.get();
+        let elemw = t_pre.get() + t_mmask.get() + t_bdt.get() + t_comb.get();
+        let tot = intra + state + elemw + t_recur.get();
+        eprintln!(
+            "    [SSD phase L={l} nc={nc}] intra-GEMM(G1+G2)={:.1}us({:.0}%) state-GEMM(G3+G4)={:.1}us({:.0}%) elementwise={:.1}us({:.0}%) inter-recur={:.1}us({:.0}%) | G1(CB)={:.1} G2(y)={:.1} G3(Sc)={:.1} G4(CS)={:.1} pre={:.1} mmask={:.1} bdt={:.1} comb={:.1}",
+            intra, intra / tot * 100.0, state, state / tot * 100.0,
+            elemw, elemw / tot * 100.0, t_recur.get(), t_recur.get() / tot * 100.0,
+            t_g1.get(), t_g2.get(), t_g3.get(), t_g4.get(),
+            t_pre.get(), t_mmask.get(), t_bdt.get(), t_comb.get(),
+        );
+    }
 
     Ok((state_out, y))
 }
