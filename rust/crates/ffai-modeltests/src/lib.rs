@@ -909,26 +909,31 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                 let moe_down_name = format!("{p}.moe_down_all");
                 let use_marlin_layout = std::env::var("NEMOTRON_W4A16_MARLIN").is_ok();
                 // Helper: optionally permute qs to Marlin layout before GPU upload.
-                let maybe_marlin_up = |qs: &[u32]| -> Vec<u32> {
-                    if use_marlin_layout { permute_q4_to_marlin(qs, n_exp, inter, hid) } else { qs.to_vec() }
-                };
-                let maybe_marlin_dn = |qs: &[u32]| -> Vec<u32> {
-                    if use_marlin_layout { permute_q4_to_marlin(qs, n_exp, hid, inter) } else { qs.to_vec() }
-                };
+                // (Marlin permute applied inline below under `_marlin` keys.)
                 let (mup_hit, mdown_hit) = (cache_read(&moe_up_name), cache_read(&moe_down_name));
                 if let (Some((uqb, usb, cm, ck, _)), Some((dqb, dsb, dm, dk, _))) = (mup_hit, mdown_hit) {
                     if cm == n_exp * inter && ck == hid && dm == n_exp * hid && dk == inter {
                         // Reconstruct qs vecs from cached bytes for optional Marlin permutation.
                         let uqs_std: Vec<u32> = uqb.chunks_exact(4).map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
                         let dqs_std: Vec<u32> = dqb.chunks_exact(4).map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
-                        let uqs_final = maybe_marlin_up(&uqs_std);
-                        let dqs_final = maybe_marlin_dn(&dqs_std);
-                        let ut = Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32);
+                        // STANDARD layout under base keys (sequential step path needs std).
+                        let ut = Tensor::new(d.upload(&tbu(&uqs_std)).unwrap(), vec![uqs_std.len()], DType::U32);
                         let ust = Tensor::new(d.upload(&usb).unwrap(), vec![usb.len() / 2], DType::F16);
-                        let dt2 = Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32);
+                        let dt2 = Tensor::new(d.upload(&tbu(&dqs_std)).unwrap(), vec![dqs_std.len()], DType::U32);
                         let dst2 = Tensor::new(d.upload(&dsb).unwrap(), vec![dsb.len() / 2], DType::F16);
-                        qw.insert(moe_up_name, (ut, ust, n_exp * inter, hid));
-                        qw.insert(moe_down_name, (dt2, dst2, n_exp * hid, inter));
+                        qw.insert(moe_up_name.clone(), (ut, ust, n_exp * inter, hid));
+                        qw.insert(moe_down_name.clone(), (dt2, dst2, n_exp * hid, inter));
+                        // MARLIN layout under `_marlin` keys (batched Marlin path only).
+                        if use_marlin_layout {
+                            let uqs_mar = permute_q4_to_marlin(&uqs_std, n_exp, inter, hid);
+                            let dqs_mar = permute_q4_to_marlin(&dqs_std, n_exp, hid, inter);
+                            qw.insert(format!("{moe_up_name}_marlin"),
+                                (Tensor::new(d.upload(&tbu(&uqs_mar)).unwrap(), vec![uqs_mar.len()], DType::U32),
+                                 Tensor::new(d.upload(&usb).unwrap(), vec![usb.len() / 2], DType::F16), n_exp * inter, hid));
+                            qw.insert(format!("{moe_down_name}_marlin"),
+                                (Tensor::new(d.upload(&tbu(&dqs_mar)).unwrap(), vec![dqs_mar.len()], DType::U32),
+                                 Tensor::new(d.upload(&dsb).unwrap(), vec![dsb.len() / 2], DType::F16), n_exp * hid, inter));
+                        }
                     } else {
                         // Dimension mismatch — fall through to rebuild.
                         let (mut uqs, mut usc, mut dqs, mut dsc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -940,10 +945,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         }
                         cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
                         cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
-                        let uqs_final = maybe_marlin_up(&uqs);
-                        let dqs_final = maybe_marlin_dn(&dqs);
-                        qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
-                        qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                        // STANDARD layout under base keys (sequential step path).
+                        qw.insert(moe_up_name.clone(), (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                        qw.insert(moe_down_name.clone(), (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                        if use_marlin_layout {
+                            let uqs_mar = permute_q4_to_marlin(&uqs, n_exp, inter, hid);
+                            let dqs_mar = permute_q4_to_marlin(&dqs, n_exp, hid, inter);
+                            qw.insert(format!("{moe_up_name}_marlin"), (Tensor::new(d.upload(&tbu(&uqs_mar)).unwrap(), vec![uqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                            qw.insert(format!("{moe_down_name}_marlin"), (Tensor::new(d.upload(&tbu(&dqs_mar)).unwrap(), vec![dqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                        }
                     }
                 } else {
                     // Cache miss: build + cache.
@@ -956,10 +966,15 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                     }
                     cache_write(&moe_up_name, &uqs, &usc, n_exp * inter, hid, true);
                     cache_write(&moe_down_name, &dqs, &dsc, n_exp * hid, inter, true);
-                    let uqs_final = maybe_marlin_up(&uqs);
-                    let dqs_final = maybe_marlin_dn(&dqs);
-                    qw.insert(moe_up_name, (Tensor::new(d.upload(&tbu(&uqs_final)).unwrap(), vec![uqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
-                    qw.insert(moe_down_name, (Tensor::new(d.upload(&tbu(&dqs_final)).unwrap(), vec![dqs_final.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                    // STANDARD layout under base keys (sequential step path).
+                    qw.insert(moe_up_name.clone(), (Tensor::new(d.upload(&tbu(&uqs)).unwrap(), vec![uqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                    qw.insert(moe_down_name.clone(), (Tensor::new(d.upload(&tbu(&dqs)).unwrap(), vec![dqs.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                    if use_marlin_layout {
+                        let uqs_mar = permute_q4_to_marlin(&uqs, n_exp, inter, hid);
+                        let dqs_mar = permute_q4_to_marlin(&dqs, n_exp, hid, inter);
+                        qw.insert(format!("{moe_up_name}_marlin"), (Tensor::new(d.upload(&tbu(&uqs_mar)).unwrap(), vec![uqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&usc)).unwrap(), vec![usc.len()], DType::F16), n_exp * inter, hid));
+                        qw.insert(format!("{moe_down_name}_marlin"), (Tensor::new(d.upload(&tbu(&dqs_mar)).unwrap(), vec![dqs_mar.len()], DType::U32), Tensor::new(d.upload(&tb_f16(&dsc)).unwrap(), vec![dsc.len()], DType::F16), n_exp * hid, inter));
+                    }
                 }
                 // NVFP4 recipe: shared-expert up/down → Q8.
                 if use_nvfp4_recipe {
@@ -1944,12 +1959,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
                                 let dn_out_f16 = if use_w4a16_marlin {
                                     // Marlin coalesced path (NEMOTRON_W4A16_MARLIN=1):
-                                    // weights are in Marlin tile-major layout (pre-permuted at load).
+                                    // read the MARLIN-layout copies under the `_marlin`
+                                    // keys, NOT the base standard-layout weights that the
+                                    // sequential step path (moe_fused_ffn) consumes.
+                                    let (muqs, musc, _, _) = &qw[&format!("{p}.moe_up_all_marlin")];
+                                    let (mdqs, mdsc, _, _) = &qw[&format!("{p}.moe_down_all_marlin")];
                                     let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
-                                        moe_w4a16_marlin(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                                        moe_w4a16_marlin(d, &xs_f16, muqs, musc, &idx_dev, mt, inter, hid).unwrap());
                                     let up_relu2 = pf!(3, 0.0, relu2_scale_f16(d, &up_out, inv).unwrap());
                                     pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
-                                        moe_w4a16_marlin(d, &up_relu2, dqs, dsc, &idx_dev, mt, hid, inter).unwrap())
+                                        moe_w4a16_marlin(d, &up_relu2, mdqs, mdsc, &idx_dev, mt, hid, inter).unwrap())
                                 } else {
                                     // Standard scattered-nibble W4A16 path (NEMOTRON_W4A16=1)
                                     let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
