@@ -1324,6 +1324,23 @@ pub fn dequant_q4_off(
 ) -> Result<Tensor> {
     use metaltile_core::ir::KernelMode;
     let n = m * k;
+    // Defensive bounds check. The kernel addresses sub-slabs purely via blk_off
+    // against the RAW bound buffers, reading up to qs[(blk_off + m*bpr - 1)*4 + 3]
+    // and scales[blk_off + m*bpr - 1]. If a caller binds a buffer that doesn't
+    // actually hold blk_off+slab blocks (an under-sized scratch / per-expert pool),
+    // that is an out-of-bounds READ — silent garbage on Metal, a deterministic
+    // MMU-fault (Xid 31 VIRT_READ) on CUDA. Fail loudly here, naming the shapes,
+    // so the mis-sized caller is obvious on every backend.
+    let bpr = k / 32;
+    let need_blocks = blk_off + m * bpr;
+    let have_qs_blocks = qs.buffer.len() / 16; // 4 u32 words/block * 4 B/word
+    let have_sc_blocks = scales.buffer.len() / 2; // f16 scale/block
+    if need_blocks > have_qs_blocks || need_blocks > have_sc_blocks {
+        return Err(Error::Msg(format!(
+            "dequant_q4_off OOB: m={m} k={k} blk_off={blk_off} needs {need_blocks} Q4 blocks \
+             but bound buffers hold qs={have_qs_blocks} scales={have_sc_blocks} blocks"
+        )));
+    }
     let out = Tensor::empty(dev, vec![m, k], out_dtype)?;
     let kern = cached_ir("ffai_dequant_q4", out_dtype, || {
         let mut kk = metaltile_std::ffai::ffai_dequant_q4::ffai_dequant_q4::kernel_ir_for(out_dtype);
