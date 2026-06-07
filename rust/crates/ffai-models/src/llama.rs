@@ -532,6 +532,33 @@ impl Q8Mat {
     fn matvec(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
         ops::gemv_q8(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
     }
+
+    /// Batched `out[n_rows, m] = x[n_rows, k] · Wqᵀ` via the resident-Q8
+    /// cooperative-matrix GEMM (`gemm_q8_mpp`). This is the **prefill** path:
+    /// all `n_rows` prompt tokens projected in one dispatch (vs `n_rows`×
+    /// `matvec`), and on Vulkan/RDNA4 it lights up the coopmat fragment ops when
+    /// `MT_VK_COOPMAT=1`. Returns `[n_rows, m]`.
+    ///
+    /// Debug: `FFAI_PREFILL_GEMV=1` routes the batched projection through a
+    /// per-row `gemv_q8` loop instead (the proven decode kernel), to A/B the
+    /// GEMM path against attention/rope when isolating a prefill correctness bug.
+    fn gemm(&self, dev: &dyn Device, x: &Tensor, n_rows: usize) -> Result<Tensor> {
+        if std::env::var("FFAI_PREFILL_GEMV").map(|v| v == "1").unwrap_or(false) {
+            // Per-row gemv_q8: slice each token's [k] activation, matvec, stack.
+            let mut rows: Vec<u8> = Vec::with_capacity(n_rows * self.m * 4);
+            for r in 0..n_rows {
+                let xr = ops::slice(dev, &x.reshaped(vec![n_rows * self.k]), r * self.k, self.k)?;
+                let yr = ops::gemv_q8(dev, &self.qs, &self.scales, &xr, self.m, self.k, self.m)?;
+                dev.synchronize()?;
+                let mut yb = vec![0u8; self.m * 4];
+                dev.download(yr.buffer.as_ref(), &mut yb)?;
+                rows.extend_from_slice(&yb);
+            }
+            let buf = dev.upload(&rows)?;
+            return Ok(Tensor::new(buf, vec![n_rows, self.m], ffai_core::DType::F32));
+        }
+        ops::gemm_q8_mpp(dev, &self.qs, &self.scales, x, n_rows, self.m, self.k)
+    }
 }
 
 /// Per-layer resident-Q8 matmul weights (the 7 big projections). Norms/biases
@@ -1003,6 +1030,134 @@ impl GgufModel {
             Some(q8) => q8.lm_head.matvec(dev, &xn)?,
             None => ops::gemv(dev, &self.weights.lm_head, &xn)?,
         };
+        dev.synchronize()?;
+        let mut bytes = vec![0u8; self.vocab * 4];
+        dev.download(logits.buffer.as_ref(), &mut bytes)?;
+        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    /// Batched **prefill**: process all `tokens` at positions `[start, start+S)`
+    /// in ONE forward, writing their K/V into the cache, and return the next-token
+    /// logits (the last row's `[vocab]`). This is the prefill counterpart of the
+    /// per-token [`step`]: instead of `S` sequential `step()` calls (each doing
+    /// `gemv_q8` matvecs), the seven projections + lm_head run as batched
+    /// `[S, k]·Wᵀ` GEMMs through [`ffai_ops::gemm_q8_mpp`] — the SimdGroup CoopTile
+    /// kernel that picks up `VK_KHR_cooperative_matrix` on Vulkan/RDNA4 when
+    /// `MT_VK_COOPMAT=1`. Only the resident-Q8 path is GEMM-routed; without Q8
+    /// weights it falls back to the per-token loop (f32 dense decode).
+    ///
+    /// Requires `head_dim == 128` (the `sdpa_multi` prefill-attention kernel).
+    /// Positions must fit the KV-cache capacity (`start + S <= cap`).
+    pub fn prefill(&self, dev: &dyn Device, tokens: &[u32], start: usize) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let s = tokens.len();
+        // Fall back to the proven per-token path when the GEMM prereqs aren't met
+        // (no resident-Q8 weights, single token, or non-128 head_dim).
+        if self.q8.is_none() || s <= 1 || cfg.head_dim != 128 {
+            let mut last = Vec::new();
+            for (i, &t) in tokens.iter().enumerate() {
+                last = self.step(dev, t, start + i)?;
+            }
+            return Ok(last);
+        }
+        let hd = cfg.head_dim;
+        let cap = self.cap;
+        let nkv = cfg.n_kv_heads;
+        let nq = cfg.n_q_heads;
+        let q8w = self.q8.as_ref().unwrap();
+
+        // Embed all S tokens → x [S, hidden].
+        let ids = Tensor::new(
+            dev.upload(u32_bytes(tokens))?,
+            vec![s],
+            ffai_core::DType::U32,
+        );
+        let mut x = ops::gather(dev, &self.weights.embed, &ids)?.reshaped(vec![s, cfg.hidden]);
+
+        // Positions [start, start+S) for batched RoPE + KV append.
+        let pos_vec: Vec<u32> = (0..s).map(|i| (start + i) as u32).collect();
+        let positions = Tensor::new(
+            dev.upload(u32_bytes(&pos_vec))?,
+            vec![s],
+            ffai_core::DType::U32,
+        );
+
+        for l in 0..self.n_layers {
+            let w = &self.weights.layers[l];
+            let q8 = &q8w.layers[l];
+            // ── attention ──────────────────────────────────────────────
+            let h = ops::rms_norm(dev, &x, &w.attn_norm, cfg.eps)?; // [S, hidden]
+            let mut q = q8.wq.gemm(dev, &h, s)?; // [S, nq*hd]  — coopmat GEMM
+            let mut k = q8.wk.gemm(dev, &h, s)?; // [S, nkv*hd]
+            let mut v = q8.wv.gemm(dev, &h, s)?; // [S, nkv*hd]
+            if cfg.attn_bias {
+                q = ops::add_bias_rows(dev, &q, w.bias_q.as_ref().unwrap(), s, nq * hd)?;
+                k = ops::add_bias_rows(dev, &k, w.bias_k.as_ref().unwrap(), s, nkv * hd)?;
+                v = ops::add_bias_rows(dev, &v, w.bias_v.as_ref().unwrap(), s, nkv * hd)?;
+            }
+            // Optional Qwen3 per-head Q/K RMSNorm (rms_norm normalizes the last
+            // dim, so a [S*heads, head_dim] view is correct per (token,head)).
+            let (q, k) = if cfg.qk_norm {
+                let qv = q.reshaped(vec![s * nq, hd]);
+                let kv = k.reshaped(vec![s * nkv, hd]);
+                (
+                    ops::rms_norm(dev, &qv, w.q_norm.as_ref().unwrap(), cfg.eps)?,
+                    ops::rms_norm(dev, &kv, w.k_norm.as_ref().unwrap(), cfg.eps)?,
+                )
+            } else {
+                (q, k)
+            };
+            // Batched RoPE over [S, heads, hd] (one dispatch each for Q and K).
+            let q = ops::rope_llama_many(dev, &q.reshaped(vec![s, nq, hd]), &positions, nq, hd, cfg.rope_theta, 1.0, 1.0, 1.0, 1e9)?;
+            let k = ops::rope_llama_many(dev, &k.reshaped(vec![s, nkv, hd]), &positions, nkv, hd, cfg.rope_theta, 1.0, 1.0, 1.0, 1e9)?;
+            let v = v.reshaped(vec![s, nkv, hd]);
+
+            // Append all S tokens' K/V into the cache in two batched dispatches,
+            // then attend the whole block in ONE `sdpa_multi` flash dispatch.
+            // `sdpa_multi` (causal) makes query `r` attend `[0, base_kv+r+1)`;
+            // with `base_kv = start` that is the causal prefix `[0, start+r]` —
+            // exactly the per-query `sdpa_decode` loop this replaced, but in a
+            // single grid (`[n_q_heads*n_query]` workgroups) with no per-row
+            // host download/upload round-trip. Validated bit-accurate on the
+            // Vulkan backend by `metaltile-std/tests/vulkan_sdpa_multi.rs`
+            // (prefill + GQA shapes) and the auto corpus.
+            ops::kv_append_many(dev, &k, &positions, &self.kcache[l], nkv, hd, cap)?;
+            ops::kv_append_many(dev, &v, &positions, &self.vcache[l], nkv, hd, cap)?;
+            let attn = ops::sdpa_multi(
+                dev,
+                &q.reshaped(vec![s * nq * hd]),
+                &self.kcache[l].reshaped(vec![nkv * cap * hd]),
+                &self.vcache[l].reshaped(vec![nkv * cap * hd]),
+                hd,
+                nq as u32,
+                start as u32, // base_kv
+                s as u32,     // n_query
+                cap as u32,   // kv_stride
+                cfg.heads_per_group(),
+                true, // causal
+                cfg.attn_scale(),
+            )?; // [s, nq, hd]
+            let attn_o = attn.reshaped(vec![s, nq * hd]);
+            let o = q8.wo.gemm(dev, &attn_o, s)?; // [S, hidden]  — coopmat GEMM
+            x = ops::add(dev, &x.reshaped(vec![s * cfg.hidden]), &o.reshaped(vec![s * cfg.hidden]))?
+                .reshaped(vec![s, cfg.hidden]);
+
+            // ── MLP (SwiGLU) ───────────────────────────────────────────
+            let h2 = ops::rms_norm(dev, &x, &w.mlp_norm, cfg.eps)?; // [S, hidden]
+            let gate = q8.w_gate.gemm(dev, &h2, s)?; // [S, ffn]
+            let up = q8.w_up.gemm(dev, &h2, s)?;     // [S, ffn]
+            let act = ops::swiglu(dev, &gate, &up)?; // [S, ffn]
+            let down = q8.w_down.gemm(dev, &act, s)?; // [S, hidden]
+            x = ops::add(dev, &x.reshaped(vec![s * cfg.hidden]), &down.reshaped(vec![s * cfg.hidden]))?
+                .reshaped(vec![s, cfg.hidden]);
+        }
+
+        // Final norm over all rows, then lm_head on the LAST token only (the
+        // next-token logits). Slice the last hidden row on-device so the lm_head
+        // stays a single matvec, matching the per-token decode path's final step.
+        let xn = ops::rms_norm(dev, &x, &self.weights.final_norm, cfg.eps)?; // [S, hidden]
+        let last_xn = ops::slice(dev, &xn.reshaped(vec![s * cfg.hidden]), (s - 1) * cfg.hidden, cfg.hidden)?;
+        let logits = q8w.lm_head.matvec(dev, &last_xn)?;
         dev.synchronize()?;
         let mut bytes = vec![0u8; self.vocab * 4];
         dev.download(logits.buffer.as_ref(), &mut bytes)?;

@@ -530,6 +530,153 @@ pub fn gemv_q8(
     Ok(out)
 }
 
+/// Batched Q8 GEMM — the **prefill** projection path. `out[r,o] = Σ_k W[o,k]·x[r,k]`
+/// for `n_rows` tokens at once, dispatching metaltile's `ffai_gemm_q8_mpp`
+/// (SimdGroup-scope CoopTile 64×64×32 tile). On the Vulkan/RDNA4 backend this
+/// kernel picks up the gated `VK_KHR_cooperative_matrix` fragment ops when
+/// `MT_VK_COOPMAT=1` (≈6× the scalar GEMM) — the realized prefill win. With the
+/// gate unset it runs the bit-exact scalar `SoftwareLocalC` tiles. Either way it
+/// replaces the `n_rows`× sequential `gemv_q8` matvecs of the per-token path.
+///
+/// The coopmat staging tiles are fp16, so the activation/output are carried as
+/// f16 across the kernel: `x` (f32 `[n_rows, k_in]`) is cast to f16 on entry and
+/// the f16 result is widened back to f32 `[n_rows, m_out]` so the rest of the
+/// f32 forward graph is unchanged. Weight layout (`qs`/`scales`) is identical to
+/// [`gemv_q8`] (dense, `rows_per_group = m_out`). `k_in` must be a multiple of 32.
+pub fn gemm_q8_mpp(
+    dev: &dyn Device,
+    qs: &Tensor,
+    scales: &Tensor,
+    x: &Tensor,
+    n_rows: usize,
+    m_out: usize,
+    k_in: usize,
+) -> Result<Tensor> {
+    if k_in % 32 != 0 {
+        return Err(Error::Msg(format!("gemm_q8_mpp: k_in {k_in} must be a multiple of 32")));
+    }
+    // Coopmat fragments stage through fp16 → drive the kernel at f16. Cast the
+    // f32 residual-stream activations in, widen the result back out.
+    let xf16 = if x.dtype == DType::F16 { x.clone() } else { cast_f32_f16(dev, x)? };
+    // `ffai_gemm_q8_mpp` in Reduction mode (matches the metaltile coopmat test
+    // + bench). Buffer order: x, qs, d_f32, out; constexpr n_rows, out_dim, k_in.
+    let k = cached_ir("ffai_gemm_q8_mpp", DType::F16, || {
+        let mut k = metaltile_std::ffai::gemm_q8_mpp::ffai_gemm_q8_mpp::kernel_ir_for(DType::F16);
+        k.mode = metaltile_core::ir::KernelMode::Reduction;
+        k
+    });
+    let out = Tensor::empty(dev, vec![n_rows * m_out], DType::F16)?;
+    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
+    // grid (threadgroups) = [ceil(out_dim/64), ceil(n_rows/64), 1], tg [128,1,1].
+    let grid = Grid {
+        grid: [(m_out as u32).div_ceil(64), (n_rows as u32).div_ceil(64), 1],
+        block: [128, 1, 1],
+    };
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(xf16.buffer.clone()),
+            Binding::Buffer(qs.buffer.clone()),
+            Binding::Buffer(scales.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            u(n_rows as u32),
+            u(m_out as u32),
+            u(k_in as u32),
+        ],
+        grid,
+    )?;
+    let out_f32 = cast_f16_f32(dev, &out)?;
+    Ok(out_f32.reshaped(vec![n_rows, m_out]))
+}
+
+/// Broadcast-add a per-feature bias `[n]` across every row of `x [n_rows, n]`:
+/// `out[r,o] = x[r,o] + bias[o]`. The decode path adds a `[n]` bias to a single
+/// `[n]` projection with plain [`add`]; the batched prefill path needs the same
+/// bias on every token row, but [`add`] is shape-strict (no broadcast). This is
+/// a fully on-device elementwise kernel (`out[i] = x[i] + bias[i % n]`) — no
+/// host round-trip, so it works on device-local (non-mappable) weight buffers.
+/// Returns `[n_rows, n]` f32.
+pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize, n: usize) -> Result<Tensor> {
+    // Fully on-device per-feature bias broadcast: `i = ProgramId(0)` (global
+    // flat id), row-local column `col = i % n`, `out[i] = x[i] + bias[col]`.
+    // `n` is a CONSTEXPR push-constant (bound as a `Binding::Scalar`) — NOT a
+    // baked `Op::Const` literal — so the one cached `ffai_add_bias_rows`
+    // pipeline serves every projection width (q: nq*hd, k/v: nkv*hd) instead
+    // of silently reusing the first call's `n`. The DSL `%` lowers to
+    // `BinOpKind::Mod` → GLSL `uint(i) % uint(n)` (integer modulo), validated
+    // bit-exact on Vulkan by `metaltile-std/tests/vulkan_add_bias_rows.rs`.
+    // No host round-trip — runs straight on the device-local weight buffer.
+    use metaltile_core::ir::ConstExprDecl;
+    use metaltile_core::ConstExpr;
+    let total = n_rows * n;
+    let out = Tensor::empty(dev, vec![total], DType::F32)?;
+    let mut k = Kernel::new("ffai_add_bias_rows");
+    for (pname, is_out) in [("x", false), ("bias", false), ("out", true)] {
+        k.params.push(Param {
+            name: pname.into(),
+            dtype: DType::F32,
+            shape: Shape::scalar(),
+            is_output: is_out,
+            kind: ParamKind::Tensor,
+        });
+    }
+    k.constexprs.push(ConstExprDecl {
+        name: ConstExpr::new("n"),
+        dtype: DType::U32,
+        value: None,
+    });
+    // SSA: 0=i, 1=n, 2=col, 3=x[i], 4=bias[col], 5=sum.
+    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
+    k.body.push_op(
+        Op::Load { src: "n".into(), indices: vec![], mask: None, other: None },
+        ValueId::new(1),
+    );
+    k.body.push_op(
+        Op::BinOp { op: BinOpKind::Mod, lhs: ValueId::new(0), rhs: ValueId::new(1) },
+        ValueId::new(2),
+    );
+    k.body.push_op(
+        Op::Load {
+            src: "x".into(),
+            indices: vec![IndexExpr::Value(ValueId::new(0))],
+            mask: None,
+            other: None,
+        },
+        ValueId::new(3),
+    );
+    k.body.push_op(
+        Op::Load {
+            src: "bias".into(),
+            indices: vec![IndexExpr::Value(ValueId::new(2))],
+            mask: None,
+            other: None,
+        },
+        ValueId::new(4),
+    );
+    k.body.push_op(
+        Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(3), rhs: ValueId::new(4) },
+        ValueId::new(5),
+    );
+    k.body.push_op_no_result(Op::Store {
+        dst: "out".into(),
+        indices: vec![IndexExpr::Value(ValueId::new(0))],
+        value: ValueId::new(5),
+        mask: None,
+    });
+    let grid = Grid::d1((total as u32).div_ceil(256), 256);
+    dev.dispatch(
+        &k,
+        &[
+            Binding::Buffer(x.buffer.clone()),
+            Binding::Buffer(bias.buffer.clone()),
+            Binding::Buffer(out.buffer.clone()),
+            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
+        ],
+        grid,
+    )?;
+    Ok(out.reshaped(vec![n_rows, n]))
+}
+
 /// Q8 gemv with fused ReLU²: `out[r] = max(0, (Wq·x)[r])²` — a MoE expert's
 /// `up` projection + activation in one dispatch. Dispatches `ffai_gemv_q8_coalesced_relu2`.
 pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {

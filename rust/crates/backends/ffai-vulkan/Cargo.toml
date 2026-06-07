@@ -34,3 +34,7 @@ required-features = ["vulkan"]
 [[test]]
 name = "qwen25_first_logit_diag"
 required-features = ["vulkan"]
+
+[[test]]
+name = "qwen25_prefill_coopmat"
+required-features = ["vulkan"]
