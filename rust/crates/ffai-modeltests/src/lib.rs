@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1936,7 +1936,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let tidx_dev2 = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
                             // acc_dev: pre-zeroed [s, hid] f32 output accumulator.
                             let acc_dev = upm(&acc_h, vec![s, hid]); // already vec of 0.0f32
-                            moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            // Deterministic scatter by default (atomicAdd nondeterministic).
+                            if std::env::var("NEMOTRON_ATOMIC_SCATTER").is_ok() {
+                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            } else {
+                                let _ = &tidx_dev2;
+                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                            }
                             // Download accumulated output for residual add.
                             acc_h = dl(&acc_dev, s * hid);
                         } else if use_grouped_gemm {
@@ -1974,7 +1980,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // But scatter_add signature multiplies by (scale/256): pass scale=256
                             // so net = w×(256/256) = w (matches the bgemm path).
                             let dn_out = cast_f16_f32(d, &dn_out_f16).unwrap();
-                            moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            // DETERMINISTIC scatter by default: the atomicAdd variant is
+                            // run-to-run nondeterministic (FP atomic accumulation order)
+                            // and flips the deep-context argmax. NEMOTRON_ATOMIC_SCATTER=1
+                            // restores the old atomic kernel (A/B perf only).
+                            if std::env::var("NEMOTRON_ATOMIC_SCATTER").is_ok() {
+                                moe_scatter_add(d, &dn_out, &tidx_dev2, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                            } else {
+                                let _ = &tidx_dev2;
+                                moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                            }
                             acc_h = dl(&acc_dev, s * hid);
                         } else {
                             // ── Per-expert cuBLAS loop ────────────────────────────────────
@@ -2089,7 +2104,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let tidx_dev = Tensor::new(d.upload(&tbu(&tidx_h)).unwrap(), vec![mt], DType::U32);
                                     let acc_dev = upm(&acc_h, vec![s, hid]); // acc_h all-zero here
                                     let dn_f32 = cast_f16_f32(d, &dn_all).unwrap();
-                                    moe_scatter_add(d, &dn_f32, &tidx_dev, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                    // Deterministic scatter by default (atomicAdd is run-to-run
+                                    // nondeterministic). NEMOTRON_ATOMIC_SCATTER=1 → old kernel.
+                                    if std::env::var("NEMOTRON_ATOMIC_SCATTER").is_ok() {
+                                        moe_scatter_add(d, &dn_f32, &tidx_dev, &wts_dev, &acc_dev, mt, hid, 256.0f32).unwrap();
+                                    } else {
+                                        let _ = &tidx_dev;
+                                        moe_scatter_add_det(d, &dn_f32, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
+                                    }
                                     acc_h = dl(&acc_dev, s * hid);
                                     drop(keep_dn); let _ = (&up_all, &dn_all, &dn_f32);
                                 }

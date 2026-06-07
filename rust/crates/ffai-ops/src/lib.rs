@@ -2435,6 +2435,109 @@ pub fn moe_scatter_add(
     )
 }
 
+/// Raw CUDA source for the **DETERMINISTIC MoE scatter-add** kernel.
+///
+/// The atomicAdd variant (`moe_scatter_add_f32`) is run-to-run NONdeterministic:
+/// floating-point `atomicAdd` completes in hardware-arbitrated (nondeterministic)
+/// order, so when several routed experts for the same token accumulate into the
+/// same `acc[token,h]`, the summation order — and thus the low bits of the result
+/// — varies between identical runs. That jitter propagates through 52 layers and
+/// can flip the final argmax at deep context.
+///
+/// This variant is bit-exact reproducible: one block per `(token, h-block)`, and
+/// each thread sums *its* token's contributing rows in a FIXED order, read from a
+/// pre-built CSR-style index (`tok_starts[s+1]`, `tok_rows[mt]`). No atomics.
+///   `acc[t,h] = Σ_{r ∈ rows(t)}  dn[r,h] * wts[r] * unscale`   (rows in row order)
+/// Grid: `[s, ceil(hid/BLOCK_H)]`; block `[BLOCK_H,1]`.
+const MOE_SCATTER_ADD_DET_SRC: &str = r#"
+#include <cuda_fp16.h>
+#define BLOCK_H 128
+
+extern "C" __global__ void moe_scatter_add_det_f32(
+    const float*    __restrict__ dn,         // [mt, hid] sorted-row expert outputs
+    const int*      __restrict__ tok_starts, // [s+1] CSR row offsets per token
+    const int*      __restrict__ tok_rows,   // [mt] row ids grouped by token (fixed order)
+    const float*    __restrict__ wts,        // [mt] router weights
+    float*                       acc,        // [s, hid] output accumulator (pre-zeroed)
+    int s, int hid, float unscale)
+{
+    int t = (int)blockIdx.x;                              // token ∈ [0, s)
+    int h = (int)(blockIdx.y * BLOCK_H + threadIdx.x);    // hidden dim
+    if (t < s && h < hid) {
+        float sum = 0.f;
+        int r0 = tok_starts[t];
+        int r1 = tok_starts[t + 1];
+        // Fixed-order reduction over this token's rows → deterministic.
+        for (int j = r0; j < r1; ++j) {
+            int r = tok_rows[j];
+            sum += dn[r * hid + h] * (wts[r] * unscale);
+        }
+        acc[t * hid + h] = sum;
+    }
+}
+"#;
+
+/// Deterministic MoE scatter-add (drop-in for [`moe_scatter_add`] on the prefill
+/// path). `tidx_host` is the per-row token index (callers already build it on the
+/// host before uploading). Builds a CSR index grouping rows by token in ascending
+/// row order, uploads it, and runs the atomic-free deterministic kernel.
+///
+/// `acc` is WRITTEN (not accumulated) — every output token is fully summed here,
+/// so it need not be pre-zeroed, but tokens with no routed rows are set to 0.
+pub fn moe_scatter_add_det(
+    dev: &dyn Device,
+    dn: &Tensor,        // [mt, hid] f32 down-GEMM output (sorted)
+    tidx_host: &[u32],  // [mt] token index per row (host)
+    wts: &Tensor,       // [mt] f32 router weights
+    acc: &Tensor,       // [s, hid] f32 accumulator
+    s: usize,
+    mt: usize,
+    hid: usize,
+    unscale: f32,
+) -> Result<()> {
+    // Build CSR (tok_starts[s+1], tok_rows[mt]) grouping rows by token. Rows are
+    // appended in ascending row order → fixed, deterministic accumulation order.
+    let mut counts = vec![0i32; s + 1];
+    for &t in tidx_host { counts[t as usize + 1] += 1; }
+    for i in 0..s { counts[i + 1] += counts[i]; } // prefix sum → tok_starts
+    let tok_starts = counts; // [s+1]
+    let mut cursor: Vec<i32> = tok_starts[..s].to_vec();
+    let mut tok_rows = vec![0i32; mt];
+    for (r, &t) in tidx_host.iter().enumerate() {
+        let ti = t as usize;
+        tok_rows[cursor[ti] as usize] = r as i32;
+        cursor[ti] += 1;
+    }
+    let ts_bytes: Vec<u8> = tok_starts.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tr_bytes: Vec<u8> = tok_rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let ts_dev = dev.upload(&ts_bytes).map_err(|e| Error::Msg(format!("moe_scatter_add_det: upload tok_starts: {e:?}")))?;
+    let tr_dev = dev.upload(&tr_bytes).map_err(|e| Error::Msg(format!("moe_scatter_add_det: upload tok_rows: {e:?}")))?;
+
+    let s_i = (s as i32).to_le_bytes().to_vec();
+    let hid_i = (hid as i32).to_le_bytes().to_vec();
+    let uscale_f = unscale.to_le_bytes().to_vec();
+    const BLOCK_H: u32 = 128;
+    let grid = [s as u32, (hid as u32).div_ceil(BLOCK_H), 1];
+    let block = [BLOCK_H, 1, 1];
+    dev.dispatch_raw_cuda(
+        MOE_SCATTER_ADD_DET_SRC,
+        "moe_scatter_add_det.cu",
+        "moe_scatter_add_det_f32",
+        &[
+            (dn.buffer.as_ref(), 0),
+            (ts_dev.as_ref(),    0),
+            (tr_dev.as_ref(),    0),
+            (wts.buffer.as_ref(), 0),
+            (acc.buffer.as_ref(), 0),
+        ],
+        &[s_i, hid_i, uscale_f],
+        grid,
+        block,
+        0,
+        false,
+    )
+}
+
 /// Raw CUDA source for `relu2_scale_f16`: `out[i] = max(0, (float)in[i])^2 * scale`
 /// where `in` and `out` are __half (f16). Fuses the cast-to-f32, relu, square,
 /// scale, and cast-back-to-f16 that the MoE prefill loop previously did by
