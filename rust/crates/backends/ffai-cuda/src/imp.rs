@@ -379,6 +379,29 @@ impl Device for CudaDevice {
         ).map_err(dispatch_err)
     }
 
+    fn gemm_batched(
+        &self,
+        x_buf: &dyn ffai_core::DeviceBuffer,
+        x_offsets: &[usize],
+        w_buf: &dyn ffai_core::DeviceBuffer,
+        w_offsets: &[usize],
+        out_buf: &dyn ffai_core::DeviceBuffer,
+        out_offsets: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: ffai_core::DType,
+    ) -> Result<()> {
+        let xb = x_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_batched: x_buf not CudaBuffer".into()))?;
+        let wb = w_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_batched: w_buf not CudaBuffer".into()))?;
+        let ob = out_buf.as_any().downcast_ref::<CudaBuffer>().ok_or_else(|| Error::Msg("gemm_batched: out_buf not CudaBuffer".into()))?;
+        let x_ptrs:   Vec<u64> = x_offsets.iter().map(|&off| xb.ptr + off as u64).collect();
+        let w_ptrs:   Vec<u64> = w_offsets.iter().map(|&off| wb.ptr + off as u64).collect();
+        let out_ptrs: Vec<u64> = out_offsets.iter().map(|&off| ob.ptr + off as u64).collect();
+        self.dev.gemm_cublas_batched(&x_ptrs, &w_ptrs, &out_ptrs, m, n, k, dtype)
+            .map_err(dispatch_err)
+    }
+
     fn gemm_grouped(
         &self,
         x_buf: &dyn ffai_core::DeviceBuffer,

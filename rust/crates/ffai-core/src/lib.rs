@@ -231,6 +231,28 @@ pub trait Device: Send + Sync {
         Err(Error::Msg("gemm_strided_batched_off unsupported on this backend".into()))
     }
 
+    /// Pointer-array batched GEMM: `batch_count` independent GEMMs sharing
+    /// `(m,n,k)`, reading X/W/Out from per-batch byte offsets into the three
+    /// backing buffers. `C_i[m,n] = X_i[m,k] · W_i[n,k]^T`. Unlike
+    /// [gemm_strided_batched] the per-batch offsets are arbitrary, so one
+    /// operand can BROADCAST (multiple batches reuse the same slice) — used by
+    /// the SSD scan to fan a per-group B/C slice into every head's batch slot
+    /// without an 8× redundant gather. All operands f16/bf16; accumulate f32.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_batched(
+        &self,
+        _x_buf: &dyn DeviceBuffer,
+        _x_offsets: &[usize],   // byte offset per batch into x_buf
+        _w_buf: &dyn DeviceBuffer,
+        _w_offsets: &[usize],   // byte offset per batch into w_buf
+        _out_buf: &dyn DeviceBuffer,
+        _out_offsets: &[usize], // byte offset per batch into out_buf
+        _m: usize, _n: usize, _k: usize,
+        _dtype: DType,
+    ) -> Result<()> {
+        Err(Error::Msg("gemm_batched unsupported on this backend".into()))
+    }
+
     /// Grouped-batched GEMM (CUDA 13+ only): `group_count` independent GEMMs
     /// where group `i` computes `C_i[m_i, n] = X_i[m_i, k] · W_i[n, k]^T`.
     /// All inputs/outputs are f16; accumulate f32.

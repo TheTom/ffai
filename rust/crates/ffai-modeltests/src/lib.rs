@@ -1639,9 +1639,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             if ssm_state[l].is_none() { ssm_state[l] = Some(up(&vec![0.0f32; m_nh * m_dh * ds])); }
                             let ssm_flops = s as f64 * m_nh as f64 * m_dh as f64 * ds as f64 * 4.0;
                             let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
-                            let use_ssd = std::env::var("NEMOTRON_SSD_MATMUL").is_ok();
+                            // SSD chunked-matmul scan is DEFAULT-ON for CUDA (the Nemotron
+                            // (64,128,64,8) cell): tensor-core GEMMs + fused per-group B/C
+                            // cut ssm_scan ~681ms(36%)→75ms(<6%), e2e +~30% @d0, argmax-exact.
+                            // Escape NEMOTRON_SSD_SEQ=1 → old sequential ssm_prefill_scan.
+                            let ssd_seq = std::env::var("NEMOTRON_SSD_SEQ").is_ok();
+                            let use_ssd = !ssd_seq && (is_cuda
+                                || std::env::var("NEMOTRON_SSD_MATMUL").is_ok()
+                                || std::env::var("NEMOTRON_SSD_FUSED").is_ok());
                             let use_ssd_port = std::env::var("NEMOTRON_SSD_PORTABLE").is_ok();
-                            let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+                            // CUDA default chunk len 128 (validated win); 256 elsewhere.
+                            let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok())
+                                .unwrap_or(if is_cuda { 128 } else { 256 });
                             let (so, y_dev) = if use_ssd_port {
                                 pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                             } else if use_ssd {
@@ -1716,9 +1725,18 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // Drops serial depth from T to T/64, exploiting 64× more GPU parallelism.
                         // Default: sequential step-record (validated, correctness-first).
                         let use_chunked = std::env::var("NEMOTRON_CHUNKED_SCAN").is_ok();
-                        let use_ssd = std::env::var("NEMOTRON_SSD_MATMUL").is_ok();
+                        // SSD chunked-matmul scan is DEFAULT-ON for CUDA (the Nemotron
+                        // (64,128,64,8) cell): tensor-core GEMMs + fused per-group B/C
+                        // cut ssm_scan ~681ms(36%)→75ms(<6%), e2e +~30% @d0, argmax-exact.
+                        // Escape NEMOTRON_SSD_SEQ=1 → old sequential ssm_prefill_scan.
+                        let ssd_seq = std::env::var("NEMOTRON_SSD_SEQ").is_ok();
+                        let use_ssd = !ssd_seq && (is_cuda
+                            || std::env::var("NEMOTRON_SSD_MATMUL").is_ok()
+                            || std::env::var("NEMOTRON_SSD_FUSED").is_ok());
                         let use_ssd_port = std::env::var("NEMOTRON_SSD_PORTABLE").is_ok();
-                        let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+                        // CUDA default chunk len 128 (validated win); 256 elsewhere.
+                        let ssd_l: u32 = std::env::var("NEMOTRON_SSD_L").ok().and_then(|v| v.parse().ok())
+                            .unwrap_or(if is_cuda { 128 } else { 256 });
                         let (so, y_dev) = if use_ssd_port {
                             pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                         } else if use_ssd {
@@ -2352,10 +2370,42 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         // to avoid the relu2 overflow).
                         let (suqs, susc, sm_up, sk_up) = &qw[&format!("{p}.mixer.shared_experts.up_proj.weight")];
                         let (sdqs, sdsc, sm_dn, sk_dn) = &qw[&format!("{p}.mixer.shared_experts.down_proj.weight")];
-                        let sd_h: Vec<f32> = if !is_cuda {
+                        // Metal shared-expert MMA gate (DEFAULT ON): route the up/down
+                        // GEMMs through the Q4-native cooperative-tensor MMA (gemm_q4_mpp,
+                        // same kernel as the dense projections / per-expert experts) instead
+                        // of dequant_q4→f32 + scalar matmul. relu2 stays in HOST f32 (squares
+                        // can exceed f16 max → overflow) — identical to the routed per-expert
+                        // f16 path (argmax-exact). The GEMM itself moving to Q4-native f16
+                        // MMA is the win (~2 → ~14 TFLOP/s). Set NEMOTRON_METAL_F32_SHARED=1
+                        // (or NEMOTRON_MOE_SHARED_MMA=0) to fall back to the f32 dequant+matmul
+                        // path for A/B. This is the Metal DEFAULT (matches metal_f16_experts for
+                        // the routed experts); NEMOTRON_MOE_SHARED_MMA=0 force-disables.
+                        let shared_mma_flag = std::env::var("NEMOTRON_MOE_SHARED_MMA").ok();
+                        let metal_mma_shared = !is_cuda
+                            && shared_mma_flag.as_deref() != Some("0")
+                            && !std::env::var("NEMOTRON_METAL_F32_SHARED").is_ok();
+                        let sd_h: Vec<f32> = if metal_mma_shared {
+                            // ── Portable Metal shared-expert MMA: gemm_q4_mpp up/down, host relu2 ──
+                            // Cast xn → f16 once; up GEMM [s,hid]·Wupᵀ → [s,shared_inter] f16;
+                            // relu2+(/256) in host f32 (overflow-safe); re-cast → f16; down GEMM
+                            // [s,shared_inter]·Wdnᵀ → [s,hid] f16; (×256) on host. EXACT-MATCH
+                            // numerics vs the f32 path (the f16 up-proj output fits f16 — the
+                            // routed experts already prove this at the same activation scale).
+                            let xnh = pf!(15, 0.0, cast_f32_f16(d, &xn).unwrap()); // [s, hid] f16
+                            let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64,
+                                gemm_q4_mpp(d, &xnh, suqs, susc, s, *sm_up, *sk_up).unwrap()); // [s, shared_inter] f16
+                            let sa_h = dl(&pf!(15, 0.0, cast_f16_f32(d, &sa).unwrap()), s * shared_inter);
+                            let sa2_h: Vec<f32> = sa_h.iter().map(|&v| { let r = v.max(0.0); r * r / 256.0 }).collect();
+                            let sa2 = pf!(15, 0.0, cast_f32_f16(d, &upm(&sa2_h, vec![s, shared_inter])).unwrap()); // f16
+                            let sd = pf!(12, 2.0*s as f64*hid as f64*shared_inter as f64,
+                                gemm_q4_mpp(d, &sa2, sdqs, sdsc, s, *sm_dn, *sk_dn).unwrap()); // [s, hid] f16
+                            let sd_h = dl(&pf!(15, 0.0, cast_f16_f32(d, &sd).unwrap()), s * hid);
+                            sd_h.iter().map(|&v| v * 256.0).collect()
+                        } else if !is_cuda {
                             // ── Portable Metal shared-expert: dequant→f32 + matmul, host relu2 ──
                             // relu2 squares activations (can exceed f16 max) so we keep the
                             // intermediate in f32 throughout — no overflow, fully portable.
+                            // A/B fallback (NEMOTRON_METAL_F32_SHARED=1).
                             let xnf = xn.clone(); // [s, hid] f32
                             let wsu = pf!(3, (*sm_up * *sk_up) as f64, dequant_q4(d, suqs, susc, *sm_up, *sk_up, DType::F32).unwrap());
                             let sa = pf!(12, 2.0*s as f64*shared_inter as f64*hid as f64, matmul(d, &wsu, &xnf).unwrap()); // [s, shared_inter] f32
