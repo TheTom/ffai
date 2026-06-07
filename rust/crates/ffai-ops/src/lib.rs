@@ -1759,6 +1759,68 @@ extern "C" __global__ void sdpa_tc_softmax(
 /// `o_blk[nq,Sq,hd]` = P_blk·V_blk (unnormalised). Updates running max `m_run`,
 /// running sum `l_run`, and running (unnormalised) output `o_run` with the
 /// standard online-softmax rescale. One block per (head,row); threads over hd.
+/// Varlen (packed multi-sequence) softmax + causal mask. Identical to
+/// `sdpa_tc_softmax`, but bounds each query row `r` BELOW by its packed
+/// segment's start `seg_lo[r]` (absolute KV position) in addition to the
+/// causal upper bound. A query thus attends only WITHIN its own packed
+/// sequence: `seg_lo[r] <= abspos <= base_kv + r`. With `seg_lo[r] == 0` for
+/// all rows this is bit-identical to the dense kernel.
+const SDPA_TC_SOFTMAX_VARLEN_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void sdpa_tc_softmax_varlen(
+    const __half* __restrict__ s_blk,  // [nq, Sq, blk] logits (scaled)
+    __half*       __restrict__ p_blk,  // [nq, Sq, blk] weights out
+    float*        __restrict__ bm,     // [nq, Sq] block max
+    float*        __restrict__ bl,     // [nq, Sq] block sum-exp
+    const int*    __restrict__ seg_lo, // [Sq] per-row segment start (abs KV pos)
+    int nq, int sq, int blk, int kb0, int base_kv)
+{
+    long row = (long)blockIdx.x;       // global (head*Sq + r)
+    if (row >= (long)nq * sq) return;
+    int r = (int)(row % sq);
+    int max_kv = base_kv + r;          // inclusive causal upper bound
+    int lo_kv  = seg_lo[r];            // inclusive segment lower bound
+    const __half* s = s_blk + row * blk;
+    __half* p = p_blk + row * blk;
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+    // pass 1: row max over valid columns
+    float lm = -3.4e38f;
+    for (int j = tid; j < blk; j += nt) {
+        int abspos = kb0 + j;
+        float v = (abspos >= lo_kv && abspos <= max_kv) ? __half2float(s[j]) : -3.4e38f;
+        if (v > lm) lm = v;
+    }
+    __shared__ float red[256];
+    red[tid] = lm; __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) { float o = red[tid+off]; if (o > red[tid]) red[tid] = o; }
+        __syncthreads();
+    }
+    float m = red[0];
+    __syncthreads();
+    // pass 2: exp + sum
+    float ls = 0.0f;
+    for (int j = tid; j < blk; j += nt) {
+        int abspos = kb0 + j;
+        float w;
+        if (abspos >= lo_kv && abspos <= max_kv && m > -3.0e38f) { w = __expf(__half2float(s[j]) - m); }
+        else { w = 0.0f; }
+        p[j] = __float2half(w);
+        ls += w;
+    }
+    red[tid] = ls; __syncthreads();
+    for (int off = nt >> 1; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid+off];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        bm[row] = (m > -3.0e38f) ? m : -3.4e38f;
+        bl[row] = red[0];
+    }
+}
+"#;
+
 const SDPA_TC_MERGE_SRC: &str = r#"
 #include <cuda_fp16.h>
 extern "C" __global__ void sdpa_tc_merge(
@@ -1944,6 +2006,130 @@ pub fn sdpa_multi_tc(
     }
 
     // ── finalise: normalise + transpose head-major → row-major ──────────────
+    let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
+    let out_f32 = if q.dtype == DType::F32 { 1i32 } else { 0 };
+    dev.dispatch_raw_cuda(SDPA_TC_FINALIZE_SRC, "sdpa_tc_finalize.cu", "sdpa_tc_finalize",
+        &[(o_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0), (out.buffer.as_ref(), 0)],
+        &[i(nq as i32), i(sq as i32), i(hd as i32), i(out_f32)],
+        blk256(nq*sq*hd), [256,1,1], 0, false)?;
+    Ok(out)
+}
+
+/// Varlen (packed multi-sequence) tensor-core FlashAttention. Identical to
+/// [`sdpa_multi_tc`] except each query attends only within its own packed
+/// segment: the softmax masks KV positions below `seg_lo[r]` (the absolute
+/// start of query row `r`'s sequence). `seg_lo` is an `[n_query]` i32 device
+/// buffer. Used by the `NEMOTRON_PACKED` batched-prefill path so N sequences
+/// share one set of GEMMs while attention stays block-diagonal (correct).
+///
+/// NOTE: this computes the full `[Sq, n_kv]` QKᵀ and masks off-segment to
+/// −inf — bit-correct, but still O((ΣL)²) QKᵀ. The segment-skip optimisation
+/// (only run KV blocks intersecting a query's segment → O(ΣLᵢ²)) is the
+/// follow-up that turns correctness into the throughput win.
+pub fn sdpa_multi_tc_varlen(
+    dev: &dyn Device,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seg_lo: &Tensor,        // [n_query] i32: abs KV start of each query's segment
+    head_dim: usize,
+    n_q_heads: u32,
+    base_kv: u32,
+    n_query: u32,
+    kv_stride: u32,
+    heads_per_group: u32,
+    causal: bool,
+    scale: f32,
+) -> Result<Tensor> {
+    let hd = head_dim;
+    let nq = n_q_heads as usize;
+    let sq = n_query as usize;
+    let hpg = heads_per_group as usize;
+    let nkv = nq / hpg;
+    let base = base_kv as usize;
+    let n_kv = if causal { base + sq } else { base + sq };
+    if n_kv > kv_stride as usize {
+        return Err(Error::Msg(format!(
+            "sdpa_multi_tc_varlen: n_kv {n_kv} exceeds kv_stride {kv_stride}")));
+    }
+    if seg_lo.elem_count() != sq {
+        return Err(Error::Msg(format!(
+            "sdpa_multi_tc_varlen: seg_lo len {} != n_query {sq}", seg_lo.elem_count())));
+    }
+    let in_f32 = match q.dtype { DType::F32 => 1i32, DType::F16 => 0,
+        other => return Err(Error::Msg(format!("sdpa_multi_tc_varlen: unsupported dtype {other:?}"))) };
+
+    let qh = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
+    let kh = Tensor::empty(dev, vec![nkv, n_kv, hd], DType::F16)?;
+
+    let i = |x: i32| x.to_le_bytes().to_vec();
+    let f = |x: f32| x.to_le_bytes().to_vec();
+    let blk256 = |n: usize| -> [u32; 3] { [((n as u32).div_ceil(256)).max(1), 1, 1] };
+
+    dev.dispatch_raw_cuda(SDPA_TC_QPREP_SRC, "sdpa_tc_qprep.cu", "sdpa_tc_qprep",
+        &[(q.buffer.as_ref(), q.offset), (qh.buffer.as_ref(), 0)],
+        &[i(sq as i32), i(nq as i32), i(hd as i32), f(scale), i(in_f32)],
+        blk256(nq*sq*hd), [256,1,1], 0, false)?;
+    dev.dispatch_raw_cuda(SDPA_TC_KPREP_SRC, "sdpa_tc_kprep.cu", "sdpa_tc_kprep",
+        &[(k.buffer.as_ref(), k.offset), (kh.buffer.as_ref(), 0)],
+        &[i(nkv as i32), i(kv_stride as i32), i(n_kv as i32), i(hd as i32), i(in_f32)],
+        blk256(nkv*n_kv*hd), [256,1,1], 0, false)?;
+
+    let o_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*hd*4])?, vec![nq, sq, hd], DType::F32);
+    let l_run = Tensor::new(dev.upload(&vec![0u8; nq*sq*4])?, vec![nq, sq], DType::F32);
+    let neg: Vec<u8> = (0..nq*sq).flat_map(|_| (-3.4e38f32).to_le_bytes()).collect();
+    let m_run = Tensor::new(dev.upload(&neg)?, vec![nq, sq], DType::F32);
+
+    let bk = 2048usize.min(n_kv);
+    let scores = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
+    let p_blk  = Tensor::empty(dev, vec![nq, sq, bk], DType::F16)?;
+    let bm     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
+    let bl     = Tensor::empty(dev, vec![nq, sq], DType::F32)?;
+    let o_blk  = Tensor::empty(dev, vec![nq, sq, hd], DType::F16)?;
+    let vt     = Tensor::empty(dev, vec![nkv, hd, bk], DType::F16)?;
+
+    let el = 2i64;
+    let mut kb0 = 0usize;
+    while kb0 < n_kv {
+        let blk = bk.min(n_kv - kb0);
+        for g in 0..nkv {
+            let q_off = g * hpg * sq * hd * 2;
+            let k_off = (g * n_kv + kb0) * hd * 2;
+            let s_off = g * hpg * sq * blk * 2;
+            dev.gemm_strided_batched_off(
+                qh.buffer.as_ref(),     q_off, (sq*hd) as i64 * el,
+                kh.buffer.as_ref(),     k_off, 0,
+                scores.buffer.as_ref(), s_off, (sq*blk) as i64 * el,
+                sq, blk, hd, hpg, DType::F16)?;
+        }
+        // varlen softmax: causal upper (base+r) AND segment lower (seg_lo[r]).
+        dev.dispatch_raw_cuda(SDPA_TC_SOFTMAX_VARLEN_SRC, "sdpa_tc_softmax_varlen.cu", "sdpa_tc_softmax_varlen",
+            &[(scores.buffer.as_ref(), 0), (p_blk.buffer.as_ref(), 0),
+              (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+              (seg_lo.buffer.as_ref(), seg_lo.offset)],
+            &[i(nq as i32), i(sq as i32), i(blk as i32), i(kb0 as i32), i(base as i32)],
+            [(nq*sq) as u32, 1, 1], [256,1,1], 0, false)?;
+        dev.dispatch_raw_cuda(SDPA_TC_VPREP_SRC, "sdpa_tc_vprep.cu", "sdpa_tc_vprep",
+            &[(v.buffer.as_ref(), v.offset), (vt.buffer.as_ref(), 0)],
+            &[i(nkv as i32), i(kv_stride as i32), i(hd as i32), i(kb0 as i32), i(blk as i32), i(in_f32)],
+            blk256(nkv*blk*hd), [256,1,1], 0, false)?;
+        for g in 0..nkv {
+            let p_off = g * hpg * sq * blk * 2;
+            let v_off = g * hd * blk * 2;
+            let o_off = g * hpg * sq * hd * 2;
+            dev.gemm_strided_batched_off(
+                p_blk.buffer.as_ref(), p_off, (sq*blk) as i64 * el,
+                vt.buffer.as_ref(),    v_off, 0,
+                o_blk.buffer.as_ref(), o_off, (sq*hd) as i64 * el,
+                sq, hd, blk, hpg, DType::F16)?;
+        }
+        dev.dispatch_raw_cuda(SDPA_TC_MERGE_SRC, "sdpa_tc_merge.cu", "sdpa_tc_merge",
+            &[(o_blk.buffer.as_ref(), 0), (bm.buffer.as_ref(), 0), (bl.buffer.as_ref(), 0),
+              (o_run.buffer.as_ref(), 0), (m_run.buffer.as_ref(), 0), (l_run.buffer.as_ref(), 0)],
+            &[i(nq as i32), i(sq as i32), i(hd as i32)],
+            [(nq*sq) as u32, 1, 1], [128,1,1], 0, false)?;
+        kb0 += blk;
+    }
     let out = Tensor::empty(dev, vec![sq, nq, hd], q.dtype)?;
     let out_f32 = if q.dtype == DType::F32 { 1i32 } else { 0 };
     dev.dispatch_raw_cuda(SDPA_TC_FINALIZE_SRC, "sdpa_tc_finalize.cu", "sdpa_tc_finalize",
