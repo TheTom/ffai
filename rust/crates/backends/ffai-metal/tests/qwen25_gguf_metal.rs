@@ -80,6 +80,87 @@ fn qwen25_1_5b_gguf_generate_on_metal() {
     eprintln!("✅ Qwen2.5-1.5B-Q8 GGUF loaded + generated coherent output on Apple GPU.");
 }
 
+/// End-to-end load + generate of **Qwen2.5-7B-Instruct Q4_K_M** — the common
+/// k-quant format (Q4_K/Q5_K/Q6_K super-blocks) and a 2-part split GGUF. This
+/// exercises the new k-quant dequant + split-file handling in the loader. Uses
+/// the f32 dequant-to-upload weight path. Set `QWEN25_7B_GGUF` to part 1 of the
+/// split (`*-00001-of-00002.gguf`); the loader opens both parts automatically.
+#[test]
+fn qwen25_7b_q4km_gguf_generate_on_metal() {
+    let Some(dev) = MetalDevice::create().expect("metal init") else {
+        eprintln!("no Metal device — skipping");
+        return;
+    };
+    let path = std::env::var("QWEN25_7B_GGUF").unwrap_or_else(|_| {
+        "/Users/tom/models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf".to_string()
+    });
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("model not found at {path} — skipping");
+        return;
+    }
+    eprintln!("device: {} — loading split Q4_K_M GGUF {path}", dev.name());
+
+    let g = Gguf::open(&path).expect("open split gguf");
+    let tok = GgufTokenizer::from_gguf(&g).expect("tokenizer");
+    eprintln!(
+        "arch={:?} vocab={} tensors={}",
+        g.meta_str("general.architecture"),
+        tok.vocab_size(),
+        g.tensor_names().count(),
+    );
+
+    let t_load = Instant::now();
+    let model = GgufModel::open(dev.as_ref(), &path, 256).expect("load q4_k_m model");
+    eprintln!(
+        "model loaded in {:.2}s — layers={} hidden={} q_heads={} kv_heads={} head_dim={} bias={} theta={}",
+        t_load.elapsed().as_secs_f32(),
+        model.n_layers,
+        model.cfg.hidden,
+        model.cfg.n_q_heads,
+        model.cfg.n_kv_heads,
+        model.cfg.head_dim,
+        model.cfg.attn_bias,
+        model.cfg.rope_theta,
+    );
+
+    let prompt_text = "The capital of France is";
+    let prompt = tok.encode(prompt_text);
+    eprintln!("prompt {:?} → {} ids: {:?}", prompt_text, prompt.len(), prompt);
+    assert!(!prompt.is_empty(), "tokenizer produced no ids");
+
+    let eos = tok.token_id("<|endoftext|>");
+    let stop = StopOn { max_new: 16, eos };
+
+    let t_gen = Instant::now();
+    let mut decode_steps = 0usize;
+    let out = generate(&prompt, &stop, &Sampling::Greedy, 0, |token, pos| {
+        if pos + 1 > prompt.len() {
+            decode_steps += 1;
+        }
+        model.step(dev.as_ref(), token, pos).expect("step")
+    });
+    let secs = t_gen.elapsed().as_secs_f32();
+    let total_steps = prompt.len() + out.len();
+    let decode_tps = decode_steps as f32 / secs.max(1e-6);
+
+    let text = tok.decode(&out);
+    eprintln!(
+        "generated {} tokens in {:.2}s ({:.1} tok/s incl. prefill, {:.1} tok/s decode-only)",
+        out.len(),
+        secs,
+        total_steps as f32 / secs,
+        decode_tps,
+    );
+    eprintln!("OUTPUT: {text:?}");
+    eprintln!("FULL:   {prompt_text:?}{text}");
+
+    assert!(
+        text.contains("Paris"),
+        "expected 'Paris' in continuation, got {text:?}"
+    );
+    eprintln!("✅ Qwen2.5-7B-Q4_K_M split GGUF loaded + generated coherent output on Apple GPU.");
+}
+
 /// Resident-Q8 decode path: weights stay quantized (Q8) and decode runs through
 /// `gemv_q8` (no f32 weight upload for the big matmuls). Runs the SAME prompt
 /// through both the f32 (`open`) and Q8 (`open_q8`) paths, reports decode tok/s
