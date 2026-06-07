@@ -238,9 +238,25 @@ pub fn conv1d_causal_step(
         u(n_channels),
         u(kernel_size),
     ];
-    let grid = Grid { grid: [n_channels, 1, 1], block: [1, 1, 1] };
+    // TIER-1 launch-geometry fix: move the n_channels extent from grid.x into
+    // block.x (product unchanged → byte-identical program_id under Grid3D
+    // codegen, where gid_x = blockIdx.x*blockDim.x + threadIdx.x). b is the
+    // largest power-friendly block that divides n_channels (gcd capped at 256).
+    let b = gcd_u32(n_channels, 256).max(1);
+    let grid = Grid { grid: [n_channels / b, 1, 1], block: [b, 1, 1] };
     dev.dispatch(&k, &bindings, grid)?;
     Ok(y)
+}
+
+/// gcd for launch-geometry block sizing (Tier-1 grid→block extent moves).
+#[inline]
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }
 
 // ── SSM (Mamba2 SSD selective scan) ─────────────────────────────────────
@@ -2761,7 +2777,10 @@ pub fn dsv4_partial_rope(
         f(0.0), // corr_low
         f(1.0), // corr_high
     ];
-    let grid = Grid { grid: [n_heads, half_rot, 1], block: [1, 1, 1] };
+    // TIER-1 launch-geometry fix: move half_rot from grid.y into block.y
+    // (product unchanged → byte-identical gid_y = blockIdx.y*blockDim.y +
+    // threadIdx.y under Grid3D codegen).
+    let grid = Grid { grid: [n_heads, 1, 1], block: [1, half_rot, 1] };
     dev.dispatch(&k, &bindings, grid)?;
     Ok(Tensor::new(qk.buffer.clone(), qk.shape.clone(), qk.dtype))
 }
@@ -2809,7 +2828,9 @@ pub fn rope_llama(
     let half = head_dim / 2;
     let k = lookup("ffai_rope_llama", qk.dtype)?;
     let out = Tensor::empty(dev, qk.shape.clone(), qk.dtype)?;
-    let grid = Grid { grid: [n_heads as u32, half as u32, 1], block: [1, 1, 1] };
+    // TIER-1 launch-geometry fix: move `half` from grid.y into block.y
+    // (product unchanged → byte-identical gid_y under Grid3D codegen).
+    let grid = Grid { grid: [n_heads as u32, 1, 1], block: [1, half as u32, 1] };
     dev.dispatch(
         &k,
         &[
@@ -2861,7 +2882,9 @@ pub fn rope_llama_many(
     let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
     let f = |v: f32| Binding::Scalar(v.to_le_bytes().to_vec());
     let row_stride = (n_heads * head_dim) as u32;
-    let grid = Grid { grid: [t as u32, n_heads as u32, half as u32], block: [1, 1, 1] };
+    // TIER-1 launch-geometry fix: move `half` from grid.z into block.z
+    // (product unchanged → byte-identical gid_z under Grid3D codegen).
+    let grid = Grid { grid: [t as u32, n_heads as u32, 1], block: [1, 1, half as u32] };
     dev.dispatch(
         &k,
         &[
