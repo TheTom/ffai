@@ -343,4 +343,73 @@ impl Gguf {
             other => Err(Error::Msg(format!("dequant '{name}': {other:?} not supported"))),
         }
     }
+
+    /// Repack a 2-D weight tensor into the resident-Q8 layout `ffai_ops::gemv_q8`
+    /// consumes: `(qs, scales, m, k)` where `m`/`k` are the [out, in] matrix dims,
+    /// `scales` is `[m * k/32]` f32 (one per 32-block), and `qs` is the int8
+    /// codes packed 4-per-u32 (8 u32/block) at `qs[r*(k/32)*8 + b*8 + i/4]`.
+    ///
+    /// For a Q8_0 tensor this is a *lossless* repack of the on-disk blocks (the
+    /// f16 block scale is widened to f32, the 32 int8 are re-packed) — no second
+    /// quantization. F16/F32 tensors are quantized per-32-block via amax/127, the
+    /// identical scheme to `ffai_ops::quantize_q8`. `k` (the in-dim, fastest GGUF
+    /// dim) must be a multiple of 32.
+    pub fn q8_repack(&self, name: &str) -> Result<(Vec<u32>, Vec<f32>, usize, usize)> {
+        let t = self.tensor(name).ok_or_else(|| Error::Msg(format!("tensor '{name}' not found")))?;
+        if t.dims.len() != 2 {
+            return Err(Error::Msg(format!("q8_repack '{name}': expected 2-D, got {:?}", t.dims)));
+        }
+        // GGUF dims are fastest-first: a [out, in] matrix is listed as [in, out].
+        let k = t.dims[0] as usize; // in  (fastest, row stride)
+        let m = t.dims[1] as usize; // out (rows)
+        if k % 32 != 0 {
+            return Err(Error::Msg(format!("q8_repack '{name}': in-dim {k} not a multiple of 32")));
+        }
+        let bpr = k / 32;
+        let mut qs = vec![0u32; m * bpr * 8];
+        let mut scales = vec![0f32; m * bpr];
+        match t.ggml_type {
+            GgmlType::Q8_0 => {
+                // On-disk block of 32: f16 scale (2 bytes) + 32 int8. The block
+                // order is row-major over [out, in], so block (r,b) is at linear
+                // block index r*bpr + b — exactly the gemv_q8 ordering. Lossless.
+                let nblocks = m * bpr;
+                let b = self.raw(t, nblocks * 34);
+                for blk in 0..nblocks {
+                    let base = blk * 34;
+                    scales[blk] = f16_to_f32(u16::from_le_bytes([b[base], b[base + 1]]));
+                    for w_i in 0..8 {
+                        let mut packed = 0u32;
+                        for i in 0..4 {
+                            let byte = b[base + 2 + w_i * 4 + i];
+                            packed |= (byte as u32) << (i * 8);
+                        }
+                        qs[blk * 8 + w_i] = packed;
+                    }
+                }
+            }
+            GgmlType::F32 | GgmlType::F16 => {
+                let w = self.dequant_f32(name)?; // row-major [out, in]
+                for r in 0..m {
+                    for b in 0..bpr {
+                        let base = r * k + b * 32;
+                        let amax = (0..32).fold(0f32, |a, i| a.max(w[base + i].abs()));
+                        let d = amax / 127.0;
+                        scales[r * bpr + b] = d;
+                        let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+                        for w_i in 0..8 {
+                            let mut packed = 0u32;
+                            for i in 0..4 {
+                                let q = (w[base + w_i * 4 + i] * inv).round().clamp(-127.0, 127.0) as i32;
+                                packed |= ((q as u8) as u32) << (i * 8);
+                            }
+                            qs[r * bpr * 8 + b * 8 + w_i] = packed;
+                        }
+                    }
+                }
+            }
+            other => return Err(Error::Msg(format!("q8_repack '{name}': {other:?} not supported"))),
+        }
+        Ok((qs, scales, m, k))
+    }
 }

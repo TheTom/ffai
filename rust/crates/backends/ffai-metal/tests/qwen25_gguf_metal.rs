@@ -79,3 +79,71 @@ fn qwen25_1_5b_gguf_generate_on_metal() {
     );
     eprintln!("✅ Qwen2.5-1.5B-Q8 GGUF loaded + generated coherent output on Apple GPU.");
 }
+
+/// Resident-Q8 decode path: weights stay quantized (Q8) and decode runs through
+/// `gemv_q8` (no f32 weight upload for the big matmuls). Runs the SAME prompt
+/// through both the f32 (`open`) and Q8 (`open_q8`) paths, reports decode tok/s
+/// for each, and asserts the Q8 path stays coherent ("Paris"). The Q8 token
+/// stream should match or near-match the f32 path (Q8 matmul is a slight
+/// numerical change). Backend-agnostic: gemv_q8 codegens to CUDA/Vulkan too.
+#[test]
+fn qwen25_1_5b_gguf_q8_resident_decode_on_metal() {
+    let Some(dev) = MetalDevice::create().expect("metal init") else {
+        eprintln!("no Metal device — skipping");
+        return;
+    };
+    let path = std::env::var("QWEN25_GGUF")
+        .unwrap_or_else(|_| "/Users/tom/models/qwen2.5-1.5b-instruct-q8_0.gguf".to_string());
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("model not found at {path} — skipping");
+        return;
+    }
+    let d = dev.as_ref();
+    let g = Gguf::open(&path).expect("open gguf");
+    let tok = GgufTokenizer::from_gguf(&g).expect("tokenizer");
+
+    let prompt_text = "The capital of France is";
+    let prompt = tok.encode(prompt_text);
+    let eos = tok.token_id("<|endoftext|>");
+    let stop = StopOn { max_new: 12, eos };
+
+    // ── f32 path (baseline) ───────────────────────────────────────────────
+    let m_f32 = GgufModel::open(d, &path, 256).expect("load f32");
+    // Warm the JIT (first dispatch of each kernel compiles) so tok/s is steady-state.
+    let _ = m_f32.step(d, prompt[0], 0).expect("f32 warmup");
+    let t = Instant::now();
+    let mut decode_steps_f32 = 0usize;
+    let out_f32 = generate(&prompt, &stop, &Sampling::Greedy, 0, |token, pos| {
+        if pos + 1 > prompt.len() { decode_steps_f32 += 1; }
+        m_f32.step(d, token, pos).expect("f32 step")
+    });
+    let f32_secs = t.elapsed().as_secs_f32();
+    let f32_tps = decode_steps_f32 as f32 / f32_secs.max(1e-6);
+    let f32_text = tok.decode(&out_f32);
+    drop(m_f32);
+
+    // ── Q8 path (resident-quantized weights) ──────────────────────────────
+    let m_q8 = GgufModel::open_q8(d, &path, 256).expect("load q8");
+    let _ = m_q8.step(d, prompt[0], 0).expect("q8 warmup");
+    let t = Instant::now();
+    let mut decode_steps_q8 = 0usize;
+    let out_q8 = generate(&prompt, &stop, &Sampling::Greedy, 0, |token, pos| {
+        if pos + 1 > prompt.len() { decode_steps_q8 += 1; }
+        m_q8.step(d, token, pos).expect("q8 step")
+    });
+    let q8_secs = t.elapsed().as_secs_f32();
+    let q8_tps = decode_steps_q8 as f32 / q8_secs.max(1e-6);
+    let q8_text = tok.decode(&out_q8);
+
+    eprintln!("─── decode tok/s (decode-only, greedy) ───");
+    eprintln!("  f32 gemv : {f32_tps:6.2} tok/s  ({decode_steps_f32} steps / {f32_secs:.2}s)");
+    eprintln!("  Q8  gemv : {q8_tps:6.2} tok/s  ({decode_steps_q8} steps / {q8_secs:.2}s)");
+    eprintln!("  speedup  : {:.2}×", q8_tps / f32_tps.max(1e-6));
+    eprintln!("f32 OUTPUT: {f32_text:?}");
+    eprintln!("Q8  OUTPUT: {q8_text:?}");
+    let matched = out_f32 == out_q8;
+    eprintln!("token streams identical: {matched}");
+
+    assert!(q8_text.contains("Paris"), "Q8 path lost coherence, got {q8_text:?}");
+    eprintln!("✅ Resident-Q8 decode coherent on Apple GPU (weights kept Q8, gemv_q8 path).");
+}

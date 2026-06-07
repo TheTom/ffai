@@ -374,6 +374,153 @@ pub fn load_qwen_gguf(
     Ok(ModelWeights { embed, layers, final_norm, lm_head })
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Resident-Q8 GGUF path: keep the big matmul weights QUANTIZED (Q8_0) on the
+// device and decode through `ffai_ops::gemv_q8` instead of dequant-to-f32.
+// ════════════════════════════════════════════════════════════════════════
+//
+// This roughly halves the weight upload (int8 + f32 scale/32 ≈ 1.03 B/weight vs
+// 4 B/weight for f32) AND cuts decode DRAM bandwidth (~4× less weight traffic
+// per matvec — the resident-decode win). Norms/RoPE/attention stay f32 (small).
+// Backend-agnostic: gemv_q8 is the registry-tested Metal/CUDA/Vulkan kernel.
+
+/// One resident-Q8 weight matrix in the layout `ffai_ops::gemv_q8` consumes:
+/// `qs` = int8 codes packed 4-per-u32 (8 u32 per 32-block), `scales` = one f32
+/// per 32-block (`[m*k/32]`). Dense matvec ⇒ `rows_per_group = m`.
+pub struct Q8Mat {
+    pub qs: Tensor,     // [m * k/32 * 8] u32
+    pub scales: Tensor, // [m * k/32]     f32
+    pub m: usize,       // out-dim (rows)
+    pub k: usize,       // in-dim  (cols, multiple of 32)
+}
+
+impl Q8Mat {
+    /// `out[m] = Wq · x[k]` via the resident-Q8 grouped matvec (dense: one group).
+    fn matvec(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+        ops::gemv_q8(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
+    }
+}
+
+/// Per-layer resident-Q8 matmul weights (the 7 big projections). Norms/biases
+/// stay f32 in the parallel [`LayerWeights`].
+pub struct Q8Layer {
+    pub wq: Q8Mat,
+    pub wk: Q8Mat,
+    pub wv: Q8Mat,
+    pub wo: Q8Mat,
+    pub w_gate: Q8Mat,
+    pub w_up: Q8Mat,
+    pub w_down: Q8Mat,
+}
+
+/// Resident-Q8 mirror of [`ModelWeights`]'s big matmuls (`embed`/norms stay f32).
+pub struct Q8Weights {
+    pub lm_head: Q8Mat,
+    pub layers: Vec<Q8Layer>,
+}
+
+/// Upload a 2-D GGUF weight as a resident-Q8 [`Q8Mat`] — Q8_0 tensors are
+/// repacked losslessly, F16/F32 are quantized per-32-block (see
+/// [`ffai_loader::gguf::Gguf::q8_repack`]). No f32 weight upload.
+fn up_q8(dev: &dyn Device, g: &ffai_loader::gguf::Gguf, name: &str) -> Result<Q8Mat> {
+    let (qs, scales, m, k) = g.q8_repack(name)?;
+    let qs_bytes: &[u8] = u32_bytes(&qs);
+    let sc_bytes: &[u8] = bytemuck_cast(&scales);
+    Ok(Q8Mat {
+        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], ffai_core::DType::U32),
+        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], ffai_core::DType::F32),
+        m,
+        k,
+    })
+}
+
+/// Build the resident-Q8 big-matmul weights from a GGUF. Parallel to
+/// [`load_qwen_gguf`], but keeps q/k/v/o + gate/up/down + lm_head QUANTIZED.
+/// `output.weight` falls back to the (tied) `token_embd.weight`.
+pub fn load_qwen_gguf_q8(
+    dev: &dyn Device,
+    g: &ffai_loader::gguf::Gguf,
+    n_layers: usize,
+) -> Result<Q8Weights> {
+    let lm_head = match up_q8(dev, g, "output.weight") {
+        Ok(t) => t,
+        Err(_) => up_q8(dev, g, "token_embd.weight")?, // tied embeddings
+    };
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let p = format!("blk.{l}");
+        layers.push(Q8Layer {
+            wq: up_q8(dev, g, &format!("{p}.attn_q.weight"))?,
+            wk: up_q8(dev, g, &format!("{p}.attn_k.weight"))?,
+            wv: up_q8(dev, g, &format!("{p}.attn_v.weight"))?,
+            wo: up_q8(dev, g, &format!("{p}.attn_output.weight"))?,
+            w_gate: up_q8(dev, g, &format!("{p}.ffn_gate.weight"))?,
+            w_up: up_q8(dev, g, &format!("{p}.ffn_up.weight"))?,
+            w_down: up_q8(dev, g, &format!("{p}.ffn_down.weight"))?,
+        });
+    }
+    Ok(Q8Weights { lm_head, layers })
+}
+
+/// Build the f32 *small* weights for the resident-Q8 path: embed (gather needs
+/// f32), the RMSNorm weights, QKV biases, and final norm. The big matmul slots
+/// in [`ModelWeights`] get a 1-element dummy (the Q8 path never reads them) so
+/// no f32 matmul weight is uploaded. Mirrors [`load_qwen_gguf`]'s f32 dequant
+/// for these small tensors only.
+pub fn load_qwen_gguf_small_f32(
+    dev: &dyn Device,
+    g: &ffai_loader::gguf::Gguf,
+    cfg: &LlamaConfig,
+    n_layers: usize,
+) -> Result<ModelWeights> {
+    let up = |name: &str| -> Result<Tensor> {
+        let t = g
+            .tensor(name)
+            .ok_or_else(|| Error::Msg(format!("gguf: tensor '{name}' not found")))?;
+        let data = g.dequant_f32(name)?;
+        let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
+        let bytes: &[u8] = bytemuck_cast(&data);
+        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+    };
+    // 1-element f32 dummy for the unused big-matmul slots (Q8 path ignores them).
+    let dummy = |dev: &dyn Device| -> Result<Tensor> {
+        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], ffai_core::DType::F32))
+    };
+
+    let embed = up("token_embd.weight")?;
+    let final_norm = up("output_norm.weight")?;
+    let lm_head = dummy(dev)?; // resident-Q8 in Q8Weights
+
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let p = format!("blk.{l}");
+        layers.push(LayerWeights {
+            attn_norm: up(&format!("{p}.attn_norm.weight"))?,
+            wq: dummy(dev)?,
+            wk: dummy(dev)?,
+            wv: dummy(dev)?,
+            wo: dummy(dev)?,
+            bias_q: if cfg.attn_bias { Some(up(&format!("{p}.attn_q.bias"))?) } else { None },
+            bias_k: if cfg.attn_bias { Some(up(&format!("{p}.attn_k.bias"))?) } else { None },
+            bias_v: if cfg.attn_bias { Some(up(&format!("{p}.attn_v.bias"))?) } else { None },
+            q_norm: if cfg.qk_norm { Some(up(&format!("{p}.attn_q_norm.weight"))?) } else { None },
+            k_norm: if cfg.qk_norm { Some(up(&format!("{p}.attn_k_norm.weight"))?) } else { None },
+            mlp_norm: up(&format!("{p}.ffn_norm.weight"))?,
+            w_gate: dummy(dev)?,
+            w_up: dummy(dev)?,
+            w_down: dummy(dev)?,
+        });
+    }
+    Ok(ModelWeights { embed, layers, final_norm, lm_head })
+}
+
+/// `&[u32]` → `&[u8]` for upload (little-endian host). Plain reinterpret.
+fn u32_bytes(v: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding/invalid bit patterns; read-only byte view for
+    // the duration of the upload call.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
 /// `&[f32]` → `&[u8]` for upload (little-endian host; the device consumes raw
 /// f32 bytes). Plain reinterpret — no external dep.
 fn bytemuck_cast(v: &[f32]) -> &[u8] {
@@ -392,6 +539,10 @@ pub struct GgufModel {
     pub n_layers: usize,
     pub vocab: usize,
     cap: usize,
+    /// Resident-Q8 big-matmul weights. When `Some`, `step` decodes through
+    /// `gemv_q8` (weights kept quantized) instead of the f32 `gemv` path; the
+    /// f32 big-matmul slots in `weights` are then unused dummy placeholders.
+    q8: Option<Q8Weights>,
     // Per-layer (k_cache, v_cache), each [n_kv_heads * cap * head_dim] f32.
     kcache: Vec<Tensor>,
     vcache: Vec<Tensor>,
@@ -399,12 +550,26 @@ pub struct GgufModel {
 
 impl GgufModel {
     /// Load from a GGUF path, deriving config from metadata and allocating a
-    /// KV cache of `cap` positions.
+    /// KV cache of `cap` positions. Uses the f32 dequant-to-upload weight path.
     pub fn open(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
         let g = ffai_loader::gguf::Gguf::open(path)?;
         let (cfg, n_layers, vocab) = gguf_config(&g)?;
         let weights = load_qwen_gguf(dev, &g, &cfg, n_layers)?;
         Self::with_weights(dev, cfg, weights, n_layers, vocab, cap)
+    }
+
+    /// Load from a GGUF path keeping the big matmul weights QUANTIZED (Q8) and
+    /// decoding through `gemv_q8`. Only embed/norms/biases are uploaded as f32
+    /// (small), so the weight upload is ~halved and decode reads ~4× less weight
+    /// DRAM. Same geometry/KV-cache as [`open`]; backend-agnostic.
+    pub fn open_q8(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
+        let g = ffai_loader::gguf::Gguf::open(path)?;
+        let (cfg, n_layers, vocab) = gguf_config(&g)?;
+        let weights = load_qwen_gguf_small_f32(dev, &g, &cfg, n_layers)?;
+        let q8 = load_qwen_gguf_q8(dev, &g, n_layers)?;
+        let mut m = Self::with_weights(dev, cfg, weights, n_layers, vocab, cap)?;
+        m.q8 = Some(q8);
+        Ok(m)
     }
 
     /// Construct from already-loaded weights (lets a caller reuse a parsed Gguf
@@ -426,7 +591,7 @@ impl GgufModel {
             kcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], ffai_core::DType::F32));
             vcache.push(Tensor::new(dev.upload(zb)?, vec![nkv_hd * cap], ffai_core::DType::F32));
         }
-        Ok(GgufModel { cfg, weights, n_layers, vocab, cap, kcache, vcache })
+        Ok(GgufModel { cfg, weights, n_layers, vocab, cap, q8: None, kcache, vcache })
     }
 
     /// One decode step: embed `token`, run every layer with KV-cache attention
@@ -450,11 +615,13 @@ impl GgufModel {
 
         for l in 0..self.n_layers {
             let w = &self.weights.layers[l];
+            let q8l = self.q8.as_ref().map(|q| &q.layers[l]);
             // ── attention ──────────────────────────────────────────────
             let h = ops::rms_norm(dev, &x, &w.attn_norm, cfg.eps)?;
-            let mut q = ops::gemv(dev, &w.wq, &h)?;
-            let mut k = ops::gemv(dev, &w.wk, &h)?;
-            let mut v = ops::gemv(dev, &w.wv, &h)?;
+            let (mut q, mut k, mut v) = match q8l {
+                Some(q8) => (q8.wq.matvec(dev, &h)?, q8.wk.matvec(dev, &h)?, q8.wv.matvec(dev, &h)?),
+                None => (ops::gemv(dev, &w.wq, &h)?, ops::gemv(dev, &w.wk, &h)?, ops::gemv(dev, &w.wv, &h)?),
+            };
             if cfg.attn_bias {
                 q = ops::add(dev, &q, w.bias_q.as_ref().unwrap())?;
                 k = ops::add(dev, &k, w.bias_k.as_ref().unwrap())?;
@@ -489,20 +656,32 @@ impl GgufModel {
                 cfg.heads_per_group(),
                 cfg.attn_scale(),
             )?;
-            let o = ops::gemv(dev, &w.wo, &attn.reshaped(vec![nq * hd]))?;
+            let attn_o = attn.reshaped(vec![nq * hd]);
+            let o = match q8l {
+                Some(q8) => q8.wo.matvec(dev, &attn_o)?,
+                None => ops::gemv(dev, &w.wo, &attn_o)?,
+            };
             x = ops::add(dev, &x, &o)?;
 
             // ── MLP (SwiGLU) ───────────────────────────────────────────
             let h2 = ops::rms_norm(dev, &x, &w.mlp_norm, cfg.eps)?;
-            let gate = ops::gemv(dev, &w.w_gate, &h2)?;
-            let up = ops::gemv(dev, &w.w_up, &h2)?;
+            let (gate, up) = match q8l {
+                Some(q8) => (q8.w_gate.matvec(dev, &h2)?, q8.w_up.matvec(dev, &h2)?),
+                None => (ops::gemv(dev, &w.w_gate, &h2)?, ops::gemv(dev, &w.w_up, &h2)?),
+            };
             let act = ops::swiglu(dev, &gate, &up)?;
-            let down = ops::gemv(dev, &w.w_down, &act)?;
+            let down = match q8l {
+                Some(q8) => q8.w_down.matvec(dev, &act)?,
+                None => ops::gemv(dev, &w.w_down, &act)?,
+            };
             x = ops::add(dev, &x, &down)?;
         }
 
         let xn = ops::rms_norm(dev, &x, &self.weights.final_norm, cfg.eps)?;
-        let logits = ops::gemv(dev, &self.weights.lm_head, &xn)?;
+        let logits = match self.q8.as_ref() {
+            Some(q8) => q8.lm_head.matvec(dev, &xn)?,
+            None => ops::gemv(dev, &self.weights.lm_head, &xn)?,
+        };
         dev.synchronize()?;
         let mut bytes = vec![0u8; self.vocab * 4];
         dev.download(logits.buffer.as_ref(), &mut bytes)?;
