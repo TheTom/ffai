@@ -1793,24 +1793,55 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         //   all DN GEMMs, then on-device scatter-add. Uses the device-gather
                         //   path for xs. Eliminates per-expert host syncs + cast overhead.
                         let use_grouped_gemm = std::env::var("NEMOTRON_GROUPED_GEMM").is_ok() && !use_bgemm && !use_w4a16;
+                        // NEMOTRON_MOE_GROUPED=1 (Metal only): replace the per-expert
+                        //   dequant_q4_off+matmul loop with the token-sorted GROUPED Q4
+                        //   GEMM (moe_bgemm_q4_bm64) — ONE MMA dispatch over all sorted
+                        //   rows, Q4 dequant fused in the kernel's block prologue (no
+                        //   per-expert f16 weight materialization). relu²+scale on host
+                        //   f32 (overflow-safe, matches the validated per-expert numerics),
+                        //   then a second grouped GEMM for down, then host scatter. The
+                        //   Metal analog of the CUDA GROUPED_GEMM/BGEMM device path — but
+                        //   those finish with the CUDA-only moe_scatter_add, so this path
+                        //   keeps the portable host relu²/scatter and only swaps the GEMM.
+                        //   bm64 requires n_out % 64 == 0: inter=1856 (29·64) and
+                        //   hid=2688 (42·64) both qualify. Gated off on CUDA (uses the
+                        //   shipped GROUPED_GEMM/BGEMM tensor-core paths instead).
+                        let use_metal_grouped = !is_cuda
+                            && std::env::var("NEMOTRON_MOE_GROUPED").is_ok()
+                            && inter % 64 == 0 && hid % 64 == 0;
                         // Build sorted activation [mt, hid]:
                         // NEMOTRON_DEVICE_GATHER=1: stay on device (gather kernel + cast),
                         //   eliminates the 22MB dl(&xn) + 132MB host scatter per E-layer.
                         // Default: host download + gather (validated path).
                         let dev_gather = std::env::var("NEMOTRON_DEVICE_GATHER").is_ok();
+                        // NEMOTRON_ONDEVICE_MOE=1 (CUDA): keep the validated fewer_syncs
+                        // per-expert cuBLAS GEMM + on-device relu²/scatter, but ALSO gather
+                        // the sorted expert activation ON DEVICE (ffai_gather over xn rows →
+                        // [mt,hid] f16) instead of the dl(&xn)+host-scatter+per-expert
+                        // re-upload. Kills the ~22MB D2H × 23 host gather + the host scatter
+                        // loop — the remaining host wall in the conv-device prefill path.
+                        // Default OFF (host gather is the validated path).
+                        // Only the default fewer_syncs per-expert path consumes the device
+                        // gather; the BGEMM/W4A16/grouped/two_pass paths have their own xs
+                        // handling, so don't hijack their gather when those are selected.
+                        let two_pass_sel = is_cuda && std::env::var("NEMOTRON_TWO_PASS").is_ok();
+                        let fewer_syncs_off = std::env::var("NEMOTRON_FEWER_SYNCS_OFF").is_ok();
+                        let ondevice_moe = is_cuda && std::env::var("NEMOTRON_ONDEVICE_MOE").is_ok()
+                            && !use_bgemm && !use_w4a16 && !use_grouped_gemm && !use_metal_grouped
+                            && !two_pass_sel && !fewer_syncs_off;
                         // xs_dev_f16 is the device version (for DEV_GATHER or BGEMM paths).
                         // xs (host f32 vec) is populated for the default host path.
                         // Build sorted activation [mt, hid]:
                         // For BGEMM: host gather → single device upload (avoids per-expert uploads).
                         // For DEVICE_GATHER: on-device gather (EXPERIMENTAL, may produce wrong output).
                         // Default: host gather (validated path).
-                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || use_w4a16 || dev_gather || use_grouped_gemm {
-                            // Need xn on host for BGEMM/W4A16 (host gather) or DEV_GATHER (gather source).
+                        let xn_h_opt: Option<Vec<f32>> = if use_bgemm || use_w4a16 || dev_gather || use_grouped_gemm || use_metal_grouped {
+                            // Need xn on host for BGEMM/W4A16/METAL_GROUPED (host gather) or DEV_GATHER (gather source).
                             Some(dl(&xn, s * hid))
                         } else {
                             None
                         };
-                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_w4a16 || use_grouped_gemm {
+                        let (xs, xs_dev_f16_opt) = if use_bgemm || use_w4a16 || use_grouped_gemm || use_metal_grouped {
                             // BGEMM/W4A16: host gather → upload xs as one [mt, hid] f16 tensor.
                             let xn_h = xn_h_opt.as_ref().unwrap();
                             let mut xs_h = vec![0.0f32; mt * hid];
@@ -1819,13 +1850,16 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             }
                             let xs_f16 = cast_f32_f16(d, &upm(&xs_h, vec![mt, hid])).unwrap();
                             (Vec::new(), Some(xs_f16))
-                        } else if dev_gather {
-                            // On-device gather (EXPERIMENTAL): upload token indices, gather xn rows.
+                        } else if dev_gather || ondevice_moe {
+                            // On-device gather: upload token indices, gather xn rows on device
+                            // into one [mt,hid] f16 buffer. The fewer_syncs per-expert GEMM
+                            // reads device slices of this (offset g0*hid*2) → no host xs,
+                            // no dl(&xn), no host scatter, no per-expert re-upload.
                             let tok_idx: Vec<u32> = triples.iter().map(|(_,t,_)| *t as u32).collect();
                             let tok_dev = Tensor::new(d.upload(&tbu(&tok_idx)).unwrap(), vec![mt], DType::U32);
                             let xn2d = xn.clone().reshaped(vec![s, hid]);
-                            let xs_f32 = gather(d, &xn2d, &tok_dev).unwrap(); // [mt, hid] f32
-                            let xs_f16 = cast_f32_f16(d, &xs_f32).unwrap();   // [mt, hid] f16
+                            let xs_f32 = pf!(12, 0.0, gather(d, &xn2d, &tok_dev).unwrap()); // [mt, hid] f32
+                            let xs_f16 = pf!(12, 0.0, cast_f32_f16(d, &xs_f32).unwrap());   // [mt, hid] f16
                             (Vec::new(), Some(xs_f16))
                         } else {
                             // Host gather: download xn, scatter rows.
@@ -1991,6 +2025,43 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 moe_scatter_add_det(d, &dn_out, &tidx_h, &wts_dev, &acc_dev, s, mt, hid, 256.0f32).unwrap();
                             }
                             acc_h = dl(&acc_dev, s * hid);
+                        } else if use_metal_grouped {
+                            // ── Metal GROUPED Q4 GEMM path (NEMOTRON_MOE_GROUPED=1) ───────
+                            // Token-sort already done (triples sorted by expert; xs_f16 is
+                            // the [mt, hid] f16 gather in expert order). Run ONE grouped
+                            // Q4 MMA GEMM per pass via moe_bgemm_q4_bm64 — the kernel reads
+                            // each row's expert id from `idx_dev` and dequants that expert's
+                            // Q4 nibbles inline (no per-expert f16 weight slab, no per-expert
+                            // dispatch). relu²+scale stays host-f32 (squares can exceed f16
+                            // max → overflow; this also keeps EXACT-MATCH numerics with the
+                            // validated per-expert path). Host scatter back to token order.
+                            //
+                            // GOTCHA (relu² fusion placement): the CUDA path fuses relu² on
+                            // device (relu2_scale_f16, dispatch_raw_cuda → unavailable on
+                            // Metal). We keep relu² on host f32 between the two grouped GEMMs.
+                            // The down-GEMM's grouping is IDENTICAL to the up-GEMM's (same
+                            // sorted order / same idx_dev), so no re-sort between passes.
+                            let xs_f16 = xs_dev_f16_opt.as_ref().unwrap().clone();
+                            // Per-row expert ids (sorted): drives the bm64 weight selection.
+                            let idx_u32: Vec<u32> = triples.iter().map(|(e,_,_)| *e).collect();
+                            let idx_dev = Tensor::new(d.upload(&tbu(&idx_u32)).unwrap(), vec![mt], DType::U32);
+                            // UP: [mt, inter] = xs[mt,hid] · Wup[expert][inter,hid]ᵀ  (Q4 bm64 MMA)
+                            let up_out = pf!(11, 2.0*mt as f64*inter as f64*hid as f64,
+                                moe_bgemm_q4_bm64(d, &xs_f16, uqs, usc, &idx_dev, mt, inter, hid).unwrap());
+                            // relu² + scale (÷256) on host f32 (overflow-safe, exact-match).
+                            let up_h = dl(&pf!(15, 0.0, cast_f16_f32(d, &up_out).unwrap()), mt * inter);
+                            let a2_h: Vec<f32> = up_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
+                            let a2_f16 = pf!(15, 0.0, cast_f32_f16(d, &upm(&a2_h, vec![mt, inter])).unwrap());
+                            // DOWN: [mt, hid] = a2[mt,inter] · Wdn[expert][hid,inter]ᵀ  (Q4 bm64 MMA)
+                            let dn_out = pf!(11, 2.0*mt as f64*hid as f64*inter as f64,
+                                moe_bgemm_q4_bm64(d, &a2_f16, dqs, dsc, &idx_dev, mt, hid, inter).unwrap());
+                            let dn_h = dl(&pf!(15, 0.0, cast_f16_f32(d, &dn_out).unwrap()), mt * hid);
+                            // Host scatter back to token order (router-weighted, ×256 unscale).
+                            for (r,(_e2, t, w)) in triples.iter().enumerate() {
+                                let dr = &dn_h[r*hid..(r+1)*hid];
+                                let ah = &mut acc_h[(*t)*hid..(*t+1)*hid];
+                                for i in 0..hid { ah[i] += w * dr[i] * 256.0; }
+                            }
                         } else {
                             // ── Per-expert cuBLAS loop ────────────────────────────────────
                             // NEMOTRON_TWO_PASS=1: two-pass variant — all UP GEMMs first
@@ -2048,15 +2119,24 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let mut g1 = g0 + 1;
                                     while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
                                     let rows = g1 - g0;
-                                    let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
+                                    // ONDEVICE_MOE: read A from the device-gathered xs_f16 at
+                                    // byte offset g0*hid*2 (no host slice/upload). Else host path.
+                                    let (xa_buf, xa_off, xg_keep) = if ondevice_moe {
+                                        let xsd = xs_dev_f16_opt.as_ref().unwrap();
+                                        (xsd.buffer.clone(), g0 * hid * 2, None)
+                                    } else {
+                                        let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
+                                        (xg.buffer.clone(), 0usize, Some(xg))
+                                    };
                                     let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
                                     pf!(11, 2.0*rows as f64*inter as f64*hid as f64,
                                         d.gemm_tc_off(
-                                            xg.buffer.as_ref(), 0,
+                                            xa_buf.as_ref(), xa_off,
                                             wup.buffer.as_ref(), 0,
                                             up_all.buffer.as_ref(), g0 * inter * 2,
                                             rows, inter, hid, DType::F16).unwrap());
-                                    keep_up.push(xg); keep_up.push(wup);
+                                    if let Some(xg) = xg_keep { keep_up.push(xg); }
+                                    keep_up.push(wup);
                                     g0 = g1;
                                 }
                                 // relu²+scale: on device (default, fast) or host f32 (deterministic).
