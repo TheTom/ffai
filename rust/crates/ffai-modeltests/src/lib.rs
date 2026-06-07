@@ -2008,7 +2008,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             // moe_scatter_add — so NOTHING is downloaded per expert. One
                             // dl(acc_dev) at the end of the layer replaces the ~2×128
                             // per-expert dl()/cuStreamSynchronize pairs. Implies dev relu².
-                            let fewer_syncs = is_cuda && !two_pass && std::env::var("NEMOTRON_FEWER_SYNCS").is_ok();
+                            // DEFAULT-ON for CUDA: FEWER_SYNCS is now deterministic (the htod
+                            // null-stream race was fixed in metaltile) and +26% at zero cost.
+                            // NEMOTRON_FEWER_SYNCS_OFF=1 reverts to the per-expert dl()/sync path.
+                            let fewer_syncs = is_cuda && !two_pass && std::env::var("NEMOTRON_FEWER_SYNCS_OFF").is_err();
                             let dev_relu2 = is_cuda && !two_pass && (fewer_syncs || std::env::var("NEMOTRON_DEV_RELU2").is_ok());
                             if fewer_syncs {
                                 // ── Batched per-expert path (NEMOTRON_FEWER_SYNCS=1) ──────────
