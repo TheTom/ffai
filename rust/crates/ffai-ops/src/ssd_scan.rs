@@ -91,6 +91,39 @@ extern "C" __global__ void ssd_gather_bc(
 }
 "#;
 
+/// CUDA (FUSED path): gather/cast C,B from [T,G,ds] into PER-GROUP [nc*G, L, ds]
+/// f16 — NO 8× head broadcast (that 8× write is replaced by a device-pointer
+/// array in the batched GEMM, where head h's batch slot points at group h/hpg's
+/// slice). 8× fewer writes / 8× smaller scratch than `ssd_gather_bc`.
+const SSD_GATHER_BC_G_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void ssd_gather_bc_g(
+    const float* __restrict__ b_mat,  // [T, G, ds]
+    const float* __restrict__ c_mat,  // [T, G, ds]
+    __half*      __restrict__ b_out,  // [nc*G, L, ds] f16  (per group)
+    __half*      __restrict__ c_out,  // [nc*G, L, ds] f16  (per group)
+    unsigned int T, unsigned int G,
+    unsigned int L, unsigned int ds, unsigned int nc)
+{
+    unsigned long long n = (unsigned long long)nc * G * L * ds;
+    unsigned long long e = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n) return;
+    unsigned int s   = (unsigned int)(e % ds);
+    unsigned int i   = (unsigned int)((e / ds) % L);
+    unsigned int cg  = (unsigned int)(e / ((unsigned long long)ds * L)); // c*G + g
+    unsigned int c   = cg / G;
+    unsigned int g   = cg % G;
+    unsigned int t   = c * L + i;
+    float bv = 0.f, cv = 0.f;
+    if (t < T) {
+        bv = b_mat[(t * G + g) * ds + s];
+        cv = c_mat[(t * G + g) * ds + s];
+    }
+    b_out[e] = __float2half(bv);
+    c_out[e] = __float2half(cv);
+}
+"#;
+
 /// CUDA: transpose x [T,H,dh] → xT [nc*H, dh, L] (f16). Head h, chunk c.
 const SSD_XT_SRC: &str = r#"
 #include <cuda_fp16.h>
@@ -276,15 +309,27 @@ pub fn ssm_prefill_scan_ssd(
     let l = chunk_len as usize;
     let nc = t.div_ceil(l); // number of chunks (tail zero-padded)
     let bhc = nc * h;       // batch count for the GEMMs
+    let bgc = nc * g;       // per-GROUP batch count (fused path: 8× smaller B/C)
+
+    // FUSED path (DEFAULT-ON; escape NEMOTRON_SSD_FUSED_OFF=1): materialize B/C
+    // only PER-GROUP [nc*G, L, ds] (8× smaller / 8× fewer writes than the
+    // broadcast gather), and fan the head→group slice into the G1/G4 GEMMs via a
+    // per-batch DEVICE POINTER ARRAY (cublasGemmBatchedEx) instead of the 8×
+    // redundant write. cuBLAS tensor cores preserved; argmax bit-identical to the
+    // strided path (same f16 GEMM inputs, just read from the shared group slice).
+    // (NEMOTRON_SSD_FUSED still force-enables it for explicit A/B.)
+    let fused = std::env::var("NEMOTRON_SSD_FUSED_OFF").is_err();
 
     // ── Output + final state (f32, matching the sequential scan). ─────────
     let y = Tensor::empty(dev, vec![t * h * dhu], DType::F32)?;
     let state_out = Tensor::empty(dev, state_in.shape.clone(), DType::F32)?;
 
     // ── Scratch buffers. ──────────────────────────────────────────────────
+    // b/c sized per-GROUP in the fused path (bgc), per-HEAD otherwise (bhc).
+    let bc_batch = if fused { bgc } else { bhc };
     let lcs = Tensor::empty(dev, vec![bhc * l], DType::F32)?;            // [nc*H, L]
-    let b_f16 = Tensor::empty(dev, vec![bhc * l * dsu], DType::F16)?;    // [nc*H, L, ds]
-    let c_f16 = Tensor::empty(dev, vec![bhc * l * dsu], DType::F16)?;    // [nc*H, L, ds]
+    let b_f16 = Tensor::empty(dev, vec![bc_batch * l * dsu], DType::F16)?; // [nc*{G|H}, L, ds]
+    let c_f16 = Tensor::empty(dev, vec![bc_batch * l * dsu], DType::F16)?; // [nc*{G|H}, L, ds]
     let xt = Tensor::empty(dev, vec![bhc * dhu * l], DType::F16)?;       // [nc*H, dh, L]
     let cb = Tensor::empty(dev, vec![bhc * l * l], DType::F16)?;         // [nc*H, L, L]
     let mmask = Tensor::empty(dev, vec![bhc * l * l], DType::F16)?;      // [nc*H, L, L]
@@ -311,24 +356,51 @@ pub fn ssm_prefill_scan_ssd(
     raw(SSD_LCS_SRC, "ssd_lcs.cu", "ssd_lcs",
         &[(bb(dt), 0), (bb(a_log), 0), (bb(&lcs), 0)],
         &[tt, hh, ll, ncn], bhc)?;
-    // 2. Gather B/C (broadcast per head) → f16.
-    raw(SSD_GATHER_BC_SRC, "ssd_gather_bc.cu", "ssd_gather_bc",
-        &[(bb(b_mat), 0), (bb(c_mat), 0), (bb(&b_f16), 0), (bb(&c_f16), 0)],
-        &[tt, hh, gg, hpgn, ll, dsd, ncn], bhc * l * dsu)?;
+    // 2. Gather B/C → f16. Fused: per-GROUP [nc*G,L,ds] (no 8× broadcast).
+    if fused {
+        raw(SSD_GATHER_BC_G_SRC, "ssd_gather_bc_g.cu", "ssd_gather_bc_g",
+            &[(bb(b_mat), 0), (bb(c_mat), 0), (bb(&b_f16), 0), (bb(&c_f16), 0)],
+            &[tt, gg, ll, dsd, ncn], bgc * l * dsu)?;
+    } else {
+        raw(SSD_GATHER_BC_SRC, "ssd_gather_bc.cu", "ssd_gather_bc",
+            &[(bb(b_mat), 0), (bb(c_mat), 0), (bb(&b_f16), 0), (bb(&c_f16), 0)],
+            &[tt, hh, gg, hpgn, ll, dsd, ncn], bhc * l * dsu)?;
+    }
     // 3. Transpose x → xT [nc*H, dh, L] f16.
     raw(SSD_XT_SRC, "ssd_xt.cu", "ssd_xt",
         &[(bb(x), 0), (bb(&xt), 0)],
         &[tt, hh, dhd, ll, ncn], bhc * dhu * l)?;
 
-    // ── G1: CB = C · Bᵀ  [L,L] = C[L,ds]·B[L,ds]ᵀ. Strided-batched. ────────
-    // primitive C[m,n]=X[m,k]·W[n,k]ᵀ → m=L, n=L, k=ds, X=c_f16, W=b_f16.
+    // Byte size of one [L,ds] f16 group slice — the broadcast stride for the
+    // device-pointer arrays (head h → group h/hpg slice c*G + h/hpg).
     let el = 2i64; // f16 element size (bytes)
     let st_lds = (l * dsu) as i64 * el; // stride of one [L,ds] matrix
     let st_ll = (l * l) as i64 * el;
-    dev.gemm_strided_batched(
-        bb(&c_f16), st_lds, bb(&b_f16), st_lds, bb(&cb), st_ll,
-        l, l, dsu, bhc, DType::F16,
-    )?;
+    // head→group slice byte offset for batch bh = c*H + h.
+    let grp_off = |bh: usize| -> usize {
+        let c = bh / h;
+        let hh_ = bh % h;
+        (c * g + hh_ / hpg) * (l * dsu) * (el as usize)
+    };
+
+    // ── G1: CB = C · Bᵀ  [L,L] = C[L,ds]·B[L,ds]ᵀ. ─────────────────────────
+    // primitive C[m,n]=X[m,k]·W[n,k]ᵀ → m=L, n=L, k=ds, X=c_f16, W=b_f16.
+    if fused {
+        // Device-ptr-array batched GEMM: X=C, W=B both point at the per-group
+        // slice (broadcast), out=cb per-head batch slot. m=L,n=L,k=ds.
+        let c_offs: Vec<usize> = (0..bhc).map(grp_off).collect();
+        let b_offs: Vec<usize> = c_offs.clone();
+        let cb_offs: Vec<usize> = (0..bhc).map(|bh| bh * (l * l) * (el as usize)).collect();
+        dev.gemm_batched(
+            bb(&c_f16), &c_offs, bb(&b_f16), &b_offs, bb(&cb), &cb_offs,
+            l, l, dsu, DType::F16,
+        )?;
+    } else {
+        dev.gemm_strided_batched(
+            bb(&c_f16), st_lds, bb(&b_f16), st_lds, bb(&cb), st_ll,
+            l, l, dsu, bhc, DType::F16,
+        )?;
+    }
 
     // 4. M = CB ⊙ Lmask ⊙ dt[j], causal.
     raw(SSD_MMASK_SRC, "ssd_mmask.cu", "ssd_mmask",
@@ -364,10 +436,22 @@ pub fn ssm_prefill_scan_ssd(
 
     // ── G4: CS = C · S_in  [L,dh]. m=L, n=dh, k=ds, X=c_f16, W=sinT[dh,ds]. ─
     let st_dhds = (dhu * dsu) as i64 * el;
-    dev.gemm_strided_batched(
-        bb(&c_f16), st_lds, bb(&sin_t), st_dhds, bb(&cs), st_ldh,
-        l, dhu, dsu, bhc, DType::F16,
-    )?;
+    if fused {
+        // X=C reads the per-group slice (broadcast via grp_off); W=sin_t and
+        // out=cs stay per-head batch slots. m=L, n=dh, k=ds.
+        let c_offs: Vec<usize> = (0..bhc).map(grp_off).collect();
+        let sin_offs: Vec<usize> = (0..bhc).map(|bh| bh * (dhu * dsu) * (el as usize)).collect();
+        let cs_offs: Vec<usize> = (0..bhc).map(|bh| bh * (l * dhu) * (el as usize)).collect();
+        dev.gemm_batched(
+            bb(&c_f16), &c_offs, bb(&sin_t), &sin_offs, bb(&cs), &cs_offs,
+            l, dhu, dsu, DType::F16,
+        )?;
+    } else {
+        dev.gemm_strided_batched(
+            bb(&c_f16), st_lds, bb(&sin_t), st_dhds, bb(&cs), st_ldh,
+            l, dhu, dsu, bhc, DType::F16,
+        )?;
+    }
 
     // 7. Combine → y [T,H,dh] f32.
     raw(SSD_COMBINE_SRC, "ssd_combine.cu", "ssd_combine",
