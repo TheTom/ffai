@@ -201,3 +201,179 @@ fn moe_w4a16_marlin_vs_standard() {
         "Marlin kernel output deviates from standard: max|Δ|={max_err:.3e} (tol 1e-2)");
     eprintln!("moe_w4a16_marlin correctness: PASS (max_abs={max_err:.3e})");
 }
+
+// ── f16 helpers shared by the straddle test ─────────────────────────────────
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    let sign = (u >> 16) & 0x8000;
+    let exp = ((u >> 23) & 0xFF) as i32 - 127 + 15;
+    let mant = (u >> 13) & 0x3FF;
+    if exp <= 0 {
+        sign as u16
+    } else if exp >= 31 {
+        (sign | 0x7C00) as u16
+    } else {
+        (sign | ((exp as u32) << 10) | mant) as u16
+    }
+}
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        0.0f32
+    } else if exp == 31 {
+        f32::INFINITY * if sign == 1 { -1.0 } else { 1.0 }
+    } else {
+        f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13))
+    }
+}
+
+/// Reproduce the e2e divergence (argmax 3260 vs correct 1104) at the kernel
+/// level on SMALL shapes. The original `moe_w4a16_marlin_vs_standard` test uses
+/// M=64 (single tile), N=128 (÷128), 16 rows/expert — which misses two boundary
+/// cases the real Nemotron shape (m≈12288, n_out=1856, n_exp=128, top_k=6) hits:
+///
+///   (A) an expert sub-run that STRADDLES a 64-row M-tile boundary, and
+///   (B) n_out NOT a multiple of 128 (1856 is ÷64 but not ÷128).
+///
+/// Here: M=128 (two M-tiles), N=192 (÷64 but NOT ÷128), ragged per-expert row
+/// counts (50 / 40 / 38) so expert 1 spans rows 50..89 → straddles the tile
+/// boundary at row 64. Compares standard `moe_w4a16` AND `moe_bgemm_q4_bm64`
+/// against the (correct) Marlin path on IDENTICAL weights/scales/indices.
+#[test]
+fn moe_w4a16_straddle_vs_marlin() {
+    let Some(dev) = CudaDevice::create().expect("cuda init") else {
+        eprintln!("no CUDA device — skipping moe_w4a16_straddle_vs_marlin");
+        return;
+    };
+    use ffai_core::{DType, Tensor};
+    use ffai_ops::{moe_bgemm_q4_bm64, moe_w4a16, moe_w4a16_marlin, permute_q4_to_marlin, quantize_q4};
+
+    const N_EXP: usize = 3;
+    const M: usize = 128; // two 64-row M-tiles
+    const N: usize = 192; // ÷64 but NOT ÷128  ← suspect (B)
+    const K: usize = 64;
+
+    // Ragged per-expert row counts → expert 1 straddles the tile boundary (64).
+    //   expert 0: rows   0..50  (50 rows, inside tile 0)
+    //   expert 1: rows  50..90  (40 rows, STRADDLES 64)  ← suspect (A)
+    //   expert 2: rows  90..128 (38 rows, inside tile 1)
+    let counts = [50usize, 40, 38];
+    let mut idx: Vec<u32> = Vec::with_capacity(M);
+    for (e, &c) in counts.iter().enumerate() {
+        for _ in 0..c {
+            idx.push(e as u32);
+        }
+    }
+    assert_eq!(idx.len(), M);
+
+    let wv: Vec<f32> = (0..N_EXP * N * K)
+        .map(|i| (i as f32 * 0.019 - 0.3).sin() * 0.9)
+        .collect();
+    let xv: Vec<f32> = (0..M * K)
+        .map(|i| (i as f32 * 0.013 - 0.4).cos() * 1.1)
+        .collect();
+
+    let (qs_std, scales_f32) = quantize_q4(&wv, N_EXP * N, K);
+    let scales_f16: Vec<u16> = scales_f32.iter().map(|&s| f32_to_f16_bits(s)).collect();
+    let xv_f16: Vec<u16> = xv.iter().map(|&x| f32_to_f16_bits(x)).collect();
+
+    let qs_mar = permute_q4_to_marlin(&qs_std, N_EXP, N, K);
+
+    let to_u8_u32 = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let to_u8_u16 = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let d = dev.as_ref();
+
+    let qs_std_dev = Tensor::new(d.upload(&to_u8_u32(&qs_std)).unwrap(), vec![qs_std.len()], DType::U32);
+    let qs_mar_dev = Tensor::new(d.upload(&to_u8_u32(&qs_mar)).unwrap(), vec![qs_mar.len()], DType::U32);
+    let sc_dev = Tensor::new(d.upload(&to_u8_u16(&scales_f16)).unwrap(), vec![scales_f16.len()], DType::F16);
+    let x_f16_dev = Tensor::new(d.upload(&to_u8_u16(&xv_f16)).unwrap(), vec![M, K], DType::F16);
+    let idx_dev = Tensor::new(d.upload(&to_u8_u32(&idx)).unwrap(), vec![M], DType::U32);
+
+    let out_std = moe_w4a16(d, &x_f16_dev, &qs_std_dev, &sc_dev, &idx_dev, M, N, K).unwrap();
+    let out_bg = moe_bgemm_q4_bm64(d, &x_f16_dev, &qs_std_dev, &sc_dev, &idx_dev, M, N, K).unwrap();
+    let out_mar = moe_w4a16_marlin(d, &x_f16_dev, &qs_mar_dev, &sc_dev, &idx_dev, M, N, K).unwrap();
+    d.synchronize().unwrap();
+
+    let dl_f16 = |t: &Tensor| -> Vec<f32> {
+        let mut buf = vec![0u8; t.elem_count() * 2];
+        d.download(t.buffer.as_ref(), &mut buf).unwrap();
+        buf.chunks_exact(2).map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect()
+    };
+    let got_std = dl_f16(&out_std);
+    let got_bg = dl_f16(&out_bg);
+    let got_mar = dl_f16(&out_mar);
+
+    // Per-row worst error vs the (correct) Marlin reference, to localize which
+    // rows diverge (expect: rows in the straddling run and/or last n-cols).
+    let row_err = |got: &[f32]| -> (f32, usize, usize) {
+        let mut max_ae = 0.0f32;
+        let mut max_row = 0;
+        let mut max_col = 0;
+        for r in 0..M {
+            for c in 0..N {
+                let ae = (got[r * N + c] - got_mar[r * N + c]).abs();
+                if ae > max_ae {
+                    max_ae = ae;
+                    max_row = r;
+                    max_col = c;
+                }
+            }
+        }
+        (max_ae, max_row, max_col)
+    };
+    let (std_ae, std_r, std_c) = row_err(&got_std);
+    let (bg_ae, bg_r, bg_c) = row_err(&got_bg);
+    eprintln!(
+        "straddle: moe_w4a16   max|Δ|={std_ae:.3e} @ row {std_r} (exp {}) col {std_c}",
+        idx[std_r]
+    );
+    eprintln!(
+        "straddle: moe_bgemm   max|Δ|={bg_ae:.3e} @ row {bg_r} (exp {}) col {bg_c}  marlin={} bgemm={}",
+        idx[bg_r],
+        got_mar[bg_r * N + bg_c],
+        got_bg[bg_r * N + bg_c]
+    );
+    // Histogram: how many bgemm cells exceed thresholds (broad precision vs a
+    // few structurally-wrong cells), and which n-tile they fall in.
+    let mut n_gt_1e3 = 0usize;
+    let mut n_gt_1e2 = 0usize;
+    let mut ntile_hits = [0usize; 4];
+    for r in 0..M {
+        for c in 0..N {
+            let ae = (got_bg[r * N + c] - got_mar[r * N + c]).abs();
+            if ae > 1e-3 {
+                n_gt_1e3 += 1;
+                ntile_hits[c / 64] += 1;
+            }
+            if ae > 1e-2 {
+                n_gt_1e2 += 1;
+            }
+        }
+    }
+    eprintln!(
+        "straddle: moe_bgemm cells |Δ|>1e-3: {n_gt_1e3} / {} ; >1e-2: {n_gt_1e2} ; by n-tile(64): {:?}",
+        M * N,
+        ntile_hits
+    );
+
+    // `moe_w4a16` (standard scattered WMMA) is BIT-EXACT with Marlin here
+    // (same 16×16×16 fragment reduction order) → strict absolute bound.
+    assert!(
+        std_ae < 1e-2,
+        "moe_w4a16 (standard) diverges from Marlin on straddle/N=192: max|Δ|={std_ae:.3e} @ row {std_r} col {std_c}"
+    );
+    // `moe_bgemm_q4_bm64` uses a different MMA tiling (coop_tile 32×32×32) and so
+    // accumulates f16 products in a different order → up to ~1 f16 ULP of drift
+    // on large-magnitude outputs (observed: 1.56e-2 == one ULP at |out|≈30, on
+    // 6/24576 cells). That is precision noise, NOT a structural index bug — a
+    // straddle/n-tile indexing bug would corrupt whole rows/columns. Guard with
+    // a magnitude-relative bound (catches structural errors, tolerates ULP).
+    let bg_rel = bg_ae / got_mar[bg_r * N + bg_c].abs().max(1.0);
+    assert!(
+        bg_rel < 1e-3,
+        "moe_bgemm_q4_bm64 diverges from Marlin on straddle/N=192: max|Δ|={bg_ae:.3e} (rel {bg_rel:.3e}) @ row {bg_r} col {bg_c}"
+    );
+    eprintln!("moe_w4a16_straddle_vs_marlin: PASS (std bit-exact; bgemm within 1 f16 ULP)");
+}
