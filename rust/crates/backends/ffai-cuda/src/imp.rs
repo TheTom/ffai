@@ -24,7 +24,22 @@ fn dispatch_err(e: MetalTileError) -> Error {
 /// A compiled module, cached for reuse. The raw `CUmodule` is single-
 /// context; we only ever touch it through its owning device, so the manual
 /// `Send`/`Sync` are sound for our serialized-submission usage.
-struct CachedModule(CudaModule);
+///
+/// Holds an `Arc<MtCudaDevice>` so the CUDA CONTEXT outlives this module. A
+/// `CudaModule`'s `Drop` calls `cuModuleUnload`, which faults
+/// (STATUS_ACCESS_VIOLATION, 0xc0000005) if the context was already destroyed —
+/// which is exactly what happened at process teardown: this device's `dev` field
+/// (its only context-keepalive) dropped before the `modules` cache, destroying
+/// the context, then the cached modules unloaded into the dead context. Pinning
+/// the context here (and dropping `module` before `_dev` via field order below)
+/// guarantees the module always unloads while its context is still live — the
+/// same invariant `CudaBuffer` already upholds for device allocations.
+struct CachedModule {
+    // Field DECLARATION ORDER is DROP ORDER: `module` (cuModuleUnload) must run
+    // BEFORE `_dev` (which may drop the last Arc and destroy the context).
+    module: CudaModule,
+    _dev: Arc<MtCudaDevice>,
+}
 unsafe impl Send for CachedModule {}
 unsafe impl Sync for CachedModule {}
 
@@ -76,7 +91,7 @@ impl CudaDevice {
             .dev
             .compile(&src, &format!("{}.cu", kernel.name))
             .map_err(dispatch_err)?;
-        let cached = Arc::new(CachedModule(module));
+        let cached = Arc::new(CachedModule { module, _dev: self.dev.clone() });
         self.modules
             .write()
             .unwrap()
@@ -156,7 +171,7 @@ impl Device for CudaDevice {
 
     fn dispatch(&self, kernel: &Kernel, bindings: &[Binding], grid: Grid) -> Result<()> {
         let module = self.module_for(kernel)?;
-        let func = module.0.function(&kernel.name).map_err(dispatch_err)?;
+        let func = module.module.function(&kernel.name).map_err(dispatch_err)?;
         let skey = (kernel.name.clone(), grid.block[0]);
         let shared = if let Some(&s) = self.shared.read().unwrap().get(&skey) {
             s
@@ -251,11 +266,11 @@ impl Device for CudaDevice {
             m
         } else {
             let m = self.dev.compile(src, prog_name).map_err(dispatch_err)?;
-            let cached = Arc::new(CachedModule(m));
+            let cached = Arc::new(CachedModule { module: m, _dev: self.dev.clone() });
             self.modules.write().unwrap().insert(fn_name.to_string(), cached.clone());
             cached
         };
-        let func = module.0.function(fn_name).map_err(dispatch_err)?;
+        let func = module.module.function(fn_name).map_err(dispatch_err)?;
 
         // Build args: device pointers (with offset applied) then scalar bytes.
         let mut ptr_store: Vec<u64> = Vec::new();
