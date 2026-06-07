@@ -2522,7 +2522,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let use_tc_attn = is_cuda && match std::env::var("NEMOTRON_PREFILL_TCATTN").ok().as_deref() {
                             Some("0") => false,
                             Some(_) => true,
-                            None => (base + s) >= 4096,
+                            // Default-on the tensor-core flash-attn for any real prefill
+                            // chunk (s>=512): the software-MMA sdpa_multi runs at ~0.5% MFU
+                            // and was 16% of the S2048 forward; the TC path is 9-14x faster.
+                            // (Was base+s>=4096, which left S2048/d0 on the slow path.)
+                            None => s >= 512 || (base + s) >= 4096,
                         };
                         let attn = if use_tc_attn {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
