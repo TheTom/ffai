@@ -239,6 +239,41 @@ extern "C" __global__ void ssd_recur(
 }
 "#;
 
+/// Varlen inter-chunk recurrence. Identical to `ssd_recur` but resets the
+/// carried state to zero at every chunk flagged in `seg_reset[c]` — i.e. the
+/// first chunk of each packed sequence starts fresh. Requires each packed
+/// segment length to be a multiple of `L` (chunk_len) so no chunk straddles a
+/// boundary. With an all-zero `seg_reset` this is bit-identical to `ssd_recur`.
+const SSD_RECUR_VARLEN_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void ssd_recur_varlen(
+    const __half* __restrict__ s_chunk,  // [nc*H, ds, dh]
+    const float*  __restrict__ lcs,      // [nc*H, L]
+    const float*  __restrict__ state_in, // [H, dh, ds] f32
+    const unsigned int* __restrict__ seg_reset, // [nc] 1 → chunk starts a new sequence
+    __half*       __restrict__ sin_t,    // [nc*H, dh, ds] f16
+    float*        __restrict__ state_out,// [H, dh, ds] f32
+    unsigned int H, unsigned int dh, unsigned int ds, unsigned int L, unsigned int nc)
+{
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long tot = (unsigned long long)H * ds * dh;
+    if (idx >= tot) return;
+    unsigned int p  = (unsigned int)(idx % dh);
+    unsigned int s  = (unsigned int)((idx / dh) % ds);
+    unsigned int h  = (unsigned int)(idx / ((unsigned long long)dh * ds));
+    float st = state_in[(h * dh + p) * ds + s];
+    for (unsigned int c = 0; c < nc; ++c) {
+        if (seg_reset[c]) st = 0.0f;       // packed boundary → fresh recurrent state
+        unsigned int bh = c * H + h;
+        sin_t[(bh * dh + p) * ds + s] = __float2half(st);
+        float alpha = expf(lcs[bh * L + (L - 1)]);
+        float sc = __half2float(s_chunk[(bh * ds + s) * dh + p]);
+        st = alpha * st + sc;
+    }
+    state_out[(h * dh + p) * ds + s] = st;
+}
+"#;
+
 /// CUDA: final combine. y[t,h,p] = y_intra[bh,i,p] + exp(Lcs[bh,i])·CS[bh,i,p]
 ///   + x[t,h,p]·D[h]. y_intra, CS are f16 [nc*H, L, dh]; output y f32 [T,H,dh].
 const SSD_COMBINE_SRC: &str = r#"
@@ -293,6 +328,10 @@ pub fn ssm_prefill_scan_ssd(
     n_heads: u32,
     n_groups: u32,
     chunk_len: u32,
+    // Varlen packed-prefill: `[nc]` u32 buffer, 1 where a chunk starts a new
+    // packed sequence (resets the recurrent state). `None` = single sequence
+    // (dense path, bit-identical to before).
+    seg_reset: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     if (dh, ds, n_heads, n_groups) != (64, 128, 64, 8) {
         return Err(Error::Msg(format!(
@@ -430,9 +469,15 @@ pub fn ssm_prefill_scan_ssd(
     )?;
 
     // 6. Serial inter-chunk recurrence → SinT [nc*H, dh, ds] + state_out.
-    raw(SSD_RECUR_SRC, "ssd_recur.cu", "ssd_recur",
-        &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
-        &[hh, dhd, dsd, ll, ncn], h * dsu * dhu)?;
+    //    Varlen: reset state at packed-sequence boundaries (seg_reset[c]).
+    match seg_reset {
+        Some(sr) => raw(SSD_RECUR_VARLEN_SRC, "ssd_recur_varlen.cu", "ssd_recur_varlen",
+            &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(sr), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
+            &[hh, dhd, dsd, ll, ncn], h * dsu * dhu)?,
+        None => raw(SSD_RECUR_SRC, "ssd_recur.cu", "ssd_recur",
+            &[(bb(&s_chunk), 0), (bb(&lcs), 0), (bb(state_in), 0), (bb(&sin_t), 0), (bb(&state_out), 0)],
+            &[hh, dhd, dsd, ll, ncn], h * dsu * dhu)?,
+    };
 
     // ── G4: CS = C · S_in  [L,dh]. m=L, n=dh, k=ds, X=c_f16, W=sinT[dh,ds]. ─
     let st_dhds = (dhu * dsu) as i64 * el;

@@ -1466,6 +1466,13 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         // Disable with NEMOTRON_NO_W16CACHE=1 (A/B).
         let w16: std::cell::RefCell<HashMap<String, Tensor>> = std::cell::RefCell::new(HashMap::new());
         let no_w16 = std::env::var("NEMOTRON_NO_W16CACHE").is_ok();
+        // NEMOTRON_RESIDENT_W16=1: ALSO cache the routed-expert up/down f16 weights
+        // resident (not just dense+shared). ~44.8 GB extra f16 on GB10 (62 GB total
+        // resident). Kills the routed-expert per-forward dequant (the remaining
+        // ~42% of prefill) at the cost of streaming a fat f16 expert pool from the
+        // unified-memory pool. Honest A/B lever — measure dequant%→0 vs the GEMM
+        // becoming bandwidth-bound on the larger f16 working set.
+        let resident_w16 = std::env::var("NEMOTRON_RESIDENT_W16").map(|v| v != "0" && v != "false").unwrap_or(false);
         // Greedy token chain (same as sequential): we need the S token ids. The
         // sequential path feeds argmax-of-previous; to reproduce it EXACTLY for
         // the correctness gate we run the sequential path's token chain here too
@@ -1539,8 +1546,10 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // a block offset for one MoE expert) and store under `key`. Returns a
             // cheap Tensor clone (Arc buffer). `cache=false` (or NEMOTRON_NO_W16CACHE)
             // → always dequant, no store. We CACHE the dense projection + shared
-            // weights (small, always used: ~few GB) but NOT the 128 routed experts
-            // ×23 layers (≈59GB f16 → OOM at large S); those re-dequant per forward.
+            // weights (small, always used: ~few GB) by default. The 128 routed
+            // experts ×23 layers (~44.8 GB f16) re-dequant per forward UNLESS
+            // NEMOTRON_RESIDENT_W16=1 (`resident_w16`), which also caches them
+            // resident — fits GB10's 121 GB unified pool (~62 GB total resident).
             let deq16c = |key: &str, qs: &Tensor, sc: &Tensor, m: usize, k: usize, blk_off: usize, cache: bool| -> Tensor {
                 if no_w16 || !cache {
                     return pf!(3, (m * k) as f64, dequant_q4_off(d, qs, sc, m, k, DType::F16, blk_off).unwrap());
@@ -1669,7 +1678,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let (so, y_dev) = if use_ssd_port {
                                 pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                             } else if use_ssd {
-                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
+                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, None).unwrap())
                             } else if use_chunked {
                                 pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                             } else {
@@ -1755,7 +1764,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let (so, y_dev) = if use_ssd_port {
                             pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                         } else if use_ssd {
-                            pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
+                            pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, None).unwrap())
                         } else if use_chunked {
                             pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                         } else {
@@ -2183,7 +2192,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                         let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
                                         (xg.buffer.clone(), 0usize, Some(xg))
                                     };
-                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, resident_w16);
                                     pf!(11, 2.0*rows as f64*inter as f64*hid as f64,
                                         d.gemm_tc_off(
                                             xa_buf.as_ref(), xa_off,
@@ -2213,7 +2222,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     let mut g1 = g0 + 1;
                                     while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
                                     let rows = g1 - g0;
-                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, false);
+                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, resident_w16);
                                     pf!(11, 2.0*rows as f64*hid as f64*inter as f64,
                                         d.gemm_tc_off(
                                             a2_all.buffer.as_ref(), g0 * inter * 2,
@@ -2278,7 +2287,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                     while g1 < mt && triples[g1].0 as usize == e { g1 += 1; }
                                     let rows = g1 - g0;
                                     let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
-                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, resident_w16);
                                     let a = gemm_cublas(d, &xg, &wup, rows, inter, hid).unwrap();
                                     up_batches.push(ExpertBatch { e, g0, g1, a, _xg: xg, _wup: wup });
                                     g0 = g1;
@@ -2299,7 +2308,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                 let mut dn_batches: Vec<DownBatch> = Vec::new();
                                 for (b, a2) in up_batches.iter().zip(&a2s) {
                                     let rows = b.g1 - b.g0;
-                                    let wdn = deq16c(&format!("{p}.dn.{}", b.e), dqs, dsc, hid, inter, b.e*hid*down_bpr, false);
+                                    let wdn = deq16c(&format!("{p}.dn.{}", b.e), dqs, dsc, hid, inter, b.e*hid*down_bpr, resident_w16);
                                     let dn = gemm_cublas(d, a2, &wdn, rows, hid, inter).unwrap();
                                     dn_batches.push(DownBatch { dn, g0: b.g0, g1: b.g1, _wdn: wdn });
                                 }
@@ -2359,7 +2368,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                         dl(&dn, rows*hid)
                                     } else {
                                     let xg = cast_f32_f16(d, &upm(&xs[g0*hid..g1*hid], vec![rows, hid])).unwrap();
-                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, false);
+                                    let wup = deq16c(&format!("{p}.up.{e}"), uqs, usc, inter, hid, e*inter*up_bpr, resident_w16);
                                     let a = pf!(11, 2.0*rows as f64*inter as f64*hid as f64, gemm_cublas(d, &xg, &wup, rows, inter, hid).unwrap());
                                     let a2 = if dev_relu2 {
                                         pf!(3, 0.0, relu2_scale_f16(d, &a, inv).unwrap())
@@ -2368,7 +2377,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                                         let a2_h: Vec<f32> = a_h.iter().map(|&v| { let r = v.max(0.0); r*r*inv }).collect();
                                         cast_f32_f16(d, &upm(&a2_h, vec![rows, inter])).unwrap()
                                     };
-                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, false);
+                                    let wdn = deq16c(&format!("{p}.dn.{e}"), dqs, dsc, hid, inter, e*hid*down_bpr, resident_w16);
                                     let dn = pf!(11, 2.0*rows as f64*hid as f64*inter as f64, gemm_cublas(d, &a2, &wdn, rows, hid, inter).unwrap());
                                     dl(&cast_f16_f32(d, &dn).unwrap(), rows*hid)
                                     };

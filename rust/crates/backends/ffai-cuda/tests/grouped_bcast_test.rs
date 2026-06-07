@@ -118,7 +118,7 @@ fn fused_vs_nonfused_multichunk() {
     let mkf = |v: &[f32], n: usize| Tensor::new(d.upload(&v.iter().flat_map(|x|x.to_le_bytes()).collect::<Vec<u8>>()).unwrap(), vec![n], DType::F32);
     let xt=mkf(&x,t*h*dh); let at=mkf(&a_log,h); let bt=mkf(&b,t*ng*ds); let ct=mkf(&c,t*ng*ds);
     let dtk=mkf(&dsk,h); let dtt=mkf(&dt,t*h); let sit=mkf(&si,h*dh*ds);
-    let call = || ssm_prefill_scan_ssd(d,&xt,&at,&bt,&ct,&dtk,&dtt,&sit,t as u32,dh as u32,ds as u32,h as u32,ng as u32,l).unwrap();
+    let call = || ssm_prefill_scan_ssd(d,&xt,&at,&bt,&ct,&dtk,&dtt,&sit,t as u32,dh as u32,ds as u32,h as u32,ng as u32,l,None).unwrap();
     // Reference: non-fused strided path (NEMOTRON_SSD_FUSED_OFF disables fusion).
     unsafe { std::env::set_var("NEMOTRON_SSD_FUSED_OFF", "1"); }
     let (_, y_ref) = call(); d.synchronize().unwrap();

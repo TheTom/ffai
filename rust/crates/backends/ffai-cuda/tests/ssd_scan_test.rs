@@ -48,7 +48,7 @@ fn run_for_len(dev: &dyn Device, t: usize, l: u32) {
     // SSD matmul path (on device).
     let (so_ssd, y_ssd) = ssm_prefill_scan_ssd(
         dev, &xt, &at, &bt, &ct, &dt_t, &dtt, &sit,
-        t as u32, dh as u32, ds as u32, h as u32, ng as u32, l,
+        t as u32, dh as u32, ds as u32, h as u32, ng as u32, l, None,
     ).unwrap();
     dev.synchronize().unwrap();
 
