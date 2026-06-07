@@ -71,6 +71,8 @@ pub struct Gguf {
     pub metadata_arr_str: BTreeMap<String, Vec<String>>,
     /// Int-array metadata (e.g. `tokenizer.ggml.token_type`).
     pub metadata_arr_i32: BTreeMap<String, Vec<i32>>,
+    /// f32-array metadata (e.g. `tokenizer.ggml.scores` for SentencePiece).
+    pub metadata_arr_f32: BTreeMap<String, Vec<f32>>,
 }
 
 struct Cursor<'a> {
@@ -183,6 +185,7 @@ struct ParsedHeader {
     metadata_f32: BTreeMap<String, f32>,
     metadata_arr_str: BTreeMap<String, Vec<String>>,
     metadata_arr_i32: BTreeMap<String, Vec<i32>>,
+    metadata_arr_f32: BTreeMap<String, Vec<f32>>,
     tensors: Vec<GgufTensor>,
     data_start: usize,
 }
@@ -207,6 +210,7 @@ fn parse_header(bytes: &[u8], path: &str) -> Result<ParsedHeader> {
     let mut metadata_f32 = BTreeMap::new();
     let mut metadata_arr_str: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut metadata_arr_i32: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    let mut metadata_arr_f32: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     let mut alignment: u64 = 32;
     for _ in 0..n_kv {
         let key = c.gstr();
@@ -230,6 +234,15 @@ fn parse_header(bytes: &[u8], path: &str) -> Result<ParsedHeader> {
                         v.push(u.unwrap_or(0) as i32);
                     }
                     metadata_arr_i32.insert(key.clone(), v);
+                }
+                6 => {
+                    // f32 array (e.g. SentencePiece `tokenizer.ggml.scores`).
+                    let mut v = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let (_, fl, _) = c.read_scalar(et);
+                        v.push(fl.unwrap_or(0.0));
+                    }
+                    metadata_arr_f32.insert(key.clone(), v);
                 }
                 _ => { for _ in 0..len { c.skip_one(et); } }
             }
@@ -268,6 +281,7 @@ fn parse_header(bytes: &[u8], path: &str) -> Result<ParsedHeader> {
         metadata_f32,
         metadata_arr_str,
         metadata_arr_i32,
+        metadata_arr_f32,
         tensors,
         data_start,
     })
@@ -346,6 +360,7 @@ impl Gguf {
             metadata_f32: m.metadata_f32,
             metadata_arr_str: m.metadata_arr_str,
             metadata_arr_i32: m.metadata_arr_i32,
+            metadata_arr_f32: m.metadata_arr_f32,
         })
     }
 

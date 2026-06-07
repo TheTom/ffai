@@ -375,6 +375,139 @@ pub fn load_qwen_gguf(
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Phi-3 GGUF path: FUSED attention/MLP tensors split at load.
+// ════════════════════════════════════════════════════════════════════════
+//
+// Phi-3 (arch="phi3") is a standard RMSNorm + RoPE + GQA + SwiGLU transformer —
+// the same forward graph as Qwen — but llama.cpp ships two of its projections
+// FUSED into single tensors:
+//   * `blk.N.attn_qkv.weight`  — Q‖K‖V stacked  [out=(nq+2·nkv)·hd, in=hidden]
+//   * `blk.N.ffn_up.weight`    — gate‖up stacked [out=2·intermediate, in=hidden]
+// (no separate `attn_q/attn_k/attn_v` or `ffn_gate`). Phi-3 has NO QKV bias and
+// NO q/k-norm, so once the fused tensors are split into the builder's q/k/v +
+// gate/up slots, the existing Qwen f32 forward path (`GgufModel::step`) runs it
+// unchanged. The split is a pure row-range slice of the row-major [out,in] f32
+// buffer (fused weights are simple row concatenations), so it is exact — no
+// re-quant, backend-agnostic (host-side slice → f32 upload → registry ops).
+
+/// True when the GGUF declares the Phi-3 architecture (fused qkv/ffn_up).
+pub fn gguf_is_phi3(g: &ffai_loader::gguf::Gguf) -> bool {
+    g.meta_str("general.architecture") == Some("phi3")
+        || g.tensor("blk.0.attn_qkv.weight").is_some()
+}
+
+/// Dequant a 2-D GGUF weight to a row-major f32 `[out, in]` buffer plus its
+/// `(out, in)` dims. GGUF stores dims fastest-first, so a logical `[out, in]`
+/// matrix is listed as `dims=[in, out]`; the dequantized buffer is row-major
+/// `[out, in]`. Shared by the fused-tensor split below.
+fn dequant_2d(g: &ffai_loader::gguf::Gguf, name: &str) -> Result<(Vec<f32>, usize, usize)> {
+    let t = g
+        .tensor(name)
+        .ok_or_else(|| Error::Msg(format!("gguf: tensor '{name}' not found")))?;
+    if t.dims.len() != 2 {
+        return Err(Error::Msg(format!("gguf: '{name}' expected 2-D, got {:?}", t.dims)));
+    }
+    let in_dim = t.dims[0] as usize; // fastest (row stride)
+    let out_dim = t.dims[1] as usize; // rows
+    let data = g.dequant_f32(name)?;
+    Ok((data, out_dim, in_dim))
+}
+
+/// Upload a contiguous row slice `[r0, r1)` of a row-major `[out, in]` f32 buffer
+/// as a `[r1-r0, in]` weight tensor — the per-projection slab carved from a
+/// fused GGUF tensor.
+fn upload_rows(
+    dev: &dyn Device,
+    data: &[f32],
+    in_dim: usize,
+    r0: usize,
+    r1: usize,
+) -> Result<Tensor> {
+    let slab = &data[r0 * in_dim..r1 * in_dim];
+    let bytes: &[u8] = bytemuck_cast(slab);
+    Ok(Tensor::new(dev.upload(bytes)?, vec![r1 - r0, in_dim], ffai_core::DType::F32))
+}
+
+/// Build [`ModelWeights`] from a **Phi-3** GGUF (f32 dequant-to-upload),
+/// splitting the fused `attn_qkv` → q/k/v and `ffn_up` → gate/up at load.
+/// Parallel to [`load_qwen_gguf`]; the rest of the graph is identical (Phi-3 has
+/// no QKV bias, no q/k-norm).
+pub fn load_phi3_gguf(
+    dev: &dyn Device,
+    g: &ffai_loader::gguf::Gguf,
+    cfg: &LlamaConfig,
+    n_layers: usize,
+) -> Result<ModelWeights> {
+    // Generic upload (handles 1-D norms and 2-D weights), matching
+    // [`load_qwen_gguf`]'s `up`: GGUF dims are fastest-first, so reverse them.
+    let up = |name: &str| -> Result<Tensor> {
+        let t = g
+            .tensor(name)
+            .ok_or_else(|| Error::Msg(format!("gguf: tensor '{name}' not found")))?;
+        let data = g.dequant_f32(name)?;
+        let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
+        let bytes: &[u8] = bytemuck_cast(&data);
+        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+    };
+
+    let embed = up("token_embd.weight")?;
+    let final_norm = up("output_norm.weight")?;
+    let lm_head = match up("output.weight") {
+        Ok(t) => t,
+        Err(_) => up("token_embd.weight")?, // tied embeddings
+    };
+
+    let q_out = cfg.n_q_heads * cfg.head_dim;
+    let kv_out = cfg.n_kv_heads * cfg.head_dim;
+
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let p = format!("blk.{l}");
+
+        // Fused QKV: rows [0,q_out) = Q, [q_out,q_out+kv_out) = K, then V.
+        let (qkv, qkv_out, qkv_in) = dequant_2d(g, &format!("{p}.attn_qkv.weight"))?;
+        if qkv_out != q_out + 2 * kv_out {
+            return Err(Error::Msg(format!(
+                "phi3 '{p}.attn_qkv': out {qkv_out} != q({q_out})+2·kv({kv_out})"
+            )));
+        }
+        let wq = upload_rows(dev, &qkv, qkv_in, 0, q_out)?;
+        let wk = upload_rows(dev, &qkv, qkv_in, q_out, q_out + kv_out)?;
+        let wv = upload_rows(dev, &qkv, qkv_in, q_out + kv_out, q_out + 2 * kv_out)?;
+
+        // Fused gate/up: rows [0,inter) = gate, [inter,2·inter) = up.
+        let (gu, gu_out, gu_in) = dequant_2d(g, &format!("{p}.ffn_up.weight"))?;
+        if gu_out != 2 * cfg.intermediate {
+            return Err(Error::Msg(format!(
+                "phi3 '{p}.ffn_up': out {gu_out} != 2·intermediate({})",
+                cfg.intermediate
+            )));
+        }
+        let w_gate = upload_rows(dev, &gu, gu_in, 0, cfg.intermediate)?;
+        let w_up = upload_rows(dev, &gu, gu_in, cfg.intermediate, 2 * cfg.intermediate)?;
+
+        layers.push(LayerWeights {
+            attn_norm: up(&format!("{p}.attn_norm.weight"))?,
+            wq,
+            wk,
+            wv,
+            wo: up(&format!("{p}.attn_output.weight"))?,
+            bias_q: None,
+            bias_k: None,
+            bias_v: None,
+            q_norm: None,
+            k_norm: None,
+            mlp_norm: up(&format!("{p}.ffn_norm.weight"))?,
+            w_gate,
+            w_up,
+            w_down: up(&format!("{p}.ffn_down.weight"))?,
+        });
+    }
+
+    Ok(ModelWeights { embed, layers, final_norm, lm_head })
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Resident-Q8 GGUF path: keep the big matmul weights QUANTIZED (Q8_0) on the
 // device and decode through `ffai_ops::gemv_q8` instead of dequant-to-f32.
 // ════════════════════════════════════════════════════════════════════════
@@ -460,6 +593,154 @@ pub fn load_qwen_gguf_q8(
         });
     }
     Ok(Q8Weights { lm_head, layers })
+}
+
+/// Quantize a row-major `[m, k]` f32 slab into a resident-Q8 [`Q8Mat`] using the
+/// identical per-32-block amax/127 scheme as [`ffai_loader::gguf::Gguf::q8_repack`].
+/// Used to carve Q8 sub-matrices from Phi-3's fused (already-dequantized) tensors.
+fn q8mat_from_f32(dev: &dyn Device, w: &[f32], m: usize, k: usize) -> Result<Q8Mat> {
+    if k % 32 != 0 {
+        return Err(Error::Msg(format!("q8mat_from_f32: in-dim {k} not a multiple of 32")));
+    }
+    let bpr = k / 32;
+    let mut qs = vec![0u32; m * bpr * 8];
+    let mut scales = vec![0f32; m * bpr];
+    for r in 0..m {
+        for b in 0..bpr {
+            let base = r * k + b * 32;
+            let amax = (0..32).fold(0f32, |a, i| a.max(w[base + i].abs()));
+            let d = amax / 127.0;
+            scales[r * bpr + b] = d;
+            let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+            for w_i in 0..8 {
+                let mut packed = 0u32;
+                for i in 0..4 {
+                    let q = (w[base + w_i * 4 + i] * inv).round().clamp(-127.0, 127.0) as i32;
+                    packed |= ((q as u8) as u32) << (i * 8);
+                }
+                qs[r * bpr * 8 + b * 8 + w_i] = packed;
+            }
+        }
+    }
+    let qs_bytes: &[u8] = u32_bytes(&qs);
+    let sc_bytes: &[u8] = bytemuck_cast(&scales);
+    Ok(Q8Mat {
+        qs: Tensor::new(dev.upload(qs_bytes)?, vec![qs.len()], ffai_core::DType::U32),
+        scales: Tensor::new(dev.upload(sc_bytes)?, vec![scales.len()], ffai_core::DType::F32),
+        m,
+        k,
+    })
+}
+
+/// Resident-Q8 mirror of [`load_phi3_gguf`]: keeps q/k/v/o + gate/up/down +
+/// lm_head QUANTIZED, splitting the fused `attn_qkv`/`ffn_up` row-ranges first
+/// (re-quantized per-32-block from the exact f32 slabs).
+pub fn load_phi3_gguf_q8(
+    dev: &dyn Device,
+    g: &ffai_loader::gguf::Gguf,
+    cfg: &LlamaConfig,
+    n_layers: usize,
+) -> Result<Q8Weights> {
+    let lm_head = match up_q8(dev, g, "output.weight") {
+        Ok(t) => t,
+        Err(_) => up_q8(dev, g, "token_embd.weight")?, // tied embeddings
+    };
+    let q_out = cfg.n_q_heads * cfg.head_dim;
+    let kv_out = cfg.n_kv_heads * cfg.head_dim;
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let p = format!("blk.{l}");
+
+        let (qkv, qkv_out, qkv_in) = dequant_2d(g, &format!("{p}.attn_qkv.weight"))?;
+        if qkv_out != q_out + 2 * kv_out {
+            return Err(Error::Msg(format!(
+                "phi3 '{p}.attn_qkv': out {qkv_out} != q({q_out})+2·kv({kv_out})"
+            )));
+        }
+        let wq = q8mat_from_f32(dev, &qkv[0..q_out * qkv_in], q_out, qkv_in)?;
+        let wk = q8mat_from_f32(dev, &qkv[q_out * qkv_in..(q_out + kv_out) * qkv_in], kv_out, qkv_in)?;
+        let wv = q8mat_from_f32(
+            dev,
+            &qkv[(q_out + kv_out) * qkv_in..(q_out + 2 * kv_out) * qkv_in],
+            kv_out,
+            qkv_in,
+        )?;
+
+        let (gu, gu_out, gu_in) = dequant_2d(g, &format!("{p}.ffn_up.weight"))?;
+        if gu_out != 2 * cfg.intermediate {
+            return Err(Error::Msg(format!(
+                "phi3 '{p}.ffn_up': out {gu_out} != 2·intermediate({})",
+                cfg.intermediate
+            )));
+        }
+        let inter = cfg.intermediate;
+        let w_gate = q8mat_from_f32(dev, &gu[0..inter * gu_in], inter, gu_in)?;
+        let w_up = q8mat_from_f32(dev, &gu[inter * gu_in..2 * inter * gu_in], inter, gu_in)?;
+
+        layers.push(Q8Layer {
+            wq,
+            wk,
+            wv,
+            wo: up_q8(dev, g, &format!("{p}.attn_output.weight"))?,
+            w_gate,
+            w_up,
+            w_down: up_q8(dev, g, &format!("{p}.ffn_down.weight"))?,
+        });
+    }
+    Ok(Q8Weights { lm_head, layers })
+}
+
+/// Phi-3 mirror of [`load_qwen_gguf_small_f32`]: f32 embed/norms/final-norm (the
+/// big matmuls are resident-Q8 in [`load_phi3_gguf_q8`], so their slots are
+/// dummies). Phi-3 has no QKV bias / q-k-norm.
+pub fn load_phi3_gguf_small_f32(
+    dev: &dyn Device,
+    g: &ffai_loader::gguf::Gguf,
+    _cfg: &LlamaConfig,
+    n_layers: usize,
+) -> Result<ModelWeights> {
+    let up = |name: &str| -> Result<Tensor> {
+        let (data, out_dim, in_dim) = dequant_2d(g, name)?;
+        let bytes: &[u8] = bytemuck_cast(&data);
+        Ok(Tensor::new(dev.upload(bytes)?, vec![out_dim, in_dim], ffai_core::DType::F32))
+    };
+    let up1 = |name: &str| -> Result<Tensor> {
+        // 1-D norm vectors (dequant_2d requires 2-D; norms are 1-D).
+        let t = g.tensor(name).ok_or_else(|| Error::Msg(format!("gguf: '{name}' not found")))?;
+        let data = g.dequant_f32(name)?;
+        let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
+        let bytes: &[u8] = bytemuck_cast(&data);
+        Ok(Tensor::new(dev.upload(bytes)?, shape, ffai_core::DType::F32))
+    };
+    let dummy = |dev: &dyn Device| -> Result<Tensor> {
+        Ok(Tensor::new(dev.upload(&0.0f32.to_le_bytes())?, vec![1, 1], ffai_core::DType::F32))
+    };
+
+    let embed = up("token_embd.weight")?;
+    let final_norm = up1("output_norm.weight")?;
+    let lm_head = dummy(dev)?; // resident-Q8 in Q8Weights
+
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        let p = format!("blk.{l}");
+        layers.push(LayerWeights {
+            attn_norm: up1(&format!("{p}.attn_norm.weight"))?,
+            wq: dummy(dev)?,
+            wk: dummy(dev)?,
+            wv: dummy(dev)?,
+            wo: dummy(dev)?,
+            bias_q: None,
+            bias_k: None,
+            bias_v: None,
+            q_norm: None,
+            k_norm: None,
+            mlp_norm: up1(&format!("{p}.ffn_norm.weight"))?,
+            w_gate: dummy(dev)?,
+            w_up: dummy(dev)?,
+            w_down: dummy(dev)?,
+        });
+    }
+    Ok(ModelWeights { embed, layers, final_norm, lm_head })
 }
 
 /// Build the f32 *small* weights for the resident-Q8 path: embed (gather needs
@@ -554,7 +835,13 @@ impl GgufModel {
     pub fn open(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
         let g = ffai_loader::gguf::Gguf::open(path)?;
         let (cfg, n_layers, vocab) = gguf_config(&g)?;
-        let weights = load_qwen_gguf(dev, &g, &cfg, n_layers)?;
+        // Phi-3 ships FUSED attn_qkv / ffn_up tensors; split them at load. Once
+        // split, the Qwen f32 forward path serves Phi-3 unchanged.
+        let weights = if gguf_is_phi3(&g) {
+            load_phi3_gguf(dev, &g, &cfg, n_layers)?
+        } else {
+            load_qwen_gguf(dev, &g, &cfg, n_layers)?
+        };
         Self::with_weights(dev, cfg, weights, n_layers, vocab, cap)
     }
 
@@ -565,8 +852,17 @@ impl GgufModel {
     pub fn open_q8(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
         let g = ffai_loader::gguf::Gguf::open(path)?;
         let (cfg, n_layers, vocab) = gguf_config(&g)?;
-        let weights = load_qwen_gguf_small_f32(dev, &g, &cfg, n_layers)?;
-        let q8 = load_qwen_gguf_q8(dev, &g, n_layers)?;
+        let (weights, q8) = if gguf_is_phi3(&g) {
+            (
+                load_phi3_gguf_small_f32(dev, &g, &cfg, n_layers)?,
+                load_phi3_gguf_q8(dev, &g, &cfg, n_layers)?,
+            )
+        } else {
+            (
+                load_qwen_gguf_small_f32(dev, &g, &cfg, n_layers)?,
+                load_qwen_gguf_q8(dev, &g, n_layers)?,
+            )
+        };
         let mut m = Self::with_weights(dev, cfg, weights, n_layers, vocab, cap)?;
         m.q8 = Some(q8);
         Ok(m)
