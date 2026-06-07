@@ -868,6 +868,31 @@ impl GgufModel {
         Ok(m)
     }
 
+    /// **Recommended GGUF entrypoint.** Loads `path` preferring the resident-Q8
+    /// decode path ([`open_q8`] — weights kept Q8, decode via `gemv_q8`, 20-57×
+    /// faster than f32 and bit-identical in practice) and transparently FALLS
+    /// BACK to the f32 dequant-to-upload path ([`open`]) if the Q8 repack can't
+    /// handle the file (e.g. a quant type `q8_repack` doesn't support). Same
+    /// geometry/KV-cache as both; backend-agnostic.
+    ///
+    /// Use this unless you specifically need the f32 reference path (e.g. a
+    /// numerical baseline) — then call [`open`] directly.
+    ///
+    /// [`open`]: GgufModel::open
+    /// [`open_q8`]: GgufModel::open_q8
+    pub fn load(dev: &dyn Device, path: &str, cap: usize) -> Result<Self> {
+        match Self::open_q8(dev, path, cap) {
+            Ok(m) => Ok(m),
+            Err(e) => {
+                eprintln!(
+                    "GgufModel::load: resident-Q8 path unavailable ({e}); \
+                     falling back to f32 dequant-to-upload"
+                );
+                Self::open(dev, path, cap)
+            }
+        }
+    }
+
     /// Construct from already-loaded weights (lets a caller reuse a parsed Gguf
     /// for the tokenizer without re-loading).
     pub fn with_weights(
