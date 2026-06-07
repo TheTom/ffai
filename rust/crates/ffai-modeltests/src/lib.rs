@@ -685,7 +685,7 @@ pub fn verify_nemotron(d: &dyn Device, plat: &str) {
 /// Env: NEMOTRON_DECODE (steps, default 32), NEMOTRON_PREFILL (warm the cache to
 /// this context length before timing, default 0).
 pub fn bench_nemotron(d: &dyn Device, plat: &str) {
-    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
+    use ffai_ops::{add, cast_f16_f32, cast_f32_f16, conv1d_causal_prefill, conv1d_causal_step, dequant_q4, dequant_q4_off, gather, gated_group_rmsnorm, gated_group_rmsnorm_batched, gemm_cublas, gemm_q4_mpp, gemv, gemv_q4, gemv_q4_accum, gemv_q4_relu2, gemv_q8, gemv_q8_relu2, gemv_q8_accum, kv_append, kv_append_many, mamba_split_conv, mamba_split_proj, matmul, moe_bgemm_q4_bm64, moe_fused_ffn, moe_gather_down, moe_gather_up_relu2, moe_grouped_gemm, moe_router_device, moe_scatter_add, moe_scatter_add_det, moe_w4a16, moe_w4a16_marlin, moe_weighted_sum, permute_q4_to_marlin, quantize_q4, quantize_q8, relu2, relu2_scale_f16, rms_norm, rope_llama, rope_llama_many, sdpa_multi, sdpa_multi_tc, sdpa_multi_tc_varlen, silu, slice, sdpa_decode, sdpa_decode_2pass, sdpa_decode_2pass_bc4, sdpa_decode_2pass_tiled, softplus_add, softplus_add_rows, ssm_prefill_scan, ssm_prefill_scan_chunked, ssm_prefill_scan_ssd, ssm_prefill_scan_ssd_portable, ssm_step, strided_col_copy};
     use std::collections::HashMap;
     use std::time::Instant;
     const PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
@@ -1093,7 +1093,11 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
     // the cache whenever both were nonzero, so sdpa_multi/kv_append_many walked
     // past the buffer (base_kv + n_query > kv_stride) → illegal memory access at
     // deep context. (Plain decode, where one of the two is 0, is unaffected.)
-    let cap = fakectx + prefill + n_decode + 8;
+    // NEMOTRON_PACKED=N packs N prompts (s·N tokens) into one batched prefill,
+    // so the KV cache must hold N× the per-sequence length.
+    let pack_n_cap = std::env::var("NEMOTRON_PACKED").ok()
+        .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let cap = fakectx + prefill * pack_n_cap + n_decode + 8;
     // per-layer state, indexed by absolute layer id. KV cache is now ON-DEVICE
     // ([nkv,cap,hd] per attn layer), so the growing context never round-trips
     // through the host — the 32K decode fix.
@@ -1510,6 +1514,34 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
             // (host top-k) defaults are already portable at d0/S≤4096. CUDA path is
             // left byte-for-byte unchanged — gated purely on `is_cuda`.
             let is_cuda = d.backend() == Backend::Cuda;
+            // ── Packed multi-sequence prefill (NEMOTRON_PACKED=N) ──────────────
+            // N equal-length sequences (seg_len = s/N, a multiple of the SSD chunk
+            // len) packed into one token stream. Attention goes block-diagonal via
+            // sdpa_multi_tc_varlen (per-token segment-start `seg_lo`), and the Mamba
+            // SSD scan resets recurrent state at each boundary (`seg_reset[chunk]`).
+            // proj/MoE/router/norm are token-parallel → unchanged. RoPE is relative
+            // so global positions give correct intra-segment rotation. NOTE: the
+            // causal conv1d is NOT yet segment-aware (kc-1≈3 tokens/segment leak
+            // across the boundary) — throughput path until the varlen conv lands.
+            let n_seg = std::env::var("NEMOTRON_PACKED").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+            let ssd_l_pk = std::env::var("NEMOTRON_SSD_L").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(128);
+            let packed = is_cuda && n_seg > 1 && s % n_seg == 0 && (s / n_seg) % ssd_l_pk == 0;
+            let (seg_lo_dev, seg_reset_dev) = if packed {
+                let seg_len = s / n_seg;
+                let seg_lo_h: Vec<u32> = (0..s).map(|r| ((r / seg_len) * seg_len) as u32).collect();
+                let seg_lo = Tensor::new(d.upload(unsafe {
+                    std::slice::from_raw_parts(seg_lo_h.as_ptr() as *const u8, s * 4) }).unwrap(),
+                    vec![s], DType::U32);
+                let nc = s.div_ceil(ssd_l_pk);
+                let seg_reset_h: Vec<u32> = (0..nc)
+                    .map(|c| if (c * ssd_l_pk) % seg_len == 0 { 1u32 } else { 0u32 }).collect();
+                let seg_reset = Tensor::new(d.upload(unsafe {
+                    std::slice::from_raw_parts(seg_reset_h.as_ptr() as *const u8, nc * 4) }).unwrap(),
+                    vec![nc], DType::U32);
+                (Some(seg_lo), Some(seg_reset))
+            } else { (None, None) };
             // pf!(idx, flops, expr): sync-bracket + accumulate when profiling.
             macro_rules! pf { ($idx:expr, $flops:expr, $e:expr) => {{
                 if pf_on { d.synchronize().ok(); let _t0 = Instant::now(); let _r = $e; d.synchronize().ok();
@@ -1678,7 +1710,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             let (so, y_dev) = if use_ssd_port {
                                 pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                             } else if use_ssd {
-                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, None).unwrap())
+                                pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, seg_reset_dev.as_ref()).unwrap())
                             } else if use_chunked {
                                 pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                             } else {
@@ -1764,7 +1796,7 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                         let (so, y_dev) = if use_ssd_port {
                             pf!(5, ssm_flops, ssm_prefill_scan_ssd_portable(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l).unwrap())
                         } else if use_ssd {
-                            pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, None).unwrap())
+                            pf!(5, ssm_flops, ssm_prefill_scan_ssd(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32, ssd_l, seg_reset_dev.as_ref()).unwrap())
                         } else if use_chunked {
                             pf!(5, ssm_flops, ssm_prefill_scan_chunked(d, &x_dev, &fwd[&format!("{p}.mixer.A_log")], &b_dev, &c_dev, &fwd[&format!("{p}.mixer.D")], &dt_dev, ssm_state[l].as_ref().unwrap(), s as u32, m_dh as u32, ds as u32, m_nh as u32, ng as u32).unwrap())
                         } else {
@@ -2538,7 +2570,12 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
                             None => s >= 512 || (base + s) >= 4096,
                         };
                         let attn = if use_tc_attn {
+                            if let Some(seg_lo) = seg_lo_dev.as_ref() {
+                                // Packed: block-diagonal varlen flash-attn (each query stays in its segment).
+                                pf!(7, attn_flops, sdpa_multi_tc_varlen(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), seg_lo, hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                            } else {
                             pf!(7, attn_flops, sdpa_multi_tc(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
+                            }
                         } else {
                             pf!(7, attn_flops, sdpa_multi(d, &qr.reshaped(vec![s, nq, hd]), &kcache.reshaped(vec![nkv, cap, hd]), &vcache.reshaped(vec![nkv, cap, hd]), hd, nq as u32, base as u32, s as u32, cap as u32, (nq/nkv) as u32, true, ascale).unwrap())
                         };
@@ -2569,7 +2606,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         // Fixed prompt id list (deterministic ramp). The correctness gate runs BOTH
         // the sequential and batched paths over THIS SAME list and compares the
         // last-token argmax — the KV cache + conv/SSM final states must agree.
-        let ids: Vec<usize> = (0..s).map(|i| (tok + i) % vocab).collect();
+        let ids: Vec<usize> = {
+            let base_ids: Vec<usize> = (0..s).map(|i| (tok + i) % vocab).collect();
+            // NEMOTRON_PACKED=N: replicate the prompt into N packed sequences (s·N
+            // tokens) to fill the GPU; forward_batched runs them block-diagonally.
+            let np = std::env::var("NEMOTRON_PACKED").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+            if np > 1 { base_ids.iter().cloned().cycle().take(s * np).collect() } else { base_ids }
+        };
 
         // ── Correctness gate (NEMOTRON_PREFILL_CHECK=1) ──────────────────────
         // Sequential reference over the fixed ids: feed ids[i] at pos fakectx+i,
@@ -2767,13 +2811,14 @@ pub fn bench_nemotron(d: &dyn Device, plat: &str) {
         let next = forward_batched(&ids, &conv_dev, &mut ssm_state, &mut kvcache, fakectx);
         d.synchronize().ok();
         let pf_s = t_pf.elapsed().as_secs_f64();
-        let tps_batched = s as f64 / pf_s;
+        let n_tok = ids.len();
+        let tps_batched = n_tok as f64 / pf_s;
         let conv_dev_on = std::env::var("NEMOTRON_CONV_DEVICE").is_ok()
             || (d.backend() == Backend::Cuda && std::env::var("NEMOTRON_CONV_DEVICE_OFF").is_err());
         let conv_dev_label = if conv_dev_on { "CONV_DEVICE=1" } else { "CONV_DEVICE=0(host)" };
         let ondevice_moe_on = d.backend() == Backend::Cuda && std::env::var("NEMOTRON_ONDEVICE_MOE_OFF").is_err();
         eprintln!("──────── NemotronH-Nano BATCHED PREFILL on {plat} ────────");
-        eprintln!("  prefill  {s} tok in {pf_s:.3}s = {tps_batched:.2} tok/s ({:.2} ms/tok) [batched forward, {conv_dev_label}, ONDEVICE_MOE={}]", pf_s * 1000.0 / s as f64, if ondevice_moe_on { "1" } else { "0" });
+        eprintln!("  prefill  {n_tok} tok in {pf_s:.3}s = {tps_batched:.2} tok/s ({:.2} ms/tok) [batched forward, {conv_dev_label}, ONDEVICE_MOE={}]", pf_s * 1000.0 / n_tok as f64, if ondevice_moe_on { "1" } else { "0" });
         eprintln!("  last-token argmax = {next}");
         if std::env::var("NEMOTRON_ROUTER_TIME").is_ok() {
             eprintln!("  host router loop (sigmoid+topk+sort, all E-layers) = {:.1} ms ({:.1}% of wall)",
